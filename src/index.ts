@@ -69,13 +69,15 @@ async function main(): Promise<void> {
   // --help / -h / help
   if (cmd === '--help' || cmd === '-h' || cmd === 'help') {
     console.log(`\n${BOLD}squad${RESET} v${VERSION} — Add an AI agent team to any project\n`);
-    console.log(`Usage: npx github:bradygaster/squad-sdk [command]\n`);
+    console.log(`Usage: squad [command] [options]\n`);
     console.log(`Commands:`);
     console.log(`  ${BOLD}(default)${RESET}  Initialize Squad (skip files that already exist)`);
+    console.log(`             Flags: --global (init in personal squad directory)`);
     console.log(`  ${BOLD}upgrade${RESET}    Update Squad-owned files to latest version`);
     console.log(`             Overwrites: squad.agent.md, templates dir (.squad-templates/ or .ai-team-templates/)`);
     console.log(`             Never touches: .squad/ or .ai-team/ (your team state)`);
-    console.log(`             Flags: --migrate-directory (rename .ai-team/ → .squad/)`);
+    console.log(`             Flags: --global (upgrade personal squad), --migrate-directory (rename .ai-team/ → .squad/)`);
+    console.log(`  ${BOLD}status${RESET}     Show which squad is active and why`);
     console.log(`  ${BOLD}copilot${RESET}    Add/remove the Copilot coding agent (@copilot)`);
     console.log(`             Usage: copilot [--off] [--auto-assign]`);
     console.log(`  ${BOLD}watch${RESET}      Run Ralph's work monitor as a local polling process`);
@@ -89,13 +91,15 @@ async function main(): Promise<void> {
     console.log(`             Usage: import <file> [--force]`);
     console.log(`  ${BOLD}scrub-emails${RESET}  Remove email addresses from Squad state files`);
     console.log(`             Usage: scrub-emails [directory] (default: .ai-team/)`);
-    console.log(`  ${BOLD}status${RESET}     Show which squad is active and why`);
     console.log(`  ${BOLD}help${RESET}       Show this help message`);
     console.log(`\nFlags:`);
     console.log(`  ${BOLD}--version, -v${RESET}  Print version`);
     console.log(`  ${BOLD}--help, -h${RESET}     Show help`);
     console.log(`  ${BOLD}--global${RESET}       Use personal (global) squad path (for init, upgrade)`);
-    console.log(`\nInsider channel: npx github:bradygaster/squad-sdk#insider\n`);
+    console.log(`\nInstallation:`);
+    console.log(`  npm install --save-dev @bradygaster/squad-cli`);
+    console.log(`\nInsider channel:`);
+    console.log(`  npm install --save-dev @bradygaster/squad-cli@insider\n`);
     process.exit(0);
   }
 

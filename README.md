@@ -26,11 +26,20 @@ git init
 
 ### 2. Install Squad
 
+#### Option A: npm (Recommended)
+
+```bash
+npm install --save-dev @bradygaster/squad-cli
+npx squad init
+```
+
+#### Option B: Legacy (GitHub-native)
+
 ```bash
 npx github:bradygaster/squad-pr
 ```
 
-This installs the Squad agent, 12 GitHub Actions workflows for automation (Ralph heartbeat, CI, triage, etc.), templates, and starter skills.
+This installs the Squad CLI, GitHub Actions workflows for automation (Ralph heartbeat, CI, triage, etc.), templates, and starter skills.
 
 ### 3. Authenticate with GitHub (for Issues, PRs, and Ralph)
 
@@ -62,23 +71,40 @@ Squad proposes a team — each member named from a persistent thematic cast. You
 
 | Command | What it does |
 |---------|-------------|
-| `npx github:bradygaster/squad-sdk` | **Init** — scaffold Squad in the current directory (skips existing files) |
-| `npx github:bradygaster/squad-sdk upgrade` | Update Squad-owned files to latest; never touches your team state |
-| `npx github:bradygaster/squad-sdk upgrade --migrate-directory` | Rename `.ai-team/` → `.squad/` (legacy migration) |
-| `npx github:bradygaster/squad-sdk copilot` | Add the Copilot coding agent (@copilot) to your squad |
-| `npx github:bradygaster/squad-sdk watch` | Run Ralph's work monitor as a local polling process |
-| `npx github:bradygaster/squad-sdk plugin marketplace add\|remove\|list\|browse` | Manage plugin marketplaces |
-| `npx github:bradygaster/squad-sdk export` | Export squad to a portable JSON snapshot |
-| `npx github:bradygaster/squad-sdk import <file>` | Import squad from an export file |
-| `npx github:bradygaster/squad-sdk scrub-emails` | Remove email addresses from Squad state files |
+| `squad init` | **Init** — scaffold Squad in the current directory (skips existing files); use `--global` to init in personal squad directory |
+| `squad upgrade` | Update Squad-owned files to latest; never touches your team state; use `--global` to upgrade personal squad |
+| `squad upgrade --migrate-directory` | Rename `.ai-team/` → `.squad/` (legacy migration) |
+| `squad status` | Show which squad is active and why |
+| `squad copilot` | Add the Copilot coding agent (@copilot) to your squad |
+| `squad watch` | Run Ralph's work monitor as a local polling process |
+| `squad plugin marketplace add\|remove\|list\|browse` | Manage plugin marketplaces |
+| `squad export` | Export squad to a portable JSON snapshot |
+| `squad import <file>` | Import squad from an export file |
+| `squad scrub-emails` | Remove email addresses from Squad state files |
 
 ### Insider Channel
 
 Want the latest features before they ship?
 
 ```bash
+npm install --save-dev @bradygaster/squad-cli@insider
+```
+
+Or with legacy distribution:
+
+```bash
 npx github:bradygaster/squad-sdk#insider
 ```
+
+### Legacy Distribution
+
+The original GitHub-native distribution is still available:
+
+```bash
+npx github:bradygaster/squad-pr
+```
+
+This resolves the package from the repository directly via git+ssh. Use this if you prefer not to depend on npm registry.
 
 ---
 
@@ -134,6 +160,61 @@ When agents finish, the coordinator immediately chains follow-up work. If you st
 ```
 
 **Commit this folder.** Your team persists. Names persist. Anyone who clones gets the team — with the same cast.
+
+---
+
+## Monorepo Development
+
+Squad is a monorepo with two packages:
+- **`@bradygaster/squad-sdk`** — Core runtime and library for programmable agent orchestration
+- **`@bradygaster/squad-cli`** — Command-line interface that depends on the SDK
+
+### Building
+
+```bash
+# Install dependencies (npm workspaces)
+npm install
+
+# Build TypeScript to dist/
+npm run build
+
+# Build CLI bundle (dist/ + esbuild → cli.js)
+npm run build:cli
+
+# Watch mode for development
+npm run dev
+```
+
+### Testing
+
+```bash
+# Run all tests
+npm test
+
+# Watch mode
+npm run test:watch
+```
+
+### Linting
+
+```bash
+# Type check (no emit)
+npm run lint
+```
+
+### Publishing
+
+Squad uses [changesets](https://github.com/changesets/changesets) for independent versioning across packages:
+
+```bash
+# Add a changeset
+npx changeset add
+
+# Validate changesets
+npm run changeset:check
+```
+
+Changesets are resolved on the `main` branch; releases happen independently per package.
 
 ---
 
