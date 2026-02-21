@@ -175,3 +175,217 @@ Brady's hard rule: ALL squad scratch/temp/state files MUST go in `.squad/` only.
 3. If `main()` is ever refactored to export a testable function, these tests can be upgraded — the assertions stay the same.
 
 **Impact:** Low. Sets a pattern for future CLI integration tests: test the logic, not the process.
+
+### 2026-02-21: Ink + React dependency versions
+**By:** Edie (TypeScript Engineer)
+**Date:** 2026-02-21
+**Re:** #233
+**PR:** #281
+
+**What:**
+- **ink@6.8.0** — latest stable, ESM-native, no CJS shims required
+- **react@19.2.4** — required by ink 6.x (peer dependency); React 19 is ESM-friendly
+- **ink-testing-library@4.0.0** — matches ink 6.x major version pairing
+- **@types/react@19.2.14** — TypeScript types for React 19
+
+**Why:** ink 6.x + React 19 are fully ESM-native — aligns with our ESM-only policy. ink-testing-library enables unit-testing ink components without a real terminal. All added as root-level deps for now; can be scoped to `packages/squad-cli` during monorepo migration.
+
+**Impact:** Low. No source changes — dependency additions only. Build passes (tsc strict), all 1621 tests pass.
+
+### 2026-02-21: GitHub-native distribution deprecated in favor of npm
+**By:** Fenster (Core Dev)
+**Date:** 2026-02-21
+**Re:** #219
+
+**What:**
+- Root `cli.js` now prints a deprecation warning to stderr when invoked via `npx github:bradygaster/squad`.
+- Users are directed to `npm install -g @bradygaster/squad-cli` or `npx @bradygaster/squad-cli`.
+- The warning is non-blocking — existing behavior continues after the notice.
+
+**Why:** The `@bradygaster/squad-cli` and `@bradygaster/squad-sdk` packages are now published to npm. The GitHub-native distribution (`npx github:bradygaster/squad`) was the original entry point but is now superseded. This deprecation notice gives users a migration path before the GitHub-native entry point is eventually removed.
+
+**Supersedes:** The earlier "SDK distribution stays on GitHub" decision (Keaton, carried from beta). npm is now the primary distribution channel.
+
+**Impact:** Low. Additive-only change to the bundled `cli.js`. No behavior change — just a stderr warning.
+
+### 2026-02-21: Shell chrome patterns and session registry design
+**By:** Fenster (Core Dev)
+**Date:** 2026-02-21
+**Re:** #236, #237
+
+**Shell Chrome:** The interactive shell header uses box-drawing characters (`╭╰│─`) for visual chrome. Version is read from `package.json` at runtime via `createRequire(import.meta.url)` — no hardcoded version strings. Box-drawing chrome is universally supported in modern terminals and provides clear visual framing without external dependencies. Using `createRequire` for JSON import follows the existing pattern in `src/build/github-dist.ts` and avoids ESM JSON import assertions.
+
+**Exit handling:** Three exit paths — `exit` command, `/quit` command, and Ctrl+C (SIGINT). All produce the same cleanup message ("👋 Squad out.") for consistency.
+
+**Session Registry:** `SessionRegistry` is a simple Map-backed class with no persistence, no event emitting, and no external dependencies. It tracks agent sessions by name with status lifecycle: `idle` → `working` → `streaming` → `idle`/`error`. Designed as a pure state container that the ink UI will consume. The Map-based approach allows O(1) lookup by agent name, which is the primary access pattern for status display.
+
+**Impact:** Low. Two files changed. No API surface changes outside the shell module. SessionRegistry is exported for future consumption but has no current consumers.
+
+### 2026-02-21: TSX compilation enabled in root tsconfig
+**By:** Fenster (Core Dev)
+**Date:** 2026-02-21
+**Re:** #242, #243, #244
+
+**What:** Added `"jsx": "react-jsx"` to the root `tsconfig.json` to enable TSX compilation for ink-based React components in `src/cli/shell/components/`.
+
+**Why:** The shell UI uses ink (React for CLIs), which requires JSX support. `react-jsx` is the modern transform — no need to import React in every file for JSX (though we do for explicitness). This is a project-wide setting because all TSX files live under `src/` which is the root `rootDir`.
+
+**Components created:**
+- `AgentPanel.tsx` — agent status display (consumes `AgentSession` from `types.ts`)
+- `MessageStream.tsx` — streaming message output (consumes `ShellMessage` from `types.ts`)
+- `InputPrompt.tsx` — readline input with history navigation
+- `components/index.ts` — barrel export
+
+All components are pure presentational — no SDK calls, no side effects. State management is the responsibility of the shell orchestrator.
+
+**Impact:** Low. Only affects `.tsx` files. No existing `.ts` files are impacted. The setting is compatible with strict mode and NodeNext module resolution.
+
+### 2026-02-21: Shell module structure and entry point routing
+**By:** Fenster (Core Dev)
+**Date:** 2026-02-21
+**Re:** #234, #235
+**PR:** #282
+
+**What:**
+- `src/cli/shell/` module created with `index.ts`, `types.ts`, and `components/` placeholder directory.
+- `squad` with no args now launches `runShell()` (interactive shell) instead of `runInit()`.
+- `squad init` remains available as an explicit subcommand — no functionality removed.
+
+**Why:**
+1. **Entry point change:** Brady's directive makes the interactive shell the primary UX. Running `squad` with no args should enter the shell, not re-run init. Init is still available via `squad init`.
+2. **Placeholder over premature implementation:** `runShell()` is console.log-only. Ink dependency is handled separately (#233). This keeps the shell module structure ready without coupling to the UI library.
+3. **Types first:** `ShellState`, `ShellMessage`, and `AgentSession` interfaces define the shell's data model before any UI code exists. This lets other agents (ink wiring, agent spawning) code against stable types.
+
+**Impact:** Low. No existing tests broken (1621/1621 pass). The only behavior change is `squad` (no args) prints a shell header and exits instead of running init. `squad init` and `squad --help` / `squad help` continue to work as before.
+
+### 2026-02-21: Agent spawn infrastructure pattern
+**By:** Fenster (Core Dev)
+**Date:** 2026-02-21
+**Re:** #238
+
+**What:** Created `src/cli/shell/spawn.ts` with three exported functions:
+- `loadAgentCharter(name, teamRoot?)` — filesystem charter loading via `resolveSquad()`
+- `buildAgentPrompt(charter, options?)` — system prompt construction from charter + context
+- `spawnAgent(name, task, registry, options?)` — full spawn lifecycle with SessionRegistry integration
+
+SDK session creation (CopilotClient) is intentionally stubbed. The spawn infrastructure is complete; session wiring comes when we understand the SDK's session management API.
+
+**Why:**
+1. **Separation of concerns:** Charter loading, prompt building, and session lifecycle are independent functions. This lets stream bridge and coordinator reuse `buildAgentPrompt` and `spawnAgent` without coupling.
+2. **Testability:** `teamRoot` parameter on `loadAgentCharter` allows tests to point at a fixture directory without mocking `resolveSquad()`.
+3. **Stub-first:** Rather than guessing the CopilotClient session API shape, we built the surrounding infrastructure. The TODO is a single integration point — when the SDK surface is clear, the change is surgical.
+
+**Impact:** Low. Additive-only. No existing behavior changed. Two files modified: `spawn.ts` (new), `index.ts` (barrel exports added).
+
+### 2026-02-21: Session lifecycle owns team discovery
+**By:** Fortier (Node.js Runtime)
+**Date:** 2026-02-21
+**Re:** #240
+
+**What:** `ShellLifecycle.initialize()` is the single entry point for team discovery in the interactive shell. It reads `.squad/team.md`, parses the Members table, and registers active agents in `SessionRegistry`. No other shell component should independently parse `team.md` or discover agents.
+
+**Why:**
+1. **Single responsibility:** Team discovery is a lifecycle concern — it happens once at shell startup. Scattering `team.md` parsing across components would create divergent interpretations of the manifest format.
+2. **Testability:** By owning initialization, `ShellLifecycle` can be tested with a mock filesystem (or temp `.squad/` directory) without touching the registry or renderer.
+3. **State consistency:** The lifecycle class is the source of truth for shell state. If initialization fails (missing `.squad/`, missing `team.md`), the state transitions to `error` and downstream components can check `getState().status` rather than catching exceptions everywhere.
+
+**Impact:** Low. Additive-only. Future shell features (command routing, agent spawning) should call `lifecycle.getDiscoveredAgents()` instead of re-parsing `team.md`.
+
+### 2026-02-21: StreamBridge is an event sink, not a subscriber
+**By:** Fortier (Node.js Runtime)
+**Date:** 2026-02-21
+**Re:** #239
+
+**What:** `StreamBridge` receives `StreamingEvent` objects via `handleEvent()` but does not register itself with `StreamingPipeline`. The wiring (`pipeline.onDelta(e => bridge.handleEvent(e))`) is the caller's responsibility.
+
+**Why:**
+1. **Testability:** The bridge can be tested with plain event objects — no pipeline instance needed.
+2. **Flexibility:** The shell entry point controls which events reach the bridge (e.g., filtering by session, throttling for UI frame rate).
+3. **Single responsibility:** The bridge translates events to callbacks; it doesn't manage subscriptions or lifecycle.
+
+**Impact:** Low. Pattern applies to all future bridges between the pipeline and UI layers (ink components, web sockets, etc.).
+
+### 2026-02-21: Shell module test patterns — fixtures over mocks
+**By:** Hockney (Tester)
+**Date:** 2026-02-21
+**Re:** #248
+
+**What:** Shell module tests use `test-fixtures/.squad/` with real files (team.md, routing.md, agent charters) instead of mocking fs calls. The `loadAgentCharter` and `buildCoordinatorPrompt` functions accept a `teamRoot` parameter that enables this pattern.
+
+**Why:**
+1. Real file reads catch encoding issues, path resolution bugs, and parsing edge cases that mocks hide.
+2. The `teamRoot` parameter was already designed into the API — tests should use it.
+3. StreamBridge tests use callback spies (arrays capturing calls) rather than vi.fn() — simpler to assert on and read.
+
+**Impact:** Low. Establishes fixture patterns for future shell module tests. test-fixtures/.squad/ is now a shared test resource.
+
+### 2026-02-21: Branch protection configuration
+**By:** Kobayashi (Git & Release)
+**Date:** 2026-02-21
+**Re:** #209
+
+**Main Branch Protection:** Require PR + passing build status checks. All changes to main require a PR (not direct push). PR cannot be merged until `build` check passes (CI/CD gate). Zero approving reviews required — allows team to use PR merge buttons freely (no blocking review workflow needed). Admins not exempted (same rules apply to everyone, strengthens process integrity).
+
+**Insider Branch:** No protection — allows direct pushes. Insider releases are automation-driven; direct branch push is the automation's path.
+
+**Implementation:** Used GitHub API (REST v3): `PUT /repos/{owner}/{repo}/branches/main/protection` with required_status_checks + required_pull_request_reviews. `DELETE /repos/{owner}/{repo}/branches/insider/protection` confirmed no-op (no existing rule).
+
+**Note:** Status check context name is `"build"` — must match the exact check name from CI workflow. If CI workflow renames the check, branch protection must be updated to match.
+
+### 2026-02-21: Insider publish package scaffolds
+**By:** Kobayashi (Git & Release)
+**Date:** 2026-02-21
+**Re:** #215
+**PR:** #283
+
+**What:** Added minimal publishable entry points to `packages/squad-sdk/` and `packages/squad-cli/` so the insider publish workflow can produce valid npm packages.
+
+**squad-sdk:**
+- `src/index.ts`: exports `VERSION` constant (placeholder — full source migration comes later)
+- `tsconfig.json`: extends root, outputs to `dist/` with declarations
+- `package.json`: added `files`, `scripts.build`
+
+**squad-cli:**
+- `src/cli.ts`: placeholder binary (`#!/usr/bin/env node`)
+- `tsconfig.json`: extends root, outputs to `dist/` with declarations
+- `package.json`: added `files`, `scripts.build`; `bin` already pointed to `./dist/cli.js`
+
+**Root:** `build` script updated: `tsc && npm run build --workspaces --if-present`
+
+**Why:** The insider publish pipeline triggers on push to `insider` branch but both workspace packages were empty scaffolds — no source, no build output, nothing to publish. This adds the minimum viable content so `npm publish` succeeds and the insider channel can be verified end-to-end.
+
+**Constraints respected:** ESM-only, TypeScript strict mode, Node.js >=20, squad-cli depends on squad-sdk via version string, `files` lists ensure only `dist/` and `README.md` ship in the published package.
+
+**Impact:** Low. Does not migrate real source code — these are placeholders. Does not add tests for workspace packages (nothing to test yet).
+
+### 2026-02-21: Distribution moves to npm for production
+**By:** Rabin (Distribution)
+**Date:** 2026-02-21
+**Re:** #216
+
+**What:** Squad packages (`@bradygaster/squad-sdk` and `@bradygaster/squad-cli`) are now distributed via npmjs.com. This supersedes the beta-era decision "Distribution is `npx github:bradygaster/squad` — never move to npmjs.com."
+
+**Why:** The project has matured from beta to production. npm is the standard distribution channel for Node.js packages. The insider publish (`0.6.0-alpha.0`) validated the pipeline. Production publish (`0.6.0`) is the natural next step.
+
+**Workflow:** Tag push `v*` on `main` triggers `.github/workflows/squad-publish.yml`. Auth is CI-only via `setup-node` + `NODE_AUTH_TOKEN`. No root `.npmrc` needed. No `--provenance` (private repo limitation).
+
+**Impact:** Users install via `npm install @bradygaster/squad-cli` (or `npx @bradygaster/squad-cli`). The GitHub-native `npx github:bradygaster/squad` path may still work but is no longer the primary distribution channel.
+
+### 2026-02-21: Coordinator prompt structure — three routing modes
+**By:** Verbal (Prompt Engineer)
+**Date:** 2026-02-21
+**Re:** #241
+
+**What:** The coordinator system prompt (`buildCoordinatorPrompt()`) uses a structured response format with three routing modes:
+- `DIRECT:` — coordinator answers inline, no agent spawn
+- `ROUTE:` + `TASK:` + `CONTEXT:` — single agent delegation
+- `MULTI:` with bullet list — fan-out to multiple agents
+
+The parser (`parseCoordinatorResponse()`) extracts a `RoutingDecision` from the LLM response. Unrecognized formats fall back to `DIRECT` (safe default — never silently drops input).
+
+**Why:**
+1. **Structured output over free-form:** Keyword prefixes (`ROUTE:`, `DIRECT:`, `MULTI:`) are cheap to parse and reliable across model temperatures. No JSON parsing needed.
+2. **Fallback-to-direct:** If the LLM doesn't follow the format, the response is surfaced to the user rather than lost. This prevents silent failures in the routing layer.
+3. **Prompt composition from files:** team.md and routing.md are read at prompt-build time, not baked in. This means the coordinator adapts to team changes without code changes.
+
+**Impact:** Low. Additive module. No changes to existing shell behavior. Future work will wire this into the readline loop and SDK session.
