@@ -178,23 +178,114 @@ export class LocalAgentSource implements AgentSource {
   }
 }
 
+/**
+ * Pluggable fetcher interface for GitHub API calls (enables testing).
+ */
+export interface GitHubFetcher {
+  /** List directory entries at a path in a repo. */
+  listDirectory(owner: string, repo: string, path: string, ref?: string): Promise<Array<{ name: string; type: 'file' | 'dir' }>>;
+  /** Fetch file content (UTF-8 string) at a path in a repo. */
+  getFileContent(owner: string, repo: string, path: string, ref?: string): Promise<string | null>;
+}
+
+/** Parse "owner/repo" format into components. */
+function parseOwnerRepo(repo: string): { owner: string; repo: string } {
+  const parts = repo.split('/');
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
+    throw new Error(`Invalid repo format "${repo}": expected "owner/repo"`);
+  }
+  return { owner: parts[0], repo: parts[1] };
+}
+
 export class GitHubAgentSource implements AgentSource {
   readonly name = 'github';
   readonly type = 'github' as const;
 
-  constructor(private repo: string, private ref?: string) {}
+  private owner: string;
+  private repoName: string;
+  private branch?: string;
+  private pathPrefix: string;
+  private fetcher: GitHubFetcher;
+
+  constructor(repo: string, options?: { ref?: string; pathPrefix?: string; fetcher?: GitHubFetcher }) {
+    const parsed = parseOwnerRepo(repo);
+    this.owner = parsed.owner;
+    this.repoName = parsed.repo;
+    this.branch = options?.ref;
+    this.pathPrefix = options?.pathPrefix ?? '.squad/agents';
+    this.fetcher = options?.fetcher ?? createDefaultFetcher();
+  }
 
   async listAgents(): Promise<AgentManifest[]> {
-    return [];
+    const entries = await this.fetcher.listDirectory(
+      this.owner, this.repoName, this.pathPrefix, this.branch,
+    );
+    const dirs = entries.filter(e => e.type === 'dir');
+    const manifests: AgentManifest[] = [];
+
+    for (const dir of dirs) {
+      const charterPath = `${this.pathPrefix}/${dir.name}/charter.md`;
+      const content = await this.fetcher.getFileContent(
+        this.owner, this.repoName, charterPath, this.branch,
+      );
+      if (!content) continue;
+      const meta = parseCharterMetadata(content);
+      manifests.push({
+        name: meta.name || dir.name,
+        role: meta.role || 'agent',
+        source: 'github',
+      });
+    }
+
+    return manifests;
   }
 
   async getAgent(name: string): Promise<AgentDefinition | null> {
-    return null;
+    const charterPath = `${this.pathPrefix}/${name}/charter.md`;
+    const charter = await this.fetcher.getFileContent(
+      this.owner, this.repoName, charterPath, this.branch,
+    );
+    if (!charter) return null;
+
+    const meta = parseCharterMetadata(charter);
+
+    let history: string | undefined;
+    const historyPath = `${this.pathPrefix}/${name}/history.md`;
+    const historyContent = await this.fetcher.getFileContent(
+      this.owner, this.repoName, historyPath, this.branch,
+    );
+    if (historyContent) history = historyContent;
+
+    return {
+      name: meta.name || name,
+      role: meta.role || 'agent',
+      source: 'github',
+      charter,
+      model: meta.model,
+      tools: meta.tools,
+      skills: meta.skills,
+      history,
+    };
   }
 
   async getCharter(name: string): Promise<string | null> {
-    return null;
+    const charterPath = `${this.pathPrefix}/${name}/charter.md`;
+    return this.fetcher.getFileContent(
+      this.owner, this.repoName, charterPath, this.branch,
+    );
   }
+}
+
+/** Default fetcher that returns empty results when no real fetcher is configured. */
+function createDefaultFetcher(): GitHubFetcher {
+  return {
+    async listDirectory(): Promise<Array<{ name: string; type: 'file' | 'dir' }>> {
+      return [];
+    },
+    async getFileContent(): Promise<string | null> {
+      return null;
+    },
+  };
 }
 
 export class MarketplaceAgentSource implements AgentSource {

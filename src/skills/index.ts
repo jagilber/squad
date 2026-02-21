@@ -9,6 +9,7 @@
 import type { SkillDefinition } from './skill-loader.js';
 export { loadSkillsFromDirectory, parseFrontmatter, parseSkillFile } from './skill-loader.js';
 export type { SkillDefinition } from './skill-loader.js';
+export * from './skill-source.js';
 
 // --- Types ---
 

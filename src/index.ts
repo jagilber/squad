@@ -19,9 +19,11 @@ export type { ConfigLoadResult, ConfigValidationError } from './runtime/config.j
 export * from './runtime/streaming.js';
 export * from './runtime/cost-tracker.js';
 export * from './runtime/telemetry.js';
+export * from './runtime/offline.js';
 export * from './cli/index.js';
 export * from './marketplace/index.js';
 export * from './build/index.js';
+export * from './sharing/index.js';
 
 function main(): void {
   const args = process.argv.slice(2);

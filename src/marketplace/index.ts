@@ -144,3 +144,19 @@ export { ExtensionAdapter, toExtensionConfig, fromExtensionEvent, registerExtens
 export type { ExtensionEvent, ExtensionConfig, RegistrationResult } from './extension-adapter.js';
 export { packageForMarketplace, validatePackageContents } from './packaging.js';
 export type { PackageResult, MarketplacePackageValidationResult } from './packaging.js';
+export { searchMarketplace, validateEntry, generateEntryFromConfig } from './schema.js';
+export type {
+  MarketplaceEntry,
+  MarketplaceEntryStats,
+  MarketplaceIndex,
+  MarketplaceSearchQuery,
+  MarketplaceSearchResult,
+  MarketplaceSortField,
+  EntryValidationResult,
+} from './schema.js';
+export { MarketplaceBrowser, formatEntryList, formatEntryDetails } from './browser.js';
+export type { MarketplaceFetcher, InstallResult } from './browser.js';
+export { MarketplaceBackend } from './backend.js';
+export type { PublishResult, OperationResult } from './backend.js';
+export { validateRemoteAgent, quarantineAgent, generateSecurityReport, SECURITY_RULES } from './security.js';
+export type { RemoteAgentDefinition, SecurityReport, SecurityRule, SecuritySeverity } from './security.js';
