@@ -11,8 +11,13 @@ const VERSION = '0.6.0-alpha.0';
 export * from './config/index.js';
 export * from './agents/onboarding.js';
 export * from './casting/index.js';
+export * from './skills/index.js';
+export { selectResponseTier, getTier } from './coordinator/response-tiers.js';
+export type { ResponseTier, TierName, TierContext, ModelTierSuggestion } from './coordinator/response-tiers.js';
 export { loadConfig, loadConfigSync } from './runtime/config.js';
 export type { ConfigLoadResult, ConfigValidationError } from './runtime/config.js';
+export * from './runtime/streaming.js';
+export * from './runtime/cost-tracker.js';
 
 function main(): void {
   const args = process.argv.slice(2);

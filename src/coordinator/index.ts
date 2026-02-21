@@ -6,6 +6,34 @@
  * agent sessions, routes work, and observes progress via SDK events.
  */
 
+// --- M3-1 Coordinator ---
+export {
+  SquadCoordinator,
+  type SquadCoordinatorOptions,
+  type CoordinatorResult,
+  type SpawnStrategy,
+  type CoordinatorContext,
+} from './coordinator.js';
+
+// --- M3-6 Direct Response ---
+export {
+  DirectResponseHandler,
+  type DirectResponseResult,
+  type DirectResponseCategory,
+  type DirectResponsePattern,
+} from './direct-response.js';
+
+// --- M1-10 Fan-Out ---
+export {
+  spawnParallel,
+  aggregateSessionEvents,
+  type AgentSpawnConfig,
+  type SpawnResult,
+  type FanOutDependencies,
+} from './fan-out.js';
+
+// --- Legacy types (kept for backwards compat) ---
+
 import type { SquadClient, SquadSessionConfig } from '../client/index.js';
 import type { EventBus } from '../client/event-bus.js';
 import type { AgentSessionManager, AgentCharter } from '../agents/index.js';

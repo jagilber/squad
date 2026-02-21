@@ -17,14 +17,20 @@ export {
   type CompiledCharter,
 } from './charter-compiler.js';
 
-// --- M1-9 Model Selection ---
+// --- M1-9 Model Selection + M3-5 Model Fallback ---
 export { 
-  resolveModel, 
+  resolveModel,
+  inferTierFromModel,
+  isTierFallbackAllowed,
+  ModelFallbackExecutor,
   type ModelResolutionOptions, 
   type ResolvedModel,
   type TaskType,
   type ModelTier,
-  type ModelResolutionSource 
+  type ModelResolutionSource,
+  type FallbackExecutorConfig,
+  type FallbackAttempt,
+  type FallbackResult,
 } from './model-selector.js';
 
 // --- M1-7 Agent Lifecycle ---
