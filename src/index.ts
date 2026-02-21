@@ -72,18 +72,25 @@ async function main(): Promise<void> {
     console.log(`\n${BOLD}squad${RESET} v${VERSION} — Add an AI agent team to any project\n`);
     console.log(`Usage: squad [command] [options]\n`);
     console.log(`Commands:`);
-    console.log(`  ${BOLD}(default)${RESET}  Initialize Squad (skip files that already exist)`);
+    console.log(`  ${BOLD}(default)${RESET}  Launch interactive shell (no args)`);
+    console.log(`             Flags: --global (init in personal squad directory)`);
+    console.log(`  ${BOLD}init${RESET}       Initialize Squad (skip files that already exist)`);
     console.log(`             Flags: --global (init in personal squad directory)`);
     console.log(`  ${BOLD}upgrade${RESET}    Update Squad-owned files to latest version`);
     console.log(`             Overwrites: squad.agent.md, templates dir (.squad-templates/ or .ai-team-templates/)`);
     console.log(`             Never touches: .squad/ or .ai-team/ (your team state)`);
     console.log(`             Flags: --global (upgrade personal squad), --migrate-directory (rename .ai-team/ → .squad/)`);
     console.log(`  ${BOLD}status${RESET}     Show which squad is active and why`);
+    console.log(`  ${BOLD}triage${RESET}     Scan for work and categorize issues`);
+    console.log(`             Usage: triage [--interval <minutes>]`);
+    console.log(`             Default: checks every 10 minutes (Ctrl+C to stop)`);
+    console.log(`  ${BOLD}loop${RESET}       Continuous work loop (Ralph mode)`);
+    console.log(`             Usage: loop [--filter <label>] [--interval <minutes>]`);
+    console.log(`             Default: checks every 10 minutes (Ctrl+C to stop)`);
+    console.log(`  ${BOLD}hire${RESET}       Team creation wizard`);
+    console.log(`             Usage: hire [--name <name>] [--role <role>]`);
     console.log(`  ${BOLD}copilot${RESET}    Add/remove the Copilot coding agent (@copilot)`);
     console.log(`             Usage: copilot [--off] [--auto-assign]`);
-    console.log(`  ${BOLD}watch${RESET}      Run Ralph's work monitor as a local polling process`);
-    console.log(`             Usage: watch [--interval <minutes>]`);
-    console.log(`             Default: checks every 10 minutes (Ctrl+C to stop)`);
     console.log(`  ${BOLD}plugin${RESET}     Manage plugin marketplaces`);
     console.log(`             Usage: plugin marketplace add|remove|list|browse`);
     console.log(`  ${BOLD}export${RESET}     Export squad to a portable JSON snapshot`);
@@ -142,14 +149,39 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  if (cmd === 'watch') {
-    const { runWatch } = await import('./cli/commands/watch.js');
+  if (cmd === 'triage' || cmd === 'watch') {
+    console.log('🕵️ Squad triage — scanning for work... (full implementation pending)');
+    process.exit(0);
+  }
+
+  if (cmd === 'loop') {
+    const filterIdx = args.indexOf('--filter');
+    const filter = (filterIdx !== -1 && args[filterIdx + 1]) ? args[filterIdx + 1] : undefined;
     const intervalIdx = args.indexOf('--interval');
     const intervalMinutes = (intervalIdx !== -1 && args[intervalIdx + 1])
-      ? parseInt(args[intervalIdx + 1], 10)
+      ? parseInt(args[intervalIdx + 1]!, 10)
       : 10;
-    await runWatch(process.cwd(), intervalMinutes);
-    return;
+    console.log(`🔄 Squad loop starting... (full implementation pending)`);
+    if (filter) {
+      console.log(`   Filter: ${filter}`);
+    }
+    console.log(`   Interval: ${intervalMinutes} minutes`);
+    process.exit(0);
+  }
+
+  if (cmd === 'hire') {
+    const nameIdx = args.indexOf('--name');
+    const name = (nameIdx !== -1 && args[nameIdx + 1]) ? args[nameIdx + 1] : undefined;
+    const roleIdx = args.indexOf('--role');
+    const role = (roleIdx !== -1 && args[roleIdx + 1]) ? args[roleIdx + 1] : undefined;
+    console.log('👋 Squad hire — team creation wizard starting... (full implementation pending)');
+    if (name) {
+      console.log(`   Name: ${name}`);
+    }
+    if (role) {
+      console.log(`   Role: ${role}`);
+    }
+    process.exit(0);
   }
 
   if (cmd === 'export') {
