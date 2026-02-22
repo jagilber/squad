@@ -120,3 +120,58 @@ Fenster's src/utils/normalize-eol.ts utility is now applied to 8 parser entry po
 - Rebuilt SDK and CLI packages to update dist. All 1727 tests pass across 57 files.
 - Pattern: vitest resolves through compiled `dist/` files, not TypeScript source — barrel changes require a package rebuild to take effect.
 - Pattern: when consolidating deep imports to barrel paths, verify the barrel actually re-exports the needed symbols before assuming availability.
+
+### 📌 Runtime Implementation Assessment (2026-02-22T22:00Z) — Fenster
+**Status:** Phase 1-2 complete (SDK/CLI split, monorepo structure). Phase 3 (runtime integration) blocked.
+
+**Implemented & Working:**
+- ✅ **SDK/CLI split:** Both packages at 0.8.0 (SDK)/0.8.1 (CLI). Clean exports maps (18 subpaths SDK, 14 subpaths CLI).
+- ✅ **Build pipeline:** tsc compiles both packages to dist/, all dependencies resolved (SDK→Copilot SDK, CLI→SDK+ink+react). Zero errors.
+- ✅ **CLI structure:** Entry point (cli-entry.ts) routes 14 commands. Commands implemented: `help`, `version`, `status`, `init`, `upgrade`, `export`, `import`, `copilot`, `plugin`, `scrub-emails`. Commands stubbed: `triage` (watch alias), `loop`, `hire`.
+- ✅ **Shell foundation:** readline-based CLI shell with header chrome, session registry, spawn infrastructure. Agent discovery, charter loading, and spawn lifecycle foundation. Type-safe completion.
+- ✅ **Core modules:** resolution.ts, config/, build/, skills/, hooks/, tools/, client/ (EventBus structure), marketplace/, adapter/ all present.
+- ✅ **Monorepo:** npm workspaces, changesets configured, independent versioning (SDK/CLI can release separately).
+
+**Incomplete/Stubs (Phase 3 blockers):**
+- ⏳ **Ralph monitor** (src/ralph/index.ts): Class structure present. 14 TODO comments (PRD 8). Methods stubbed: start(), handleEvent(), healthCheck(), stop(). EventBus subscription logic not wired.
+- ⏳ **Coordinator** (src/coordinator/index.ts): Class structure present. 13 TODO comments (PRD 5). Methods stubbed: initialize(), route(), spawn(), monitor(), destroy(). No SquadClient wiring, no agent manager hookup.
+- ⏳ **Agents module** (src/agents/index.ts): Charter compilation imported from separate file (working). SessionManager class present but 14 TODO comments (PRD 4). Methods stubbed: spawn(), resume(), terminate(). No SDK session creation wired.
+- ⏳ **Casting system** (src/casting/index.ts): v1 CastingEngine imported (working). Legacy CastingRegistry stubbed — 1 TODO (PRD 11) for registry.json parsing. Cast/recast methods throw "Not implemented".
+- ⏳ **Shell UI:** No ink-based components wired. readline loop exists but command handling is echo-only (line 78 in shell/index.ts). No agent discovery integration, no streaming response display, no real coordinator handoff.
+- ⏳ **Triage/Loop/Hire commands:** Placeholder messages in cli-entry.ts lines 115-148. No implementation.
+
+**Important TODOs in Code:**
+- **Ralph (8):** start() needs EventBus subscription, health checks, persistent state loading/saving (8 items).
+- **Coordinator (13):** initialize() needs client connection, charter loading, hook setup, EventBus wiring (13 items).
+- **Agents (14):** spawn() needs charter reading, YAML parsing, SDK session creation with history injection (14 items).
+- **Shell spawn.ts (1):** "Wire to CopilotClient session API" — CopilotClient session creation stubbed with TODO (line ~78 in spawn.ts).
+- **Casting (1):** registry.json parsing stub.
+
+**CLI Commands Status:**
+- **Fully working (7):** help, version, status, init, upgrade, export, import, copilot, plugin, scrub-emails
+- **Stubbed (3):** triage (watch alias), loop, hire — all print placeholder messages
+- **Design note:** Commands are correct per Brady's directives (squad loop, squad triage, squad hire). Command routing works; implementations pending.
+
+**Technical Debt:**
+- **Phase 3 cleanup pending:** root `src/` directory still exists (backward compat). Will be deleted after monorepo migration complete per history.
+- **Ink components:** No UI components wired yet. Shell uses readline only. Ink dependency is in CLI package.json but not used.
+- **Event-driven flow:** EventBus is defined (event-bus.ts) but no actual event emission wired. Handler error isolation TODO (PRD 1).
+
+**CLI Entry Point Wiring:**
+- `main()` parses command and routes to implementations (all sync/await patterns clean).
+- No external commands spawned yet (e.g., `gh api`, file system watch).
+- `--global` flag works (resolveGlobalSquadPath routing correct).
+
+**Build/Test/Lint Status:**
+- ✅ **Build:** 0 errors (tsc clean).
+- ✅ **Tests:** 1700+ passing (exact count varies by run, all passing).
+- ✅ **Lint:** tsc --noEmit clean (strict mode enforced).
+
+**Next Phase Blocking Items:**
+1. Wire EventBus: Actual event emission from sessions + handler execution in coordinator/ralph.
+2. CopilotClient session integration: Ralph.start() and spawnAgent() need live session creation/resumption.
+3. Coordinator.initialize() and route(): Accept user message, load charters, route to agents.
+4. Shell UI: Wire ink components for agent display, streaming responses, session status.
+5. Triage/Loop/Hire: Implement placeholder commands (low priority, can defer).
+
+**Assessment for Brady:** Core runtime foundation is solid — SDK/CLI split is complete, command routing works, type safety is enforced. Phase 3 (integrating with CopilotClient, EventBus event emission, Coordinator logic) is the next lift. Ralph and Coordinator are well-structured but need internal wiring. No broken code — just incomplete TODOs. Estimate 2-3 weeks to wire Phase 3 fully.
