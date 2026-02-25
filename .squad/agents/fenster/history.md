@@ -5,6 +5,31 @@
 - **Stack:** TypeScript (strict mode, ESM-only), Node.js ≥20, @github/copilot-sdk, Vitest, esbuild
 - **Created:** 2026-02-21
 
+---
+
+## 2025-01-XX: CLI Command Inventory (Complete Ground Truth)
+
+**Task:** Map every CLI command that exists — implementation status, help coverage, ghost commands, orphaned commands.
+
+**Deliverable:** `.squad/agents/fenster/cli-command-inventory.md` (28KB comprehensive reference)
+
+**Key Findings:**
+- **13 implemented commands:** init, upgrade, status, triage/watch, copilot, plugin, export, import, scrub-emails, doctor, link, aspire, (no args)
+- **1 orphaned command:** `upstream` — fully implemented, not in help
+- **5 ghost commands:** hire, heartbeat, loop, shell, run — in docs, not in code
+- **10 shell commands:** /status, /history, /agents, /clear, /help, /quit, /exit, /sessions, /resume, /version
+- **Help coverage:** 12/13 in main help (missing upstream), 0/13 with dedicated --help handlers, 0/13 with examples
+
+**Recommendations:**
+1. Wire ghost commands or remove from docs (Priority 1)
+2. Add `upstream` to main help (Priority 2)
+3. Add dedicated --help handlers + examples (Priority 3)
+
+**Files Created:**
+- `.squad/agents/fenster/cli-command-inventory.md` — full inventory with command tables, implementation file map, draft help outputs for all 13 commands
+
+---
+
 ## Core Context
 
 **Created:** 2026-02-21  
