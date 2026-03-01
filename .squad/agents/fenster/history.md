@@ -629,3 +629,19 @@ The upstream.ts command was fully implemented but never wired into cli-entry.ts.
 **Files created:** `packages/squad-cli/src/cli/core/nap.ts`, `.squad-templates/skills/nap/SKILL.md`
 **Files modified:** `packages/squad-cli/src/cli-entry.ts`, `packages/squad-cli/src/cli/shell/commands.ts`
 **Verified:** TypeScript compiles clean, all 3229 tests pass (38 nap-specific).
+📌 Team update (2026-03-01T05:57:23): Nap feature complete — dual sync/async export pattern, 38 comprehensive tests, all 3229 tests pass. Issue #635 closed, PR #636 merged. — decided by Fenster, Hockney
+
+## Learnings
+
+### REPL empty-roster gate (2026-03-02)
+**Task:** Gate REPL dispatch on non-empty roster. When team.md exists but has no members, the REPL showed no error — the coordinator just acted as generic AI. Added `hasRosterEntries()` check in both `handleDispatch` and `buildCoordinatorPrompt`, added `/init` slash command, updated post-init message.
+
+**Key decisions:**
+- `hasRosterEntries()` parses the `## Members` section for table data rows (skips header/separator)
+- Dual gate: `handleDispatch` blocks early with user guidance; `buildCoordinatorPrompt` injects refusal prompt as defense-in-depth
+- Post-init message now says "Start a Copilot session" — accurate for VS Code, github.com, and Copilot CLI
+- `/init` command provides actionable steps without trying to invoke init directly from REPL
+
+**Files modified:** `coordinator.ts`, `shell/index.ts`, `commands.ts`, `core/init.ts`, `test/human-journeys.test.ts`
+**Verified:** Build clean, all 3229 tests pass.
+

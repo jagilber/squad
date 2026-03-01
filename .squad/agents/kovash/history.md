@@ -92,3 +92,5 @@
   2. **Disabled state — newline preservation:** Changed `key.return` from being ignored to appending `\n` to `bufferRef`, so pasted text arriving during processing retains its line structure.
 - **Key insight:** Ink's `useInput` delivers paste characters synchronously within a single event loop tick, so a 10ms debounce cleanly separates paste (characters arrive in <1ms) from real Enter (next input arrives after human reaction time). The 10ms delay is imperceptible for normal typing.
 - **All value mutation paths** (backspace, history nav, tab completion, regular input) now sync `valueRef` alongside React state to keep the ref as source of truth for the debounced submit.
+📌 Team update (2026-03-01T05:57:23): Nap feature complete — dual sync/async export pattern, 38 comprehensive tests, all 3229 tests pass. Issue #635 closed, PR #636 merged. — decided by Fenster, Hockney
+

@@ -6,7 +6,7 @@
  */
 
 import { createRequire } from 'node:module';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import React from 'react';
 import { render } from 'ink';
@@ -22,7 +22,7 @@ import type { SquadSession } from '@bradygaster/squad-sdk/client';
 import type { ShellMessage } from './types.js';
 import { initSquadTelemetry, TIMEOUTS } from '@bradygaster/squad-sdk';
 import { enableShellMetrics, recordShellSessionDuration, recordAgentResponseLatency, recordShellError } from './shell-metrics.js';
-import { buildCoordinatorPrompt, parseCoordinatorResponse } from './coordinator.js';
+import { buildCoordinatorPrompt, parseCoordinatorResponse, hasRosterEntries } from './coordinator.js';
 import { loadAgentCharter, buildAgentPrompt } from './spawn.js';
 import { createSession, saveSession, loadLatestSession, type SessionData } from './session-store.js';
 import { parseDispatchTargets, type ParsedInput } from './router.js';
@@ -36,7 +36,7 @@ export { ShellLifecycle } from './lifecycle.js';
 export type { LifecycleOptions, DiscoveredAgent } from './lifecycle.js';
 export { spawnAgent, loadAgentCharter, buildAgentPrompt } from './spawn.js';
 export type { SpawnOptions, SpawnResult, ToolDefinition } from './spawn.js';
-export { buildCoordinatorPrompt, parseCoordinatorResponse, formatConversationContext } from './coordinator.js';
+export { buildCoordinatorPrompt, parseCoordinatorResponse, formatConversationContext, hasRosterEntries } from './coordinator.js';
 export type { CoordinatorConfig, RoutingDecision } from './coordinator.js';
 export { parseInput, parseDispatchTargets } from './router.js';
 export type { MessageType, ParsedInput, DispatchTargets } from './router.js';
@@ -607,6 +607,26 @@ export async function runShell(): Promise<void> {
       shellApi?.addMessage({
         role: 'system',
         content: '\u26A0 No Squad team found. Run /init to create your team first.',
+        timestamp: new Date(),
+      });
+      return;
+    }
+
+    // Check if roster is actually populated
+    const teamContent = readFileSync(teamFile, 'utf-8');
+    if (!hasRosterEntries(teamContent)) {
+      shellApi?.addMessage({
+        role: 'system',
+        content: [
+          '\u26A0 No team members yet. Your scaffold is ready but no team has been cast.',
+          '',
+          'To cast your team:',
+          '  \u2022 Open this project in VS Code \u2192 Copilot Chat \u2192 the coordinator will propose a team',
+          '  \u2022 Or edit .squad/team.md directly to add members',
+          '  \u2022 Or run squad init in a new Copilot CLI session (the coordinator handles casting)',
+          '',
+          'The REPL needs at least one team member to route work.',
+        ].join('\n'),
         timestamp: new Date(),
       });
       return;

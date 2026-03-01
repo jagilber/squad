@@ -135,7 +135,7 @@ describe('Journey 1: I just installed this (squad init)', () => {
 
     // The human needs a clear next step — not silence
     expect(output).toContain('Scaffold ready');
-    expect(output.toLowerCase()).toMatch(/run.*squad/);
+    expect(output.toLowerCase()).toMatch(/copilot session/i);
   });
 
   it('writes first-run marker so the REPL knows this is day one', async () => {

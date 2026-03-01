@@ -297,3 +297,106 @@
 **What:** The REPL shell must support full scrollback — users should be able to scroll up and down to see all text (paste, run output, rendered content, logs) over time, like GitHub Copilot CLI does. The current Ink-based rendering loses/hides content and that's unacceptable.
 **Why:** User request — captured for team memory. This is a P0 UX requirement for the shell.
 **Status:** P0 blocking issue. Requires rendering architecture review (Cheritto, Kovash, Marquez).
+
+### 2026-03-01T04:47Z: User directive — Auto-incrementing build numbers
+**By:** Brady (via Copilot)
+**What:** Add auto-incrementing build numbers to versions. Format: `0.8.6.{N}-preview` where N increments each local build. Tracks build-to-release cadence.
+**Why:** User request — captured for team memory.
+
+### 2026-03-01: Nap engine — dual sync/async export pattern
+**By:** Fenster (Core Dev)
+**What:** The nap engine (`cli/core/nap.ts`) exports both `runNap` (async, for CLI entry) and `runNapSync` (sync, for REPL). All internal operations use sync fs calls. The async wrapper exists for CLI convention consistency.
+**Why:** REPL `executeCommand` is synchronous and cannot await. ESM forbids `require()`. Exporting a sync variant keeps the REPL integration clean without changing the shell architecture.
+**Impact:** Future commands that need both CLI and REPL support should follow this pattern if they only do sync fs work.
+
+### 2026-03-01: First-run gating test strategy
+**By:** Hockney (Tester)
+**Date:** 2026-03-01
+**Issue:** #607
+**What:** Created `test/first-run-gating.test.ts` with 25 tests covering 6 categories of Init Mode gating. Tests use logic-level extraction from App.tsx conditionals, filesystem marker lifecycle via `loadWelcomeData`, and source-code structural assertions for render ordering. No full App component rendering — SDK dependencies make that impractical for unit tests.
+**Why:** 3059 tests existed with zero enforcement of first-run gating behavior. The `.first-run` marker, banner uniqueness, assembled-message gating, warning suppression, session-scoped keys, and terminal clear ordering were all untested paths that could regress silently.
+**Impact:** All squad members: if you modify `loadWelcomeData`, the `firstRunElement` conditional in App.tsx, or the terminal clear sequence in `runShell`, these tests will catch regressions. The warning suppression tests replicate the `cli-entry.ts` pattern — if that pattern changes, update both locations.
+
+### Verbal's Analysis: "nap" Skill — Context Window Optimization
+**By:** Verbal (Prompt Engineer)
+**Requested by:** Brady
+**Date:** 2026-03-01
+**Scope:** Approved. Build it. Current context budget analysis:
+- Agent spawn loads charter (~500t) + history + decisions.md (4,852t) + team.md (972t)
+- Hockney: 25,940t history (worst offender)
+- Fenster: 22,574t (history + CLI inventory)
+- Coherence cliff: 40-50K tokens on non-task context
+
+**Key Recommendations:**
+1. **Decision distillation:** Keep decisions.md as single source of truth (don't embed in charters — creates staleness/duplication)
+2. **History compression — 12KB rule insufficient:** Six agents blow past threshold. Target **4KB ceiling per history** (~1,000t) with assertions not stories.
+3. **Nap should optimize:** Deduplication (strip decisions.md content echoed in histories), staleness (flag closed PRs, merged work), charter bloat (stay <600t), skill pruning (archive high-confidence, no-recent-invocation skills), demand-loading for extra files (CLI inventory, UX catalog, fragility catalog).
+4. **Enforcement:** Nap runs periodically or on-demand, enforces hard ceilings without silent quality degradation.
+
+### ShellApi.clearMessages() for terminal state reset
+**By:** Kovash (REPL Expert)
+**Date:** 2026-03-01
+**What:** `ShellApi` now exposes `clearMessages()` which resets both `messages` and `archivedMessages` React state. Used in session restore and `/clear` command.
+**Why:** Without clearing archived messages, old content bleeds through when restoring sessions or clearing the shell. The `/clear` command previously only reset `messages`, leaving `archivedMessages` in the Static render list.
+**Impact:** Any code calling `shellApi` to reset shell state should use `clearMessages()` rather than manually manipulating message arrays.
+
+### 2026-03-01: Prompt placeholder hints must not duplicate header banner
+**By:** Kovash (REPL Expert)
+**Date:** 2026-03-01
+**Issue:** #606
+**What:** The InputPrompt placeholder text must provide *complementary* guidance, never repeat what the header banner already shows. The header banner is the single source of truth for @agent routing and /help discovery. Placeholder hints should surface lesser-known features (tab completion, history navigation, utility commands).
+**Why:** Two elements showing "Type @agent or /help" simultaneously creates visual noise and a confusing UX. One consistent prompt style throughout the session.
+**Impact:** `getHintText()` in InputPrompt.tsx now has two tiers instead of three. Any future prompt hints should check the header banner first to avoid duplication.
+
+### 2026-03-02: Paste detection via debounce in InputPrompt
+**By:** Kovash (REPL Expert)
+**Date:** 2026-03-02
+**What:** InputPrompt uses a 10ms debounce on `key.return` to distinguish paste from intentional Enter. If more input arrives within 10ms → paste detected → newline preserved. If timer fires without input → real Enter → submit. A `valueRef` (React ref) mirrors mutations synchronously since closure-captured `value` is stale during rapid `useInput` calls. In disabled state, `key.return` appends `\n` to buffer instead of being ignored.
+**Why:** Multi-line paste was garbled because `useInput` fires per-character and `key.return` triggered immediate submission.
+**Impact:** 10ms delay on single-line submit is imperceptible. UX: multi-line paste preserved. Testing: Hockney should verify paste scenarios use `jest.useFakeTimers()` or equivalent. Future: if Ink adds native bracketed-paste support, debounce can be replaced.
+
+### 2026-03-01: First-run init messaging — single source of truth
+**By:** Kovash (REPL & Interactive Shell)
+**Date:** 2026-03-01
+**Issue:** #625
+**What:** When no roster exists, only the header banner tells the user about `squad init` / `/init`. The `firstRunElement` block returns `null` for the empty-roster case instead of showing a duplicate message. `firstRunElement` is reserved for the "Your squad is assembled" onboarding when a roster already exists.
+**Why:** Two competing UI elements both said "run squad init" — visual noise that confuses the information hierarchy. Banner is persistent and visible; it owns the no-roster guidance. `firstRunElement` owns the roster-present first-run experience.
+**Impact:** App.tsx only. No API or prop changes. Banner text reworded to prioritize `/init` (in-shell path) over exit-and-run.
+
+### 2026-03-01: NODE_NO_WARNINGS for subprocess warning suppression
+**By:** Cheritto (TUI Engineer)
+**Date:** 2026-03-01
+**Issue:** #624
+**What:** `process.env.NODE_NO_WARNINGS = '1'` is set as the first executable line in `cli-entry.ts` (line 2, after shebang). This supplements the existing `process.emitWarning` override.
+**Why:** The Copilot SDK spawns child processes that inherit environment variables but NOT in-process monkey-patches like `process.emitWarning` overrides. `NODE_NO_WARNINGS=1` is the Node.js-native mechanism for suppressing warnings across an entire process tree. Without it, `ExperimentalWarning` messages (e.g., SQLite) leak into the terminal via the SDK's subprocess stderr forwarding.
+**Pattern:** When suppressing Node.js warnings, use BOTH: (1) `process.env.NODE_NO_WARNINGS = '1'` — covers child processes (env var inheritance); (2) `process.emitWarning` override — covers main process (belt-and-suspenders).
+**Impact:** Eliminates `ExperimentalWarning` noise in terminal for all Squad CLI users, including when the Copilot SDK spawns subprocesses.
+
+### 2026-03-01: No content suppression based on terminal width
+**By:** Cheritto (TUI Engineer)
+**Date:** 2026-03-01
+**What:** Terminal width tiers (compact ≤60, standard, wide ≥100) may adjust *layout* (e.g., wrapping, column arrangement) but must NOT suppress or truncate *content*. Every piece of information shown at 120 columns must also be shown at 40 columns.
+**Why:** Users can scroll. Hiding roster names, spacing, help text, or routing hints on narrow terminals removes information the user needs. Layout adapts to width; content does not.
+**Convention:** `compact` variable may be used for layout decisions (flex direction, column vs. row) but must NOT gate visibility of text, spacing, or UI sections. `wide` may add supplementary content but narrow must not remove it.
+
+### 2026-03-01: Multi-line user message rendering pattern
+**By:** Cheritto (TUI Engineer)
+**Date:** 2026-03-01
+**What:** Multi-line user messages in the Static scrollback use `split('\n')` with a column layout: first line gets the `❯` prefix, subsequent lines get `paddingLeft={2}` for alignment.
+**Why:** Ink's horizontal `<Box>` layout doesn't handle embedded `\n` in `<Text>` children predictably when siblings exist. Explicit line splitting with column flex direction gives deterministic multi-line rendering.
+**Impact:** Any future changes to user message prefix width must update the `paddingLeft={2}` on continuation lines to match.
+
+### 2026-03-01: Elapsed time display — inline after message content
+**By:** Cheritto (TUI Engineer)
+**Date:** 2026-03-01
+**Issue:** #605
+**What:** Elapsed time annotations on completed agent messages are always rendered inline after the message content as `(X.Xs)` in dimColor. This applies to the Static scrollback block in App.tsx, which is the canonical render path for all completed messages.
+**Why:** After the Static scrollback refactor, MessageStream receives `messages=[]` and only renders live streaming content. The duration code in MessageStream was dead. Moving duration display into the Static block ensures it always appears consistently.
+**Convention:** `formatDuration()` from MessageStream.tsx is the shared formatter. Format is `Xms` for <1s, `X.Xs` for ≥1s. Always inline, always dimColor, always after content text.
+
+### 2026-03-01: Banner usage line separator convention
+**By:** Cheritto (TUI Engineer)
+**Date:** 2026-03-01
+**What:** Banner hint/usage lines use middle dot `·` as inline separator. Init messages use single CTA (no dual-path instructions).
+**Why:** Consistent visual rhythm. Middle dot is lighter than em-dash or hyphen for inline command lists. Single CTA reduces cognitive load for new users.
+**Impact:** App.tsx headerElement. Future banner copy should follow same separator and single-CTA pattern.

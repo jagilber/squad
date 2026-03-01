@@ -797,3 +797,5 @@ All labeled squad:hockney for routing. Each issue includes: what's missing, why 
   - **#624 (SQLite warning suppression):** Structural test verifying NODE_NO_WARNINGS='1' is set before any import in cli-entry.ts. Filter test confirming process.emitWarning override blocks both string and object ExperimentalWarning forms while passing other warnings through.
   - **#625 (Redundant init messaging):** Logic test verifying empty roster + isFirstRun yields null firstRunElement (no duplicate init text). Logic test verifying non-empty roster still renders "assembled" message. Structural test confirming banner guidance text prioritizes /init over xit and run squad init.
 - All 30 tests pass (25 existing + 5 new). Test patterns match existing style: structural source verification, logic simulation, and process.emitWarning interception.
+📌 Team update (2026-03-01T05:57:23): Nap feature complete — dual sync/async export pattern, 38 comprehensive tests, all 3229 tests pass. Issue #635 closed, PR #636 merged. — decided by Fenster, Hockney
+

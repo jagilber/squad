@@ -10,6 +10,23 @@ function debugLog(...args: unknown[]): void {
   }
 }
 
+/**
+ * Check if team.md has actual roster entries in the ## Members section.
+ * Returns true if there is at least one table data row.
+ */
+export function hasRosterEntries(teamContent: string): boolean {
+  const membersMatch = teamContent.match(/## Members\s*\n([\s\S]*?)(?=\n## |\n*$)/);
+  if (!membersMatch) return false;
+  const membersSection = membersMatch[1] ?? '';
+  const rows = membersSection.split('\n').filter(line => {
+    const trimmed = line.trim();
+    return trimmed.startsWith('|') &&
+           !trimmed.match(/^\|\s*Name\s*\|/) &&
+           !trimmed.match(/^\|\s*-+\s*\|/);
+  });
+  return rows.length > 0;
+}
+
 export interface CoordinatorConfig {
   teamRoot: string;
   /** Path to routing.md */
@@ -30,6 +47,18 @@ export function buildCoordinatorPrompt(config: CoordinatorConfig): string {
   let teamContent = '';
   try {
     teamContent = readFileSync(teamPath, 'utf-8');
+    if (!hasRosterEntries(teamContent)) {
+      teamContent = `⚠️ NO TEAM CONFIGURED
+
+This project doesn't have a Squad team yet.
+
+**You MUST NOT do any project work.** Instead, tell the user:
+1. "This project doesn't have a Squad team yet."
+2. Suggest running \`squad init\` or the \`/init\` command to set one up.
+3. Politely refuse any work requests until init is done.
+
+Do not answer coding questions, route to agents, or perform any project tasks.`;
+    }
   } catch (err) {
     debugLog('buildCoordinatorPrompt: failed to read team.md at', teamPath, err);
     teamContent = `⚠️ NO TEAM CONFIGURED

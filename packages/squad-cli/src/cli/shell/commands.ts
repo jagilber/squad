@@ -56,6 +56,8 @@ export function executeCommand(
       return { handled: true, output: context.version ?? 'unknown' };
     case 'nap':
       return handleNap(args, context);
+    case 'init':
+      return handleInit(context);
     default:
       return { handled: false, output: `Hmm, /${command}? Type /help for commands.` };
   }
@@ -119,6 +121,7 @@ function handleHelp(args: string[]): CommandResult {
         '/agents — List team members',
         '/sessions — Past sessions',
         '/resume <id> — Restore session',
+        '/init — Set up your team',
         '/nap — Context hygiene',
         '/version — Show version',
         '/clear — Clear screen',
@@ -140,6 +143,7 @@ function handleHelp(args: string[]): CommandResult {
       '  /agents    — List all team members',
       '  /sessions  — List saved sessions',
       '  /resume    — Restore a past session',
+      '  /init      — Set up your team',
       '  /nap       — Context hygiene (compress, prune, archive)',
       '  /version   — Show version',
       '  /clear     — Clear the screen',
@@ -203,4 +207,21 @@ function handleNap(args: string[], context: CommandContext): CommandResult {
   } catch {
     return { handled: true, output: 'Nap failed. Run `squad nap` from the CLI for details.' };
   }
+}
+
+function handleInit(context: CommandContext): CommandResult {
+  return {
+    handled: true,
+    output: [
+      'To set up your Squad team:',
+      '',
+      '  1. Exit the REPL (Ctrl+C or /quit)',
+      '  2. Open this project in VS Code with GitHub Copilot',
+      '  3. Start a Copilot Chat — the coordinator will propose a team',
+      '',
+      'Or edit .squad/team.md directly to add team members.',
+      '',
+      `Team file: ${context.teamRoot}/.squad/team.md`,
+    ].join('\n'),
+  };
 }

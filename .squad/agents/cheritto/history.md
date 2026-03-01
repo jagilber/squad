@@ -194,3 +194,5 @@
 - **TypeScript:** Used `?? ''` for `split('\n')[0]` due to `noUncheckedIndexedAccess: true` in tsconfig.
 - **File changed:** `App.tsx` lines 349-360 (Static scrollback user message block)
 - Build clean (tsc passes for both squad-sdk and squad-cli).
+📌 Team update (2026-03-01T05:57:23): Nap feature complete — dual sync/async export pattern, 38 comprehensive tests, all 3229 tests pass. Issue #635 closed, PR #636 merged. — decided by Fenster, Hockney
+
