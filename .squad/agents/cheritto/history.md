@@ -25,6 +25,10 @@
 
 ## Learnings
 
+### 📌 Team update (2026-03-01T23:07:00): Issue audit completed — Cheritto + Hockney parallel TUI audit (#673–#681)
+- **Agents:** Cheritto (TUI code audit), Hockney (test verification)
+- **Result:** 3 OPEN (#673, #675, #679), 2 PARTIAL (#674, #681)
+- **Session log:** `.squad/log/20260301T23-07-00-issue-audit.md`
 
 ### 2026-02-26: Recent PR work — progress, animations, terminal, P2 polish, first-run UX, loading, animations, TUI fixes (#335–#446)
 - Added `activityHint?: string` to `AgentSession` type in `types.ts`

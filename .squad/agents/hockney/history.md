@@ -26,6 +26,12 @@
 
 ## Learnings
 
+### 📌 Team update (2026-03-01T23:07:00): Issue audit completed — Cheritto + Hockney parallel TUI audit (#673–#681)
+- **Agents:** Cheritto (TUI code audit), Hockney (test verification)
+- **Result:** 3 OPEN (#673, #675, #679), 2 PARTIAL (#674, #681)
+- **Aligned verification:** Test behavior confirmed all statuses
+- **Session log:** `.squad/log/20260301T23-07-00-issue-audit.md`
+
 ### Nap feature tests — Issue #635 (2026-03-01)
 **Status:** Complete — 38 new tests in `test/nap.test.ts`, all passing.
 - **Categories:** Metrics collection (3), History compression (5), Log pruning (3), Inbox cleanup (3), Decision archival (2), Deep mode (2), Dry-run mode (3), Journal safety (2), Report formatting (5), Edge cases (8), Combined scenarios (2).

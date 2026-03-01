@@ -578,3 +578,43 @@ Scribe and Ralph are always injected if missing from the proposal. Casting state
 - Interactive picker is discoverable and non-blocking; minimal cognitive load
 - Error messages with next actions reduce support friction
 - Onboarding defaults and migration notices ensure smooth upgrade path for existing users
+
+# Decision: Separator component is canonical for horizontal rules
+
+**By:** Cheritto (TUI Engineer)
+**Date:** 2026-03-02
+**Issues:** #655, #670, #671, #677
+
+## What
+
+- All horizontal separator lines in shell components must use the shared `Separator` component (`components/Separator.tsx`), not inline `box.h.repeat()` calls.
+- The `Separator` component handles terminal capability detection, box-drawing character degradation, and width computation internally.
+- Information hierarchy convention: **bold** for primary CTAs (commands, actions) > normal for content > **dim** for metadata (timestamps, status, hints).
+- `flexGrow` should not be used on containers that may be empty — it creates dead space in Ink layouts.
+
+## Why
+
+Duplicated separator logic was found in 3 files (App.tsx, AgentPanel.tsx, MessageStream.tsx). Consolidation to a single component prevents drift and makes it trivial to change separator style globally. The info hierarchy and whitespace conventions ensure visual consistency as new components are added.
+
+# Decision: CLI sessions use approve-all permission handler
+
+**Date:** 2025-07-14
+**Author:** Fenster (Core Dev)
+**Issue:** #651
+
+## Context
+
+The Copilot SDK requires an `onPermissionRequest` handler when creating sessions. This handler was defined in our adapter types (`SquadSessionConfig`) but was never wired in the CLI shell's 4 `createSession()` calls. External users hit a raw SDK error with no guidance.
+
+## Decision
+
+All CLI shell session creation calls now pass `onPermissionRequest: approveAllPermissions`, a handler that returns `{ kind: 'approved' }` for every request. The CLI runs locally with user trust — there is no interactive permission prompt.
+
+SDK consumers (programmatic API users) still control their own handler. The SDK's `createSession` in `adapter/client.ts` now catches the raw permission error and wraps it with a clear message explaining how to fix it.
+
+## Impact
+
+- **CLI users:** Error is gone. All permissions auto-approved (matches existing CLI trust model).
+- **SDK consumers:** Better error message if they forget to pass `onPermissionRequest`.
+- **Types:** `SquadPermissionHandler`, `SquadPermissionRequest`, `SquadPermissionRequestResult` are now exported from `@bradygaster/squad-sdk/client` for reuse.
+
