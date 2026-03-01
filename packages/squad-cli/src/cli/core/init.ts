@@ -399,7 +399,7 @@ Reusable patterns and heuristics learned through work. NOT transcripts — each 
 
   if (!isInitNoColor()) await sleep(80);
   console.log();
-  console.log(`${GREEN}${BOLD}Your team is ready.${RESET} Run ${CYAN}${BOLD}squad${RESET} to start.`);
+  console.log(`${GREEN}${BOLD}Scaffold ready.${RESET} Run ${CYAN}${BOLD}squad${RESET} to cast your team and start building.`);
   console.log();
 
   if (squadInfo.isLegacy) {

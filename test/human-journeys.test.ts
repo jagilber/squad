@@ -134,7 +134,7 @@ describe('Journey 1: I just installed this (squad init)', () => {
     await harness.close();
 
     // The human needs a clear next step — not silence
-    expect(output).toContain('Your team is ready');
+    expect(output).toContain('Scaffold ready');
     expect(output.toLowerCase()).toMatch(/run.*squad/);
   });
 
