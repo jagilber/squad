@@ -1105,3 +1105,303 @@ Brady's directive (2026-03-03T02:16:00Z): "squad-cli and squad-sdk must NOT be b
 - Reference this decision when asked "what version should we release?"
 - Use this model for all future releases (main project and public repo)
 - Update team onboarding docs to include this versioning distinction
+
+---
+
+## 2026-03-03: Risk Assessment — Migration Blockers Identified
+
+**By:** Keaton (Lead)  
+**Date:** 2026-03-03  
+**Impact:** BLOCKING — Do not execute migration until all 🔴 HIGH risks resolved.  
+
+### Summary
+
+Migration from bradygaster/squad-pr → bradygaster/squad has 5 critical risks and 3 medium-risk gaps. Most critical: PR #582 merge conflicts, version number mismatch (0.8.17 vs 0.8.18-preview), and missing .squad/ cleanup.
+
+### 🔴 HIGH Risks (Must Resolve)
+
+1. **PR #582 Merge Conflicts:** 11 commits, 57 files, CONFLICTING status. Merge base diverged. Key conflict zones: SDK exports, package.json, package-lock.json.
+   - **Mitigation:** Simulate merge locally, resolve conflicts, add Phase 2.5 validation (build, test, version verification).
+
+2. **Version Number Mismatch:** Checklist inconsistency between 0.8.17 (npm published), 0.8.18-preview (current packages), and 0.6.0 (migration target).
+   - **Mitigation:** Brady must decide: Is target version 0.8.17 (match npm) or 0.8.18 (new stable)? Align Phases 5, 8, 11 accordingly.
+
+3. **Prebuild Script Auto-Increment:** scripts/bump-build.mjs auto-increments on every 
+pm run build. Risk: versions drift during migration (0.8.18-preview → 0.8.18-preview.1).
+   - **Mitigation:** Disable prebuild during migration or manually manage version bumps. Lock versions before Phase 8 publish.
+
+4. **.squad/ Directory Cleanup Missing:** 67KB decisions.md, 47KB+ agent histories, orchestration logs, private PRDs should NOT ship to public repo.
+   - **Mitigation:** Add Phase 2.5 cleanup script. Remove history.md, prd-*.md, orchestration-log.md, catalogs, triage/. Update .gitignore.
+
+5. **Phase Ordering:** PR #582 merge not integrated into migration checklist. Checklist jumps from Phase 2 to Phase 3, skipping PR #582.
+   - **Mitigation:** Insert Phase 2.5 "Merge PR #582" between Phase 2 and Phase 3. Reference Kobayashi's decision file.
+
+### 🟡 MEDIUM Risks (Should Resolve)
+
+- **No .gitignore for .squad/ session state:** Future builds will regenerate session files. Add rules to prevent future leaks.
+- **Migration branch 9 commits ahead:** Drift risk. Consider auditing commits (especially ded5f35 "crashed session") and rebasing before merge.
+- **No npm publish permissions validation:** Phase 8 assumes credentials. Add Phase 1.5 dry-run: 
+pm publish --dry-run --access public.
+
+### Missing Phases & Gaps
+
+- **Gap 1:** No communication plan (who announces, where, when, what message)
+- **Gap 2:** No post-migration smoke test (install from npm, verify squad --version, squad init, squad doctor)
+- **Gap 3:** No monitoring plan (how to detect post-release issues)
+
+### Recommended Execution Order
+
+1. Phase 1: Prerequisites
+2. 🆕 Phase 1.5: npm publish dry-run validation
+3. Phase 2: Version alignment check (Brady decision: 0.8.17 or 0.8.18?)
+4. 🆕 Phase 2.5: Clean .squad/ directory for public release
+5. 🆕 Phase 2.6: Merge PR #582 (conflict resolution + validation)
+6. Phase 3: Push origin/migration to beta/migration
+7. *... continue existing phases ...*
+8. 🆕 Phase 14: Communication & announcement
+9. 🆕 Phase 15: Post-migration monitoring (48 hours)
+
+### Recommendation
+
+**DO NOT EXECUTE MIGRATION** until all HIGH risks are resolved. Version number confusion alone is a showstopper — publishing will fail. Estimated 4-6 hours to clear blockers.
+
+---
+
+## 2026-03-03: PR #582 Merge Plan — Conflict Resolution Strategy
+
+**By:** Kobayashi (Git & Release)  
+**Date:** 2026-02-24  
+**Status:** Planning (executed 2026-03-03)  
+
+### Summary
+
+PR #582 ("Consult mode implementation" by James Sturtevant) must merge into origin/migration BEFORE Phase 3. Detailed conflict resolution strategy documented.
+
+### Merge Details
+
+- **Source:** consult-mode-impl (11 commits, 57 files)
+- **Target:** origin/migration (local)
+- **Type:** --no-ff (explicit merge commit)
+- **Timeline:** Immediately before Phase 3
+
+### Conflict Resolution Rules
+
+**Version Conflicts (CRITICAL):**
+- Keep 0.8.18-preview everywhere. This is migration branch's current dev version.
+- Use git checkout --ours package.json packages/*/package.json
+- Verify post-merge: grep '"version"' package.json packages/*/package.json | grep -v 0.8.18-preview → must be empty
+
+**SDK Exports (index.ts):**
+- Likely conflict: Both branches have new exports
+- Strategy: Manual merge — ensure ALL exports from both branches retained
+- Validation: 
+pm run build must pass
+
+**package-lock.json:**
+- Strategy: Regenerate from scratch post-merge
+- If conflict: abort merge, then git merge ... && npm install && git add package-lock.json && git commit --amend
+
+**Test Files:**
+- Strategy: Manual merge — ensure both old and new tests included
+- Validation: 
+pm test must pass
+
+### Merge Commands
+
+`ash
+git fetch origin consult-mode-impl
+git checkout migration
+git merge origin/consult-mode-impl --no-ff -m "Merge PR #582: Consult mode implementation"
+# ... resolve conflicts as documented ...
+npm install
+git log migration --oneline -5
+grep '"version"' package.json packages/*/package.json
+`
+
+### Rollback
+
+If merge fails irreparably:
+`ash
+git merge --abort
+git status  # verify clean
+`
+
+Escalate to Brady and James Sturtevant for resolution.
+
+### Validation Checklist
+
+- [ ] Merge completes without fatal conflicts
+- [ ] All version strings are 0.8.18-preview (no 0.6.0)
+- [ ] 
+pm install succeeds
+- [ ] 
+pm run build succeeds
+- [ ] 
+pm test passes
+- [ ] Migration branch HEAD is merge commit
+- [ ] No uncommitted changes
+
+---
+
+## 2026-03-03: PR #582 Merge Executed Successfully
+
+**By:** Kobayashi (Git & Release)  
+**Date:** 2026-03-03  
+**Status:** ✅ Executed  
+
+### Summary
+
+PR #582 merged into migration branch. Consult mode feature fully integrated. 58 files changed with clean conflict resolution.
+
+### Merge Details
+
+- **Source:** consult-mode-impl (SHA 548a43be from jsturtevant/squad-pr fork)
+- **Target:** migration branch (commit 3be0fb5)
+- **Merge commit:** 17f2738
+- **Type:** --no-ff
+
+### Conflicts Resolved
+
+**Three version conflicts encountered and resolved:**
+- root package.json: 0.8.18-preview (ours) vs 0.8.16.4-preview.1 (theirs) → Kept 0.8.18-preview
+- packages/squad-cli/package.json: same conflict → Kept 0.8.18-preview
+- packages/squad-sdk/package.json: same conflict → Kept 0.8.18-preview
+
+**Rationale:** Migration branch must maintain 0.8.18-preview throughout. James' branch was based on older version state. Version numbers will be adjusted to v0.6.0 in Phase 4 (after merge to beta).
+
+### Changes Integrated
+
+- **58 files changed:** +12,791 insertions, -6,850 deletions
+- **Core feature:** Consult mode (packages/squad-sdk/src/sharing/consult.ts — 1,116 lines)
+- **CLI commands:** consult.ts, extract.ts
+- **SDK templates:** 26 new template files (charters, ceremonies, workflows, skills, agent format)
+- **SDK refactor:** init.ts consolidated (1,357 line changes moving CLI logic to SDK)
+- **Tests:** consult.test.ts (SDK: 767 lines, CLI: 181 lines)
+- **Config:** squad.config.ts added
+
+### Validation Results
+
+✅ TypeScript check: 
+px tsc --noEmit — PASSED  
+✅ Version verification: All three package.json files confirmed at 0.8.18-preview  
+✅ Git log: Merge commit visible at HEAD, clean history  
+
+### Key Learnings
+
+1. **Forked PR branches require direct fetch:** When PR branch isn't in origin, fetch from contributor's fork directly.
+2. **Monorepo version conflicts need triple-check:** Always verify root + both workspace packages.
+3. **Union merge driver protects .squad/ state:** No conflicts in .squad/agents/*/history.md files due to merge=union strategy.
+4. **Version integrity is non-negotiable:** Never allow merge to change versions until explicit Phase 4.
+
+### Next Steps
+
+- Phase 3: Push migration branch to beta repo
+- Phase 4: Create PR on beta repo (migration → main)
+- Consult mode feature will be part of v0.6.0 public release
+
+---
+
+## 2026-03-03: README.md Command Documentation — Alignment with CLI Implementation
+
+**By:** McManus (DevRel)  
+**Date:** 2026-03-06  
+**Impact:** Documentation accuracy, user discoverability  
+
+### Problem Identified
+
+Brady flagged README.md "All Commands" section no longer matches CLI --help output:
+1. squad run <agent> [prompt] listed in README but NOT in CLI
+2. squad nap in CLI --help but missing from README
+3. Command aliases not documented (init→hire, doctor→heartbeat, triage→watch/loop)
+
+### Investigation Results
+
+- **14 core commands exist** in CLI: init, upgrade, status, triage, copilot, doctor, link, upstream, nap, export, import, plugin, aspire, scrub-emails
+- **4 aliases registered:** hire→init, heartbeat→doctor, watch→triage, loop→triage
+- **squad run does NOT exist** in codebase (no registration, no handler)
+- **squad nap IS implemented** (line 449 in cli-entry.ts: help text exists)
+
+### Decision
+
+**Removed squad run** from README's "All Commands" table.  
+**Added squad nap** to "Utilities" section with flag documentation.  
+**Added alias documentation** inline for init (hire), doctor (heartbeat), triage (watch, loop).  
+
+### Changes Made
+
+**README.md lines 64–82:**
+- Removed row: squad run <agent> [prompt]
+- Inserted (after upstream): squad nap | Context hygiene — compress, prune, archive...
+- Updated init row: added lias: hire
+- Updated doctor row: added lias: heartbeat
+- Updated triage row: clarified (aliases: watch, loop)
+- Enhanced copilot, nap, plugin descriptions with flag details
+
+### Why This Matters
+
+- **Source of truth:** CLI --help is implementation contract. Docs must reflect it.
+- **User trust:** Listing non-existent commands erodes confidence and wastes troubleshooting time.
+- **Consistency:** Aliases belong next to base commands for discoverability.
+- **Tone ceiling:** No hand-waving about features that don't exist; claims substantiated by implementation.
+
+### Follow-Up Recommendations
+
+1. Add docs-sync test to CI (annual comparison of CLI --help with README command table)
+2. If squad run implemented in future, add back to README with full documentation
+3. Enforce README update as part of CLI feature release PR checklist
+
+---
+
+## 2026-03-03: GitHub npx Distribution Channel — Recommendation Against
+
+**By:** Rabin (Distribution)  
+**Date:** 2026-03 (decision deferred)  
+**Status:** Recommendation  
+
+### Question
+
+Can we support 
+px github:bradygaster/squad alongside npm channel (
+px @bradygaster/squad-cli)?
+
+### Answer
+
+Technically yes, practically no. Not recommended.
+
+### What It Would Take (3 Changes)
+
+1. Add "bin": { "squad": "./cli.js" } to root package.json
+2. Add "prepare": "npm run build" to root package.json scripts
+3. Update root cli.js to forward to CLI without deprecation notice
+
+### Why Not Recommended
+
+| Factor | npm channel | GitHub npx channel |
+|--------|------------|-------------------|
+| First-run speed | ~3 seconds (pre-built tarball) | ~30+ seconds (clone + install + build) |
+| Download size | CLI + production deps only | Entire repo + ALL devDeps (TS, esbuild, Vitest, Playwright) |
+| Caching | npm cache works | Git clone every time |
+| Version pinning | @0.8.18 (semver) | #v0.8.18 (git ref, not semver-aware) |
+| Build failures | Never (pre-built) | User-facing if build chain breaks |
+| Maintenance | Zero (npm publish handles it) | Must ensure prepare script stays working |
+
+### Core Problem
+
+
+px github: installs from source. It clones repo, installs ALL dependencies (including devDeps), runs a build, then executes. This is fundamentally slower and more fragile than pre-built tarball from npm.
+
+The old beta worked because it was a single-file CLI with zero build step. The new monorepo with TypeScript compilation makes the GitHub path significantly worse UX.
+
+### Alternative
+
+GitHub Packages registry (npm registry hosted on GitHub). Same pre-built tarball, different registry URL. But requires auth tokens for consumers — worse than public npm.
+
+### Recommendation
+
+**Keep npm-only.** Aligns with existing team decision (2026-02-21). GitHub channel adds maintenance burden for strictly worse user experience. The error-only shim in root cli.js (already implemented) correctly directs users to npm.
+
+### Who This Affects
+
+- **All team members:** No change needed. Continue using npm references in docs/examples.
+- **Brady:** If "cool URL" matters enough, 3 changes above would work. But UX trade-offs not recommended.
+

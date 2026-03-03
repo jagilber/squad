@@ -858,3 +858,5 @@ McManus updated CHANGELOG.md with v0.6.0 entries and created docs/squadui-integr
 
 Multi-agent build of Rock-Paper-Scissors game with 10 AI strategies, Docker infrastructure, and full documentation. Fenster (Coordinator) identified and resolved 3 integration bugs (ID mismatch, move parsing, history semantics). Sample ready for use.
 
+
+📌 Team update (2026-03-03T03-08-17Z): PR #582 merge executed successfully (17f2738). Risk assessment completed. README audit finalized. 4 decisions merged to decisions.md, orchestration logs written. Blockers: Brady version decision, .squad/ cleanup script, .gitignore rules. DO NOT execute migration until HIGH risks resolved. — Keaton, Kobayashi, McManus

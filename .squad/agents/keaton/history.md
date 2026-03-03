@@ -529,3 +529,5 @@ Keaton's split plan produced definitive SDK/CLI mapping with clean DAG (CLI → 
 2. Request PRD move to proposals/
 3. Discuss architecture before implementation (sharing/ module fit, session vs history, extraction strategy)
 4. Break into smaller implementation PRs with actual code
+
+📌 Team update (2026-03-03T03-08-17Z): PR #582 merge executed successfully (17f2738). Risk assessment completed. README audit finalized. 4 decisions merged to decisions.md, orchestration logs written. Blockers: Brady version decision, .squad/ cleanup script, .gitignore rules. DO NOT execute migration until HIGH risks resolved. — Keaton, Kobayashi, McManus

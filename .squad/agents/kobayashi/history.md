@@ -411,3 +411,5 @@ Kobayashi aligned all version strings to 0.8.0 (SDK package, CLI package, VERSIO
 - **Version integrity verified:** All three package.json files correctly at 0.8.18-preview post-merge (root, squad-cli, squad-sdk)
 - **Learning:** Forked PR branches require fetching from contributor's fork URL directly when branch not pushed to origin. Version conflicts in monorepo merges require checking all three package.json locations (root + both packages). Union merge driver handled .squad/ files cleanly (no Fenster history conflicts).
 - **Outcome:** Consult mode feature (PR #582) successfully integrated into migration branch. Migration branch now ready for next phase (push to beta). All version strings protected at 0.8.18-preview.
+
+📌 Team update (2026-03-03T03-08-17Z): PR #582 merge executed successfully (17f2738). Risk assessment completed. README audit finalized. 4 decisions merged to decisions.md, orchestration logs written. Blockers: Brady version decision, .squad/ cleanup script, .gitignore rules. DO NOT execute migration until HIGH risks resolved. — Keaton, Kobayashi, McManus
