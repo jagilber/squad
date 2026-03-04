@@ -1,5 +1,3 @@
-> **⚠️ SUPERSEDED** — This document has been consolidated into [`docs/migration-checklist.md`](migration-checklist.md). Retained for reference only.
-
 # Migration Guide: GitHub-native to npm
 
 > ⚠️ **Experimental** — Squad is alpha software. APIs, commands, and behavior may change between releases.
