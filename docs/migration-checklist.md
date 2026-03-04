@@ -58,16 +58,22 @@ If NOT checked, STOP. Do not proceed.
 ---
 
 ## Phase 4: Merge beta/migration → beta/main
-- [ ] Navigate to beta repo (or switch remote context)
-- [ ] Create PR: `gh pr create --repo bradygaster/squad --base main --head migration --title "Migration: squad-pr → squad" --body "..."`
-- [ ] PR body should include:
-  - [ ] Version jump: v0.5.4 → v0.8.18
-  - [ ] Breaking changes (monorepo, npm distribution, .squad/ vs .ai-team/)
-  - [ ] User upgrade path (GitHub-native → npm)
-  - [ ] Distribution change (npx github: → npm install -g)
-- [ ] Wait for CI checks (if any)
-- [ ] Merge PR to beta/main
-- [ ] Verify merge: `git fetch beta && git log beta/main -5`
+- [x] Navigate to beta repo (or switch remote context)
+- [x] Create PR: `gh pr create --repo bradygaster/squad --base main --head migration --title "Migration: squad-pr → squad" --body "..."`
+- [x] PR body should include:
+  - [x] Version jump: v0.5.4 → v0.8.18
+  - [x] Breaking changes (monorepo, npm distribution, .squad/ vs .ai-team/)
+  - [x] User upgrade path (GitHub-native → npm)
+  - [x] Distribution change (npx github: → npm install -g)
+- [x] Wait for CI checks (if any)
+- [x] Merge PR to beta/main
+- [x] Verify merge: `git fetch beta && git log beta/main -5`
+
+**✅ VERIFIED COMPLETE.**
+- PR #186 created with comprehensive migration documentation
+- Merge resolved all conflicts by accepting migration branch content
+- Merge commit: ac9e156 (beta/main) includes full migration history
+- beta/main now points to v0.8.18-preview monorepo structure
 
 ---
 
