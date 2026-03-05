@@ -438,6 +438,18 @@ function stampVersionInContent(content: string, version: string): string {
  * @param options - Initialization options
  * @returns Result with created file paths
  */
+
+/**
+ * Workflow files that are part of the Squad framework and should always be installed.
+ * Other workflows in templates/workflows/ are generic CI/CD scaffolding and are opt-in.
+ */
+const FRAMEWORK_WORKFLOWS = [
+  'squad-heartbeat.yml',
+  'squad-issue-assign.yml',
+  'squad-triage.yml',
+  'sync-squad-labels.yml',
+];
+
 export async function initSquad(options: InitOptions): Promise<InitResult> {
   const {
     teamRoot,
@@ -802,7 +814,8 @@ ${projectDescription ? `- **Description:** ${projectDescription}\n` : ''}- **Cre
     const workflowsDest = join(teamRoot, '.github', 'workflows');
     
     if (statSync(workflowsSrc).isDirectory()) {
-      const workflowFiles = readdirSync(workflowsSrc).filter(f => f.endsWith('.yml'));
+      const allWorkflowFiles = readdirSync(workflowsSrc).filter(f => f.endsWith('.yml'));
+      const workflowFiles = allWorkflowFiles.filter(f => FRAMEWORK_WORKFLOWS.includes(f));
       await mkdir(workflowsDest, { recursive: true });
       
       for (const file of workflowFiles) {
