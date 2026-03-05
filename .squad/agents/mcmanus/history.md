@@ -851,6 +851,49 @@ McManus updated CHANGELOG.md with v0.6.0 entries **[CORRECTED: v0.6.0 is outdate
 **Tone applied:** Light, prompt-first (beta tone preserved). No hype, no internal markers, CLI commands updated for v1 distribution.
 **Notes:**
 - docs/build.js already supported multi-directory sections — no build script changes needed
+
+### 2026-03-07: Contributors hall of fame created for v0.8.21
+
+**Status:** Complete. CONTRIBUTORS.md replaced placeholder with real squad roster and v0.8.21 release credits.
+
+**Work completed:**
+
+1. **Built "The Squad" section** — 20-member roster table with roles and domains:
+   - Extracted from `.squad/team.md` roster (Keaton through Waingro)
+   - Mapped each agent to their charter (from `.squad/agents/{member}/charter.md`)
+   - Created table: Name | Role | Domain
+   - Celebratory opener: "Squad is built by an AI team where each member owns a domain and ships real work."
+
+2. **Created v0.8.21 Contributors section** — Release credits for key work:
+   - **Saul:** Aspire Docker-only refactor — 27-test expansion (18→45), hardened CLI wiring
+   - **Verbal:** Squad Places integration — feedback session (18 agents), 3-wave artifact socialization
+   - **Fenster:** Squad Places client — REST API rewrite, offline queue, core runtime integration
+   - **Hockney:** Aspire test expansion — Docker path, port validation, error handling coverage
+   - **Kobayashi:** Release management — v0.8.20 docs, v0.8.21-preview.1 bump, branch strategy
+   - **McManus:** Docs & tone — audit completed (10 issues filed), tone ceiling enforced, consistency verified
+   - Source: `git --no-pager log v0.8.20..dev` commit messages + agent charter ownership
+
+3. **Updated docs/release-checklist.md** — Added permanent checklist item:
+   - New step in "Pre-Release Steps (All Releases)": **Review and update CONTRIBUTORS.md with v0.X.X section**
+   - Ensures every future release includes contributors page (Brady's requirement: "every release updated")
+   - Placed after CHANGELOG.md review, before version verification
+
+4. **Kept existing structure intact:**
+   - Insider Program section unchanged (top of file)
+   - Join section with CONTRIBUTING.md link preserved (bottom)
+   - Tone ceiling maintained: real credits, no hype, no unsubstantiated claims
+
+**Tone & messaging:**
+- Celebratory but grounded — lists actual work shipped by each contributor
+- Avoids marketing language; uses concrete technical outcomes (Docker refactor, test count, API rewrite)
+- Hierarchical: roster (all members) → v0.8.21 (active contributors) → Join (invitation to contribute)
+- Accessible: table format makes scanning easy, links connect to CONTRIBUTING.md for new contributors
+
+**Impact:**
+- Contributors page now reflects team structure and celebrates real work
+- Release checklist enforces contributors page updates (Brady requirement satisfied)
+- Sets template for future releases (v0.8.22, etc.) — format proven, process documented
+- Signals to users: This is a real team doing real work, each member accountable for their domain
 - docs/launch/ left untouched (internal release notes, separate concern)
 - migration-github-to-npm.md at root left as-is (separate migration doc, not part of restructure)
 
