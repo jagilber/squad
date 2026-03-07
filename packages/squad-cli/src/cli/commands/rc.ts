@@ -181,12 +181,19 @@ export async function runRC(cwd: string, options: RCOptions): Promise<void> {
 
   // Spawn copilot --acp as transparent relay (dumb pipe)
   // Copilot needs ~20s to load MCP servers before accepting ACP requests
-  // The native exe is used directly for reliable stdio piping on Windows
-  const copilotExePath = path.join(
-    'C:', 'ProgramData', 'global-npm', 'node_modules', '@github', 'copilot',
-    'node_modules', '@github', 'copilot-win32-x64', 'copilot.exe'
-  );
-  const copilotCmd = fs.existsSync(copilotExePath) ? copilotExePath : 'copilot';
+  // Try to find copilot in common locations, fall back to PATH
+  let copilotCmd = 'copilot';
+  
+  // On Windows, try the global npm location first
+  if (process.platform === 'win32') {
+    const winPath = path.join(
+      'C:', 'ProgramData', 'global-npm', 'node_modules', '@github', 'copilot',
+      'node_modules', '@github', 'copilot-win32-x64', 'copilot.exe'
+    );
+    if (fs.existsSync(winPath)) {
+      copilotCmd = winPath;
+    }
+  }
 
   console.log(`  ${DIM}Spawning copilot --acp (MCP servers loading ~15-20s)...${RESET}`);
   let copilotProc: ReturnType<typeof spawnChild> | null = null;
@@ -273,6 +280,7 @@ export async function runRC(cwd: string, options: RCOptions): Promise<void> {
   // Clean shutdown
   const cleanup = async () => {
     console.log(`\n  ${DIM}Shutting down...${RESET}`);
+    clearInterval(checkInterval);
     copilotProc?.kill();
     destroyTunnel();
     await bridge.stop();

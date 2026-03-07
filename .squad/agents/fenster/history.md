@@ -889,3 +889,72 @@ pm test\: 3768 tests passed (2 pre-existing failures unrelated to changes)
 
 
 📌 Team update (2026-03-07T21:06:29Z): Team restructure — Kobayashi retired, Trejo (Release Manager) + Drucker (CI/CD Engineer) hired. Separation of concerns: Trejo WHAT/WHEN, Drucker HOW. 10 decisions merged. 4-0 REPLACE vote. — Scribe
+
+---
+
+## Squad RC Code Review (2026-03-07)
+
+**Task:** Verify `squad rc` implementation before Brady ships docs. Check if it builds, runs, and has correct wiring.
+
+### Bugs Found & Fixed
+
+1. **CRITICAL: remote-ui static files not copied to dist**
+   - **Issue:** The `remote-ui` directory (containing index.html, app.js, styles.css, manifest.json) exists in `src/` but was NOT being copied to `dist/` during build
+   - **Impact:** At runtime, rc.ts tries to serve PWA files from `../../remote-ui` relative to compiled `dist/cli/commands/rc.js`, which resolves to `dist/remote-ui/` — a directory that doesn't exist. Would cause 404s for all UI assets.
+   - **Fix:** Added postbuild script to package.json: `"postbuild": "node -e \"require('fs').cpSync('src/remote-ui', 'dist/remote-ui', {recursive: true})\""`
+   - **Verified:** Files now correctly copied, path resolution works
+
+2. **Hardcoded Windows-only copilot.exe path**
+   - **Issue:** Lines 185-189 in rc.ts hardcoded `C:\ProgramData\global-npm\...\copilot-win32-x64\copilot.exe` with no platform check
+   - **Impact:** Would fail silently on macOS/Linux, though fallback to `'copilot'` command exists
+   - **Fix:** Added platform check: only use hardcoded path on Windows (`process.platform === 'win32'`)
+   - **Behavior:** Windows tries specific path first, all platforms fall back to `'copilot'` in PATH
+
+3. **Minor: checkInterval not cleaned up on shutdown**
+   - **Issue:** Line 294's `setInterval` for connection count logging wasn't cleared in cleanup()
+   - **Impact:** Minor resource leak on shutdown (process exits anyway, but cleaner is better)
+   - **Fix:** Added `clearInterval(checkInterval)` to cleanup function
+
+### Verification Checklist
+
+✅ **Build:** Clean build with 0 TypeScript errors  
+✅ **CLI wiring:** Command properly routed in cli-entry.ts (line 434-442), import resolves  
+✅ **rc-tunnel wiring:** Command wired at line 468-475  
+✅ **RemoteBridge exports:** Correctly exported from squad-sdk/src/remote/index.ts  
+✅ **Static files:** remote-ui/ now copied to dist/, contains index.html, app.js, styles.css, manifest.json  
+✅ **Path resolution:** From dist/cli/commands/rc.js, ../../remote-ui correctly resolves to dist/remote-ui/  
+✅ **Error handling:** Copilot spawn errors caught (line 239-240), devtunnel missing handled (line 245-249), tunnel failures handled (line 269-271)  
+✅ **SIGINT cleanup:** Properly wired with process.on('SIGINT', cleanup) and process.on('SIGTERM', cleanup)
+
+### What Works
+
+- **RemoteBridge:** Solid implementation with rate limiting, session tokens, audit logging, ticket-based auth
+- **Devtunnel integration:** Proper lifecycle (create, host, destroy), label-based discovery, 1-day expiration
+- **Copilot passthrough:** Spawns `copilot --acp`, pipes stdin/stdout to WebSocket clients as JSON-RPC relay
+- **PWA static serving:** Security headers, directory traversal protection, EISDIR guards
+- **Team roster loading:** Parses team.md Active members
+- **Error resilience:** Graceful degradation when copilot missing, devtunnel unavailable, or tunnel fails
+
+### Known Limitations (NOT bugs, document as-is)
+
+1. **Copilot path assumption:** Windows path assumes global npm at `C:\ProgramData\global-npm\` — works for most installs, falls back to PATH
+2. **Devtunnel CLI required:** Windows-specific install instructions (`winget install Microsoft.devtunnel`) — works, but platform-specific
+3. **MCP warmup time:** ~15-20s for copilot to load MCP servers before accepting ACP — documented in code comments
+
+### Build Output
+
+- All files built successfully to dist/
+- remote-ui/ copied with 4 files (index.html, app.js, styles.css, manifest.json)
+- Import paths resolve correctly
+- Zero compilation errors
+
+## Learnings
+
+- **Static asset copying:** TypeScript compiler doesn't copy non-TS files. Must add postbuild script to package.json for asset directories like remote-ui/
+- **Platform-specific paths:** Always guard platform-specific code with `process.platform === 'win32'` checks, provide cross-platform fallbacks
+- **Interval cleanup:** Track setInterval return values, clear them in cleanup functions even if process exits anyway
+- **Build verification pattern:** Check both src/ AND dist/ when verifying file paths — tsc only outputs .js/.d.ts, not static assets
+- **Import resolution in ESM:** Dynamic imports like `await import('./cli/commands/rc.js')` resolve from dist/ at runtime, not src/
+- **Remote Control architecture:** RemoteBridge = HTTP server (static files) + WebSocket server (events) + passthrough pipe (copilot --acp). Three layers, one server.
+- **squad rc wiring:** cli-entry.ts checks `cmd === 'rc' || cmd === 'remote-control'`, dynamic import, parse flags, call runRC()
+- **Devtunnel labels:** Only allow `[a-zA-Z0-9_-=]`, sanitize with regex replace, max 50 chars per label

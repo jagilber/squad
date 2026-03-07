@@ -1,6 +1,6 @@
 {
   "name": "@bradygaster/squad-cli",
-  "version": "0.8.22",
+  "version": "0.8.22.4",
   "description": "Squad CLI — Command-line interface for the Squad multi-agent runtime",
   "type": "module",
   "bin": {
@@ -124,6 +124,10 @@
       "types": "./dist/cli/commands/rc-tunnel.d.ts",
       "import": "./dist/cli/commands/rc-tunnel.js"
     },
+    "./commands/rc": {
+      "types": "./dist/cli/commands/rc.d.ts",
+      "import": "./dist/cli/commands/rc.js"
+    },
     "./commands/extract": {
       "types": "./dist/cli/commands/extract.d.ts",
       "import": "./dist/cli/commands/extract.js"
@@ -144,7 +148,8 @@
   ],
   "scripts": {
     "prepublishOnly": "npm run build",
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json && npm run postbuild",
+    "postbuild": "node -e \"require('fs').cpSync('src/remote-ui', 'dist/remote-ui', {recursive: true})\""
   },
   "engines": {
     "node": ">=20"
