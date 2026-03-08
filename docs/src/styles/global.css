@@ -130,6 +130,11 @@ body {
   @apply my-8 border-surface-200 dark:border-surface-700;
 }
 
+/* Docs layout — sidebar + main scroll independently */
+.docs-layout {
+  @apply flex h-[calc(100vh-3.5rem)];
+}
+
 /* Sidebar styles */
 .sidebar-link {
   @apply block px-3 py-1.5 text-sm rounded-md transition-colors text-surface-600 dark:text-surface-400 hover:bg-surface-100 dark:hover:bg-surface-800 hover:text-surface-900 dark:hover:text-white;
@@ -148,4 +153,16 @@ html.dark .astro-code,
 html.dark .astro-code span {
   color: var(--shiki-dark) !important;
   background-color: var(--shiki-dark-bg) !important;
+}
+
+/* Pagefind search result highlights */
+mark[data-pagefind-highlight] {
+  @apply bg-squad-200 dark:bg-squad-800 text-surface-900 dark:text-white rounded-sm px-0.5;
+}
+
+.line-clamp-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }

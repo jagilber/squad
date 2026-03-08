@@ -26,6 +26,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
 
       - name: Install docs dependencies
         working-directory: docs
@@ -33,7 +35,7 @@ jobs:
 
       - name: Build docs site
         working-directory: docs
-        run: npx astro build
+        run: npm run build
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

@@ -15,11 +15,11 @@ const { title, description, currentSlug } = Astro.props;
 
 <BaseLayout title={title} description={description}>
   <Header />
-  <div class="flex min-h-[calc(100vh-3.5rem)]">
+  <div class="docs-layout">
     <Sidebar currentSlug={currentSlug} />
-    <main class="flex-1 min-w-0">
+    <main class="flex-1 min-w-0 overflow-y-auto h-[calc(100vh-3.5rem)]">
       <div class="max-w-4xl mx-auto px-4 py-8 sm:px-6 lg:px-8">
-        <article class="prose">
+        <article class="prose" data-pagefind-body>
           <slot />
         </article>
       </div>

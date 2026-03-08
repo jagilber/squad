@@ -129,7 +129,7 @@ describe('Docs Build Script (Astro)', () => {
     if (existsSync(DIST_DIR)) {
       rmSync(DIST_DIR, { recursive: true, force: true });
     }
-    execSync('npx astro build', { cwd: DOCS_DIR, timeout: 120_000 });
+    execSync('npm run build', { cwd: DOCS_DIR, timeout: 120_000 });
   }, 120_000);
 
   afterAll(() => {
@@ -156,7 +156,7 @@ describe('Docs Build Script (Astro)', () => {
   it('build runs without errors (exit code 0)', () => {
     if (!existsSync(join(DOCS_DIR, 'package.json'))) return;
     expect(() => {
-      execSync('npx astro build', { cwd: DOCS_DIR, timeout: 120_000 });
+      execSync('npm run build', { cwd: DOCS_DIR, timeout: 120_000 });
     }).not.toThrow();
   }, 120_000);
 
@@ -279,5 +279,22 @@ describe('Docs Build Script (Astro)', () => {
     if (!requireBuild()) return;
     const html = readDocHtml('tips-and-tricks', 'guide');
     expect(html).toMatch(/<article[\s>]/);
+  });
+
+  // --- 8. Search (Pagefind) ---
+
+  it('pagefind index is generated in dist/', () => {
+    if (!requireBuild()) return;
+    const pagefindDir = join(DIST_DIR, 'pagefind');
+    expect(existsSync(pagefindDir), 'pagefind/ directory missing').toBe(true);
+    expect(existsSync(join(pagefindDir, 'pagefind.js')), 'pagefind.js missing').toBe(true);
+    expect(existsSync(join(pagefindDir, 'pagefind-entry.json')), 'pagefind-entry.json missing').toBe(true);
+  });
+
+  it('doc pages include search UI in header', () => {
+    if (!requireBuild()) return;
+    const html = readDocHtml('tips-and-tricks', 'guide');
+    expect(html).toContain('id="search-btn"');
+    expect(html).toContain('id="search-modal"');
   });
 });
