@@ -13,13 +13,13 @@ Squad is built by contributors who believe in democratizing multi-agent developm
 
 We welcome contributions in all forms:
 
-**For detailed contribution guidelines, including branch rules and PR process, see [CONTRIBUTING.md](../CONTRIBUTING.md).**
+**For detailed contribution guidelines, including branch rules and PR process, see the [Contributing Guide](./guide/contributing.html).**
 
 ### Report Issues
 Found a bug, have a feature request, or want to discuss an idea? [Open an issue](https://github.com/bradygaster/squad/issues).
 
 ### Submit a Pull Request
-Ready to contribute code? [Check out the open issues](https://github.com/bradygaster/squad/issues) and submit a PR. See [CONTRIBUTING.md](../CONTRIBUTING.md) for branch protection rules and the branch model.
+Ready to contribute code? [Check out the open issues](https://github.com/bradygaster/squad/issues) and submit a PR. See the [Contributing Guide](./guide/contributing.html) for branch protection rules and the branch model.
 
 ### Join the Discussion
 Have questions, want to share how you're using Squad, or discuss the roadmap? [Start a discussion](https://github.com/bradygaster/squad/discussions).

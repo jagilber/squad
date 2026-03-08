@@ -44,7 +44,7 @@ const SECTIONS = [
 // Explicit ordering within sections (filename without .md → priority)
 const SECTION_ORDER = {
   'get-started': ['installation', 'first-session', 'migration'],
-  'guide': ['tips-and-tricks', 'sample-prompts', 'personal-squad'],
+  'guide': ['tips-and-tricks', 'sample-prompts', 'personal-squad', 'contributing'],
   'features': [
     'team-setup', 'routing', 'model-selection', 'response-modes',
     'parallel-execution', 'memory', 'skills', 'directives',
