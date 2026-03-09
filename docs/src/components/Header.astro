@@ -1,7 +1,18 @@
 ---
+import { Image } from 'astro:assets';
 import ThemeToggle from './ThemeToggle.astro';
 import Search from './Search.astro';
+import squadLogo from '../assets/images/squad-logo.png';
 const base = import.meta.env.BASE_URL;
+const pathname = Astro.url.pathname;
+const isDocsActive = pathname.startsWith(`${base}docs/`);
+const isBlogActive = pathname.startsWith(`${base}blog/`);
+
+const navBase = "px-3 py-1.5 rounded-md transition-colors";
+const navInactive = "text-surface-600 dark:text-surface-400 hover:text-surface-900 dark:hover:text-white hover:bg-surface-100 dark:hover:bg-surface-800";
+const navActive = "text-squad-700 dark:text-squad-300 bg-squad-50 dark:bg-squad-900/30 font-medium";
+
+const mobileNavBase = "block px-3 py-2 rounded-md text-base transition-colors";
 ---
 
 <header class="sticky top-0 z-40 w-full border-b border-surface-200 dark:border-surface-800 bg-white/80 dark:bg-surface-950/80 backdrop-blur-lg">
@@ -30,15 +41,15 @@ const base = import.meta.env.BASE_URL;
 
     <!-- Logo -->
     <a href={base} class="flex items-center gap-2 font-semibold text-surface-900 dark:text-white mr-6">
-      <img src={`${base}images/squad-logo.png`} alt="Squad" class="h-7 w-7" />
+      <Image src={squadLogo} alt="Squad" class="h-7 w-7" />
       <span class="text-lg">Squad</span>
     </a>
 
     <!-- Top nav links (desktop) -->
     <nav class="hidden md:flex items-center gap-1 text-base">
-      <a href={`${base}docs/get-started/installation/`} class="px-3 py-1.5 rounded-md text-surface-600 dark:text-surface-400 hover:text-surface-900 dark:hover:text-white hover:bg-surface-100 dark:hover:bg-surface-800 transition-colors">Docs</a>
-      <a href={`${base}blog/`} class="px-3 py-1.5 rounded-md text-surface-600 dark:text-surface-400 hover:text-surface-900 dark:hover:text-white hover:bg-surface-100 dark:hover:bg-surface-800 transition-colors">Blog</a>
-      <a href="https://github.com/bradygaster/squad" class="px-3 py-1.5 rounded-md text-surface-600 dark:text-surface-400 hover:text-surface-900 dark:hover:text-white hover:bg-surface-100 dark:hover:bg-surface-800 transition-colors" target="_blank" rel="noopener">GitHub</a>
+      <a href={`${base}docs/get-started/installation/`} class:list={[navBase, isDocsActive ? navActive : navInactive]}>Docs</a>
+      <a href={`${base}blog/`} class:list={[navBase, isBlogActive ? navActive : navInactive]}>Blog</a>
+      <a href="https://github.com/bradygaster/squad" class:list={[navBase, navInactive]} target="_blank" rel="noopener">GitHub</a>
     </nav>
 
     <!-- Right side -->
@@ -62,9 +73,9 @@ const base = import.meta.env.BASE_URL;
   <!-- Mobile nav dropdown -->
   <nav id="mobile-nav" class="hidden md:hidden border-t border-surface-200 dark:border-surface-800 bg-white dark:bg-surface-950">
     <div class="px-4 py-3 space-y-1">
-      <a href={`${base}docs/get-started/installation/`} class="block px-3 py-2 rounded-md text-base text-surface-600 dark:text-surface-400 hover:text-surface-900 dark:hover:text-white hover:bg-surface-100 dark:hover:bg-surface-800 transition-colors">Docs</a>
-      <a href={`${base}blog/`} class="block px-3 py-2 rounded-md text-base text-surface-600 dark:text-surface-400 hover:text-surface-900 dark:hover:text-white hover:bg-surface-100 dark:hover:bg-surface-800 transition-colors">Blog</a>
-      <a href="https://github.com/bradygaster/squad" class="block px-3 py-2 rounded-md text-base text-surface-600 dark:text-surface-400 hover:text-surface-900 dark:hover:text-white hover:bg-surface-100 dark:hover:bg-surface-800 transition-colors" target="_blank" rel="noopener">GitHub</a>
+      <a href={`${base}docs/get-started/installation/`} class:list={[mobileNavBase, isDocsActive ? navActive : navInactive]}>Docs</a>
+      <a href={`${base}blog/`} class:list={[mobileNavBase, isBlogActive ? navActive : navInactive]}>Blog</a>
+      <a href="https://github.com/bradygaster/squad" class:list={[mobileNavBase, navInactive]} target="_blank" rel="noopener">GitHub</a>
     </div>
   </nav>
 </header>

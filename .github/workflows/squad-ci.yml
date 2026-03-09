@@ -23,6 +23,10 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install docs dependencies
+        run: npm ci
+        working-directory: docs
+
       - name: Install Playwright browsers
         run: npx playwright install chromium --with-deps
 
