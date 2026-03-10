@@ -23,6 +23,7 @@ const EXPECTED_REFERENCE = ['cli', 'sdk', 'config'];
 
 const EXPECTED_SCENARIOS = [
   'issue-driven-dev', 'existing-repo', 'ci-cd-integration', 'solo-dev', 'monorepo', 'team-of-humans',
+  'cross-org-auth',
 ];
 
 const EXPECTED_BLOG = [
