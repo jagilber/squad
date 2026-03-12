@@ -18,3 +18,6 @@ Release blog posts use YAML frontmatter with: title, date, author, wave, tags, s
 
 ### Roster & Contributor Recognition (v0.8.25)
 Squad moved to Apollo 13/NASA Mission Control naming scheme (Flight, Procedures, EECOM, FIDO, PAO, CAPCOM, CONTROL, Surgeon, Booster, GNC, Network, RETRO, INCO, GUIDO, Telemetry, VOX, DSKY, Sims, Handbook). CONTRIBUTORS.md tracks both team roster and community contributors; contributor table entries grow with PRs (append PR counts rather than replace, maintaining attribution history).
+
+### Scannability Framework (v0.8.25)
+Format selection is a scannability decision, not style preference. Paragraphs for narrative/concepts (3-4 sentences max). Bullets for scannable items (features, options, non-sequential steps). Tables for comparisons or structured reference data (config, API params). Quotes/indents for callouts/warnings. Decision test: if reader hunts for one item in a paragraph, convert to bullets/table. This framework is now a hard rule in charter under SCANNABILITY REVIEW.
