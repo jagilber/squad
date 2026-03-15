@@ -25,6 +25,8 @@ export interface AgentSpawnConfig {
   context?: string;
   /** Model override (skips resolution) */
   modelOverride?: string;
+  /** MCP server configurations to pass to the spawned session */
+  mcpServers?: Record<string, { command: string; args?: string[]; env?: Record<string, string> }>;
 }
 
 // --- Spawn Result ---
@@ -121,11 +123,15 @@ async function spawnSingle(
       ? config.modelOverride
       : await deps.resolveModel(charter, config.modelOverride);
 
-    // Step 3: Create session
-    const session = await deps.createSession({
+    // Step 3: Create session (with MCP config if provided)
+    const sessionConfig: Record<string, unknown> = {
       model,
       clientName: `squad-agent-${config.agentName}`,
-    });
+    };
+    if (config.mcpServers) {
+      sessionConfig.mcpServers = config.mcpServers;
+    }
+    const session = await deps.createSession(sessionConfig);
 
     // Step 4: Register in session pool
     deps.sessionPool.add({

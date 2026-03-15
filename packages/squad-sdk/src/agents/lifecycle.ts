@@ -22,7 +22,7 @@ const tracer = trace.getTracer('squad-sdk');
 /**
  * Agent handle status.
  */
-export type AgentStatus = 'spawning' | 'active' | 'idle' | 'error' | 'destroyed';
+export type AgentStatus = 'pending' | 'spawning' | 'active' | 'idle' | 'error' | 'destroyed';
 
 /**
  * Handle to a spawned agent session.
