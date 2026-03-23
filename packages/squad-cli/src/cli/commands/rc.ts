@@ -201,6 +201,7 @@ export async function runRC(cwd: string, options: RCOptions): Promise<void> {
     copilotProc = spawnChild(copilotCmd, ['--acp'], {
       cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
     });
 
     copilotProc.on('error', (err) => {

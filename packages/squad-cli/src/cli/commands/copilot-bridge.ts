@@ -32,7 +32,7 @@ export class CopilotBridge {
 
       // Test if --acp --stdio actually produces output
       const testResult = await new Promise<boolean>((resolve) => {
-        const cp = spawn('copilot', ['--acp', '--stdio'], { stdio: ['pipe', 'pipe', 'pipe'] });
+        const cp = spawn('copilot', ['--acp', '--stdio'], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
         let gotOutput = false;
 
         cp.stdout?.on('data', () => { gotOutput = true; });
@@ -79,6 +79,7 @@ export class CopilotBridge {
     this.child = spawn('copilot', args, {
       cwd: this.config.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
     });
 
     // Read NDJSON from stdout
