@@ -68,6 +68,7 @@ export async function createTunnel(port: number, labels: TunnelLabels): Promise<
   hostProcess = spawn('devtunnel', ['host', tunnelIdClean], {
     stdio: 'pipe',
     detached: false,
+    windowsHide: true,
   });
 
   // Wait for the URL to appear in stdout

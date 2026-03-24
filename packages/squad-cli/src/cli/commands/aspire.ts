@@ -72,6 +72,7 @@ function launchWithDocker(): ChildProcess {
   ], {
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: false,
+    windowsHide: true,
   });
   return child;
 }
@@ -84,6 +85,7 @@ function launchWithDotnet(): ChildProcess {
   ], {
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: false,
+    windowsHide: true,
   });
   return child;
 }
