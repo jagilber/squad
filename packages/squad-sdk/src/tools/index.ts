@@ -17,6 +17,7 @@ import { trace, SpanStatusCode } from '../runtime/otel-api.js';
 import type { StorageProvider } from '../storage/storage-provider.js';
 import { FSStorageProvider } from '../storage/fs-storage-provider.js';
 import type { SquadState } from '../state/squad-state.js';
+import { spawnParallel, type FanOutDependencies } from '../coordinator/fan-out.js';
 
 const tracer = trace.getTracer('squad-sdk');
 
@@ -184,12 +185,20 @@ export class ToolRegistry {
   private sessionPoolGetter?: () => any;
   private storage: StorageProvider;
   private state?: SquadState;
+  private fanOutDepsGetter?: () => FanOutDependencies | undefined;
 
-  constructor(squadRoot = '.squad', sessionPoolGetter?: () => any, storage: StorageProvider = new FSStorageProvider(), state?: SquadState) {
+  constructor(
+    squadRoot = '.squad',
+    sessionPoolGetter?: () => any,
+    storage: StorageProvider = new FSStorageProvider(),
+    state?: SquadState,
+    fanOutDepsGetter?: () => FanOutDependencies | undefined,
+  ) {
     this.squadRoot = squadRoot;
     this.sessionPoolGetter = sessionPoolGetter;
     this.storage = storage;
     this.state = state;
+    this.fanOutDepsGetter = fanOutDepsGetter;
     this.registerSquadTools();
   }
 
@@ -223,7 +232,7 @@ export class ToolRegistry {
         required: ['targetAgent', 'task'],
       },
       handler: async (args) => {
-        // Validate target agent exists (stub for now, will check roster later)
+        // Validate target agent
         if (!args.targetAgent || args.targetAgent.trim() === '') {
           return {
             textResultForLlm: 'Error: Target agent name is required',
@@ -232,18 +241,56 @@ export class ToolRegistry {
           };
         }
 
-        // Create route request (session creation wired later)
+        const priority = args.priority || 'normal';
         const routeRequest: RouteRequest = {
           targetAgent: args.targetAgent,
           task: args.task,
-          priority: args.priority || 'normal',
+          priority,
           context: args.context,
         };
 
+        // Resolve fan-out dependencies. Without them, the SDK cannot create
+        // sessions on behalf of the LLM. Returning fake-success here would
+        // cause the coordinator to claim work it never did (#1029).
+        const fanOutDeps = this.fanOutDepsGetter?.();
+        if (!fanOutDeps) {
+          return {
+            textResultForLlm:
+              `Cannot route to ${args.targetAgent}: ToolRegistry was constructed without fan-out dependencies, so squad_route cannot create sessions. ` +
+              `Configure ToolRegistry with a fanOutDepsGetter, or intercept squad_route via SquadSessionHooks.onPreToolUse.`,
+            resultType: 'failure',
+            error: 'fan-out-deps-unavailable',
+            toolTelemetry: { routeRequest },
+          };
+        }
+
+        // Spawn the target agent via the production fan-out path.
+        // spawnParallel with a single config matches CLI Path A behavior
+        // (charter compile → model resolve → createSession → initial message).
+        const results = await spawnParallel(
+          [{
+            agentName: args.targetAgent,
+            task: args.task,
+            priority,
+            context: args.context,
+          }],
+          fanOutDeps,
+        );
+        const result = results[0];
+
+        if (!result || result.status !== 'success') {
+          return {
+            textResultForLlm: `Failed to spawn ${args.targetAgent}: ${result?.error ?? 'unknown error'}`,
+            resultType: 'failure',
+            error: result?.error ?? 'spawn-failed',
+            toolTelemetry: { routeRequest, spawnResult: result },
+          };
+        }
+
         return {
-          textResultForLlm: `Task routed to ${args.targetAgent}. Priority: ${routeRequest.priority}. Session creation will be implemented when session lifecycle is in place.`,
+          textResultForLlm: `Spawned session ${result.sessionId} for ${args.targetAgent} with priority ${priority}.`,
           resultType: 'success',
-          toolTelemetry: { routeRequest },
+          toolTelemetry: { routeRequest, sessionId: result.sessionId },
         };
       },
     });
