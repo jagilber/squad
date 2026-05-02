@@ -94,6 +94,20 @@ await tool.handler({
 
 The lead routes a task to DevRel. A new session is created, context is passed, and the task is queued with priority. No human in the loop.
 
+> **Wiring requirement:** `squad_route` creates sessions via `spawnParallel`, which requires fan-out dependencies. Pass a `fanOutDepsGetter` as the 5th argument to `new ToolRegistry(...)`:
+>
+> ```typescript
+> const registry = new ToolRegistry(
+>   './.squad',
+>   () => sessionPool,       // sessionPoolGetter
+>   storageProvider,          // storage
+>   squadState,               // state (enables roster validation)
+>   () => fanOutDeps,         // fanOutDepsGetter
+> );
+> ```
+>
+> Without it, `squad_route` returns `resultType: 'failure'` with `error: 'fan-out-deps-unavailable'`. Agent names must match `/^[a-zA-Z0-9_-]+$/` and, when state is provided, exist in the team roster.
+
 ### `squad_decide` — Record a team decision
 
 ```typescript

@@ -166,15 +166,24 @@ export function defineTool<TArgs = unknown>(config: {
   };
 }
 
+// --- Validation ---
+
+/** Agent name format: alphanumeric, hyphens, underscores. Same rule as squad_decide/squad_memory. */
+const AGENT_NAME_RE = /^[a-zA-Z0-9_-]+$/;
+
 // --- Error Sanitization ---
 
 /**
  * Sanitize error messages before sending to LLM.
- * Strips absolute filesystem paths by replacing the squadRoot prefix with [team-root].
+ * Strips absolute filesystem paths by replacing the squadRoot prefix with [team-root],
+ * and collapses multi-line errors to prevent stack trace leakage.
  */
 function sanitizeErrorForLlm(error: unknown, squadRoot: string): string {
-  const msg = error instanceof Error ? error.message : String(error);
-  return msg.replace(new RegExp(squadRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[team-root]');
+  const raw = error instanceof Error ? error.message : String(error);
+  const stripped = raw.replace(new RegExp(squadRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[team-root]');
+  // Collapse to first line to avoid leaking stack-like multi-line details
+  const firstLine = stripped.split('\n')[0] ?? stripped;
+  return firstLine.slice(0, 512);
 }
 
 // --- Tool Registry ---
@@ -232,18 +241,40 @@ export class ToolRegistry {
         required: ['targetAgent', 'task'],
       },
       handler: async (args) => {
-        // Validate target agent
-        if (!args.targetAgent || args.targetAgent.trim() === '') {
+        // Normalize + validate target agent name
+        const targetAgent = (args.targetAgent ?? '').trim();
+        if (!targetAgent) {
           return {
             textResultForLlm: 'Error: Target agent name is required',
             resultType: 'failure',
             error: 'Invalid target agent',
           };
         }
+        if (!AGENT_NAME_RE.test(targetAgent)) {
+          return {
+            textResultForLlm: 'Invalid target agent name: must contain only letters, numbers, hyphens, and underscores',
+            resultType: 'failure',
+            error: 'invalid-agent-name',
+          };
+        }
+
+        // Roster check: verify the agent exists when state is available
+        if (this.state) {
+          try {
+            const handle = this.state.agents.get(targetAgent);
+            await handle.charter();
+          } catch {
+            return {
+              textResultForLlm: `Agent '${targetAgent}' not found in the team roster. Check .squad/agents/ for available agents.`,
+              resultType: 'failure',
+              error: 'agent-not-in-roster',
+            };
+          }
+        }
 
         const priority = args.priority || 'normal';
         const routeRequest: RouteRequest = {
-          targetAgent: args.targetAgent,
+          targetAgent,
           task: args.task,
           priority,
           context: args.context,
@@ -256,8 +287,8 @@ export class ToolRegistry {
         if (!fanOutDeps) {
           return {
             textResultForLlm:
-              `Cannot route to ${args.targetAgent}: ToolRegistry was constructed without fan-out dependencies, so squad_route cannot create sessions. ` +
-              `Configure ToolRegistry with a fanOutDepsGetter, or intercept squad_route via SquadSessionHooks.onPreToolUse.`,
+              `Cannot route to ${targetAgent}: fan-out dependencies are not configured. ` +
+              `Wire a fanOutDepsGetter into ToolRegistry, or intercept squad_route via SquadSessionHooks.onPreToolUse.`,
             resultType: 'failure',
             error: 'fan-out-deps-unavailable',
             toolTelemetry: { routeRequest },
@@ -267,31 +298,40 @@ export class ToolRegistry {
         // Spawn the target agent via the production fan-out path.
         // spawnParallel with a single config matches CLI Path A behavior
         // (charter compile → model resolve → createSession → initial message).
-        const results = await spawnParallel(
-          [{
-            agentName: args.targetAgent,
-            task: args.task,
-            priority,
-            context: args.context,
-          }],
-          fanOutDeps,
-        );
-        const result = results[0];
+        try {
+          const results = await spawnParallel(
+            [{
+              agentName: targetAgent,
+              task: args.task,
+              priority,
+              context: args.context,
+            }],
+            fanOutDeps,
+          );
+          const result = results[0];
 
-        if (!result || result.status !== 'success') {
+          if (!result || result.status !== 'success') {
+            return {
+              textResultForLlm: `Failed to route to ${targetAgent}: ${sanitizeErrorForLlm(result?.error ?? 'unknown error', this.squadRoot)}`,
+              resultType: 'failure',
+              error: result?.error ?? 'spawn-failed',
+              toolTelemetry: { routeRequest, spawnResult: result },
+            };
+          }
+
           return {
-            textResultForLlm: `Failed to spawn ${args.targetAgent}: ${result?.error ?? 'unknown error'}`,
+            textResultForLlm: `Spawned session ${result.sessionId} for ${targetAgent} with priority ${priority}.`,
+            resultType: 'success',
+            toolTelemetry: { routeRequest, sessionId: result.sessionId },
+          };
+        } catch (error) {
+          return {
+            textResultForLlm: `Failed to route to ${targetAgent}: ${sanitizeErrorForLlm(error, this.squadRoot)}`,
             resultType: 'failure',
-            error: result?.error ?? 'spawn-failed',
-            toolTelemetry: { routeRequest, spawnResult: result },
+            error: 'spawn-exception',
+            toolTelemetry: { routeRequest },
           };
         }
-
-        return {
-          textResultForLlm: `Spawned session ${result.sessionId} for ${args.targetAgent} with priority ${priority}.`,
-          resultType: 'success',
-          toolTelemetry: { routeRequest, sessionId: result.sessionId },
-        };
       },
     });
 

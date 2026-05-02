@@ -187,7 +187,102 @@ describe('SDK contract: squad_route (documented snippet)', () => {
     );
 
     expect(result).toMatchObject({ resultType: 'failure' });
-    expect((result as { error: string }).error).toContain('charter-not-found');
+    // Spawn exceptions are caught and returned as spawn-exception
+    const error = (result as { error: string }).error;
+    expect(error === 'spawn-exception' || error.includes('charter-not-found')).toBe(true);
+  });
+
+  it('rejects targetAgent with invalid characters', async () => {
+    const deps = buildEmbedderFanOutDeps();
+    const registry = new ToolRegistry(
+      './.squad-sdk-contract',
+      undefined,
+      undefined,
+      undefined,
+      () => deps,
+    );
+    const tool = registry.getTool('squad_route')!;
+
+    const result = await tool.handler(
+      { targetAgent: '../evil-path', task: 'pwn' } as RouteRequest,
+      ctx,
+    );
+
+    expect(result).toMatchObject({
+      resultType: 'failure',
+      error: 'invalid-agent-name',
+    });
+    expect(deps.compileCharter).not.toHaveBeenCalled();
+  });
+
+  it('rejects targetAgent with spaces', async () => {
+    const deps = buildEmbedderFanOutDeps();
+    const registry = new ToolRegistry(
+      './.squad-sdk-contract',
+      undefined,
+      undefined,
+      undefined,
+      () => deps,
+    );
+    const tool = registry.getTool('squad_route')!;
+
+    const result = await tool.handler(
+      { targetAgent: 'agent with spaces', task: 'test' } as RouteRequest,
+      ctx,
+    );
+
+    expect(result).toMatchObject({
+      resultType: 'failure',
+      error: 'invalid-agent-name',
+    });
+  });
+
+  it('trims and accepts a valid targetAgent name', async () => {
+    const deps = buildEmbedderFanOutDeps();
+    const registry = new ToolRegistry(
+      './.squad-sdk-contract',
+      undefined,
+      undefined,
+      undefined,
+      () => deps,
+    );
+    const tool = registry.getTool('squad_route')!;
+
+    const result = await tool.handler(
+      { targetAgent: '  fenster  ', task: 'test trim' } as RouteRequest,
+      ctx,
+    );
+
+    expect(result).toMatchObject({ resultType: 'success' });
+    expect(deps.compileCharter).toHaveBeenCalledWith('fenster');
+  });
+
+  it('sanitizes spawn error messages (no raw squadRoot paths in textResultForLlm)', async () => {
+    const squadRoot = './.squad-sdk-contract';
+    const deps = buildEmbedderFanOutDeps({
+      compileCharter: vi.fn(async () => {
+        throw new Error(`ENOENT: ${squadRoot}/agents/ghost/charter.md not found`);
+      }),
+    });
+    const registry = new ToolRegistry(
+      squadRoot,
+      undefined,
+      undefined,
+      undefined,
+      () => deps,
+    );
+    const tool = registry.getTool('squad_route')!;
+
+    const result = await tool.handler(
+      { targetAgent: 'ghost', task: 'test' } as RouteRequest,
+      ctx,
+    );
+
+    expect(result).toMatchObject({ resultType: 'failure' });
+    const text = (result as { textResultForLlm: string }).textResultForLlm;
+    // sanitizeErrorForLlm replaces squadRoot with [team-root]
+    expect(text).not.toContain(squadRoot);
+    expect(text).toContain('[team-root]');
   });
 
   it('lists squad_route in registry.getToolsForAgent (documented filter API)', () => {
