@@ -84,10 +84,10 @@ function initOTelForAspire(): void {
       'squad.version': 'test',
     }),
     traceExporter: new OTLPTraceExporter({ url: OTLP_GRPC_TARGET }),
-    metricReader: new PeriodicExportingMetricReader({
+    metricReaders: [new PeriodicExportingMetricReader({
       exporter: new OTLPMetricExporter({ url: OTLP_GRPC_TARGET }),
       exportIntervalMillis: 1_000,
-    }),
+    })],
   });
   sdk.start();
 }
