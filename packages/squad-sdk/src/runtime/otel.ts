@@ -81,9 +81,15 @@ function ensureSDK(config?: OTelConfig): void {
     PeriodicExportingMetricReader = sdkNode.metrics.PeriodicExportingMetricReader;
     OTLPTraceExporter = req('@opentelemetry/exporter-trace-otlp-grpc').OTLPTraceExporter;
     OTLPMetricExporter = req('@opentelemetry/exporter-metrics-otlp-grpc').OTLPMetricExporter;
-  } catch {
-    // Optional SDK packages not installed — telemetry stays disabled
-    if (config?.debug || process.env['SQUAD_DEBUG'] === '1') {
+  } catch (err: unknown) {
+    const isModuleNotFound =
+      err instanceof Error &&
+      'code' in err &&
+      (err as NodeJS.ErrnoException).code === 'MODULE_NOT_FOUND';
+    if (!isModuleNotFound) {
+      // API-shape failure (e.g. missing export after a major-version bump) — always log
+      console.error('[squad-otel] OTel SDK API mismatch — telemetry disabled.', err);
+    } else if (config?.debug || process.env['SQUAD_DEBUG'] === '1') {
       console.error('[squad-otel] Optional OTel SDK packages not available. Telemetry disabled.');
     }
     return;
@@ -99,10 +105,10 @@ function ensureSDK(config?: OTelConfig): void {
   const sdk = new NodeSDK({
     resource,
     traceExporter: new OTLPTraceExporter({ url: endpoint }),
-    metricReader: new PeriodicExportingMetricReader({
+    metricReaders: [new PeriodicExportingMetricReader({
       exporter: new OTLPMetricExporter({ url: endpoint }),
       exportIntervalMillis: 30_000,
-    }),
+    })],
   });
 
   try {
