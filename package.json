@@ -26,6 +26,11 @@
   "engines": {
     "node": ">=22.5.0"
   },
+  "overrides": {
+    "vite": "^7.3.3",
+    "protobufjs": "^7.5.6",
+    "@github/copilot": "^1.0.47"
+  },
   "devDependencies": {
     "@opentelemetry/api": "^1.9.0",
     "@opentelemetry/sdk-metrics": "^2.5.1",
