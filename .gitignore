@@ -57,3 +57,11 @@ artifacts/
 /run-artifacts/
 # Local MCP configuration (machine-specific, not committed)
 /.mcp.json
+
+# Workspace-local index-server runtime state (MCP server writes these into the
+# repo it is launched from; they are not source and must not be committed).
+/data/
+/logs/
+/metrics/
+/snapshots/
+/feedback/
