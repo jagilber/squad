@@ -6,7 +6,8 @@
 
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { FSStorageProvider } from '@bradygaster/squad-sdk';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { FSStorageProvider, toClaudeSubagentDoc } from '@bradygaster/squad-sdk';
 import { success, warn, info, dim, bold } from './output.js';
 import { fatal } from './errors.js';
 import { detectSquadDir } from './detect-squad-dir.js';
@@ -72,7 +73,7 @@ function buildMcpServerSpecs(isGitHub: boolean, cliVersion?: string): McpServerS
     ? {
         name: 'EXAMPLE-github',
         command: 'npx',
-        args: ['-y', '@anthropic/github-mcp-server'],
+        args: ['-y', '@modelcontextprotocol/server-github'],
         env: { GITHUB_TOKEN: '${GITHUB_TOKEN}' },
       }
     : {
@@ -271,6 +272,55 @@ function writeAgentTemplate(agentSrc: string, agentDest: string, cliVersion: str
 
   storage.writeSync(agentDest, agentContent);
   stampVersion(agentDest, cliVersion);
+}
+
+/**
+ * Resolve the on-disk path for the Claude Code coordinator from the template
+ * manifest. Returns null when no such entry is registered (emission is then a
+ * no-op, so the manifest entry is load-bearing rather than decorative).
+ *
+ * @param squadDir The resolved `.squad/` directory — manifest destinations are
+ *                 relative to it (`../.claude/agents/squad.md`).
+ */
+function resolveClaudeAgentDest(squadDir: string): string | null {
+  const entry = TEMPLATE_MANIFEST.find(
+    f => f.source === 'squad.agent.md.template' && f.destination.includes('.claude/'),
+  );
+  return entry ? path.resolve(squadDir, entry.destination) : null;
+}
+
+/**
+ * Emit `.claude/agents/squad.md` — the same coordinator body as
+ * `.github/agents/squad.agent.md`, re-fronted with Claude Code's subagent
+ * front matter (see `toClaudeSubagentDoc`).
+ *
+ * Manifest entry: `squad.agent.md.template` → `../.claude/agents/squad.md`.
+ * Written here rather than by the generic copy loop so the version stamp is
+ * applied and the front matter is translated instead of copied verbatim.
+ *
+ * @returns true if the file was written (false on dry-run or missing template)
+ */
+function writeClaudeAgentTemplate(
+  agentSrc: string,
+  claudeDest: string | null,
+  cliVersion: string,
+  options?: { dryRun?: boolean },
+): boolean {
+  if (!claudeDest) return false;
+  if (!storage.existsSync(agentSrc)) return false;
+
+  if (options?.dryRun) {
+    info(storage.existsSync(claudeDest)
+      ? '.claude/agents/squad.md would be refreshed from the latest template'
+      : '.claude/agents/squad.md does not exist — would create from template');
+    return false;
+  }
+
+  const content = toClaudeSubagentDoc(storage.readSync(agentSrc) ?? '');
+  storage.mkdirSync(path.dirname(claudeDest), { recursive: true });
+  storage.writeSync(claudeDest, content);
+  stampVersion(claudeDest, cliVersion);
+  return true;
 }
 
 /**
@@ -769,6 +819,49 @@ function refreshSquadTemplatesDir(dest: string, templatesDir: string): void {
 }
 
 /**
+ * Re-run the ESM import patcher against the project's own node_modules (#1190).
+ *
+ * npm runs postinstall with cwd inside the installed package dir, so a global
+ * `npm install -g` only ever patches the global copy — the consumer repo's
+ * node_modules stays unpatched and `squad doctor` keeps failing its
+ * vscode-jsonrpc / copilot-sdk checks there. Loading the patch script and
+ * pointing it at `<dest>/node_modules` closes that gap on every upgrade.
+ *
+ * Returns true when at least one file was patched.
+ */
+export async function ensureEsmImportsPatched(dest: string): Promise<boolean> {
+  // Locate scripts/patch-esm-imports.mjs by walking up from the compiled file,
+  // same approach as getTemplatesDir() — works from dist/cli/core/ and bundles.
+  let dir = path.dirname(fileURLToPath(import.meta.url));
+  let scriptPath: string | undefined;
+  for (let i = 0; i < 6; i++) {
+    const candidate = path.join(dir, 'scripts', 'patch-esm-imports.mjs');
+    if (storage.existsSync(candidate)) {
+      scriptPath = candidate;
+      break;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  if (!scriptPath) return false;
+
+  try {
+    const patcher = await import(pathToFileURL(scriptPath).href) as {
+      patchVscodeJsonrpcExports: (searchRoots?: string[]) => boolean;
+      patchCopilotSdkSessionJs: (searchRoots?: string[]) => boolean;
+    };
+    const roots = [path.join(dest, 'node_modules')];
+    const patchedExports = patcher.patchVscodeJsonrpcExports(roots);
+    const patchedSession = patcher.patchCopilotSdkSessionJs(roots);
+    return patchedExports || patchedSession;
+  } catch (err) {
+    warn(`Could not patch ESM imports in ${path.join(dest, 'node_modules')}: ${err instanceof Error ? err.message : err}`);
+    return false;
+  }
+}
+
+/**
  * Run all ensure* checks and skill/template sync — shared by both code paths
  */
 async function runEnsureChecks(dest: string, templatesDir: string, filesUpdated: string[]): Promise<void> {
@@ -807,6 +900,12 @@ async function runEnsureChecks(dest: string, templatesDir: string, filesUpdated:
     const uniqueAgentNames = Array.from(new Set(builtinAgents.map(p => path.basename(path.dirname(p)))));
     success(`scaffolded ${uniqueAgentNames.length} built-in agent(s): ${uniqueAgentNames.join(', ')}`);
     filesUpdated.push(...builtinAgents);
+  }
+
+  const userOwned = ensureUserOwnedTemplates(dest, templatesDir);
+  if (userOwned.length > 0) {
+    success(`installed ${userOwned.length} missing user-owned template(s): ${userOwned.join(', ')}`);
+    filesUpdated.push(...userOwned);
   }
 
   const skillMigration = migrateLegacyCopilotSkills(dest);
@@ -853,11 +952,23 @@ async function runEnsureChecks(dest: string, templatesDir: string, filesUpdated:
     success(`removed stale squad_state from ${tomb.path} (now lives in .mcp.json)`);
     filesUpdated.push('.copilot/mcp-config.json (tombstoned)');
   }
+
+  // #1190: patch ESM imports in the repo-local node_modules — postinstall only
+  // ever runs against the installed package's own directory tree.
+  if (await ensureEsmImportsPatched(dest)) {
+    success('patched ESM imports in repo-local node_modules (vscode-jsonrpc / copilot-sdk, see #449)');
+    filesUpdated.push('node_modules (ESM patch)');
+  }
 }
 
 /** Human-readable single-line description of an McpSpec for success() messages. */
 export function describeMcpSpec(spec: SquadStateMcpSpec): string {
-  // After iter-7 all specs are `npx -y <pkg@version-or-tag> state-mcp`.
+  // Standalone bundles spawn their own launcher by absolute path rather than
+  // going through npx, so there is no package spec in args to report.
+  if (spec.source === 'standalone') {
+    return `${spec.command} (standalone bundle)`;
+  }
+  // Every other spec is `npx -y <pkg@version-or-tag> state-mcp`.
   const pkg = spec.args[1] ?? '<unknown>';
   return spec.source === 'insider' ? `${pkg} (@insider fallback)` : pkg;
 }
@@ -974,6 +1085,39 @@ export function ensureBuiltinAgents(dest: string, templatesDir: string): string[
 }
 
 /**
+ * Install user-owned template files that are missing on disk.
+ *
+ * Iterates TEMPLATE_MANIFEST entries with `overwriteOnUpgrade: false` and
+ * copies each source template to its destination only if the destination
+ * does not yet exist.  Existing user-customized files are never touched.
+ *
+ * Called during both `squad init` (post-SDK scaffolding) and `squad upgrade`
+ * (via runEnsureChecks) so that newly-added user-owned templates are installed
+ * for existing squads on upgrade without overwriting any prior customization.
+ */
+export function ensureUserOwnedTemplates(dest: string, templatesDir: string): string[] {
+  const created: string[] = [];
+  const squadDir = path.join(dest, '.squad');
+  const userOwned = TEMPLATE_MANIFEST.filter(f => !f.overwriteOnUpgrade && !f.source.startsWith('skills/'));
+
+  for (const entry of userOwned) {
+    const srcPath = path.join(templatesDir, entry.source);
+    // Destination paths can be relative to .squad/ or can use '../' for repo root
+    const destPath = entry.destination.startsWith('../')
+      ? path.join(dest, entry.destination.slice(3))
+      : path.join(squadDir, entry.destination);
+
+    if (!storage.existsSync(srcPath)) continue;
+    if (storage.existsSync(destPath)) continue;
+
+    storage.mkdirSync(path.dirname(destPath), { recursive: true });
+    storage.copySync(srcPath, destPath);
+    created.push(entry.destination);
+  }
+  return created;
+}
+
+/**
  * Run the upgrade command
  */
 export async function runUpgrade(dest: string, options: UpgradeOptions = {}): Promise<UpdateInfo> {
@@ -996,6 +1140,10 @@ export async function runUpgrade(dest: string, options: UpgradeOptions = {}): Pr
 
   const agentDest = path.join(dest, '.github', 'agents', 'squad.agent.md');
   const oldVersion = readInstalledVersion(agentDest) ?? '0.0.0';
+  // The Claude Code coordinator destination comes from TEMPLATE_MANIFEST, not a
+  // literal — drop the manifest entry and the emission stops, which is what the
+  // manifest-registration test is guarding.
+  const claudeAgentDest = resolveClaudeAgentDest(squadDirInfo.path);
   const squadConfig = readSquadConfig(squadDirInfo.path);
   const mcpConfigMode = detectMcpConfigMode(squadConfig, agentDest);
   const isGitHubForMcp = detectIsGitHubForMcp(dest, squadConfig);
@@ -1012,6 +1160,7 @@ export async function runUpgrade(dest: string, options: UpgradeOptions = {}): Pr
     const agentSrc = path.join(templatesDir, 'squad.agent.md.template');
     if (storage.existsSync(agentSrc)) {
       writeAgentTemplate(agentSrc, agentDest, cliVersion, mcpConfigMode, isGitHubForMcp, { dryRun: true });
+      writeClaudeAgentTemplate(agentSrc, claudeAgentDest, cliVersion, { dryRun: true });
     }
     const filesToUpgrade = TEMPLATE_MANIFEST.filter(f => f.overwriteOnUpgrade && f.source !== 'squad.agent.md.template');
     if (filesToUpgrade.length > 0) {
@@ -1055,6 +1204,10 @@ export async function runUpgrade(dest: string, options: UpgradeOptions = {}): Pr
       writeAgentTemplate(agentSrc, agentDest, cliVersion, mcpConfigMode, isGitHubForMcp);
       success('upgraded squad.agent.md');
       filesUpdated.push('squad.agent.md');
+      if (writeClaudeAgentTemplate(agentSrc, claudeAgentDest, cliVersion)) {
+        success('upgraded .claude/agents/squad.md');
+        filesUpdated.push('.claude/agents/squad.md');
+      }
     } else {
       warn('squad.agent.md.template not found — squad.agent.md was not refreshed. Reinstall or repair the CLI to restore the missing template.');
     }
@@ -1084,6 +1237,11 @@ export async function runUpgrade(dest: string, options: UpgradeOptions = {}): Pr
   const fromLabel = oldVersion === '0.0.0' || !oldVersion ? 'unknown' : oldVersion;
   success(`upgraded coordinator from ${fromLabel} to ${cliVersion}`);
   filesUpdated.push('squad.agent.md');
+
+  if (writeClaudeAgentTemplate(agentSrc, claudeAgentDest, cliVersion)) {
+    success('upgraded .claude/agents/squad.md (Claude Code coordinator)');
+    filesUpdated.push('.claude/agents/squad.md');
+  }
 
   // Upgrade squad-owned files from template manifest
   // Exclude squad.agent.md — already copied and version-stamped above

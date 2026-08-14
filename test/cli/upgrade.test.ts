@@ -89,6 +89,75 @@ describe('CLI: upgrade command', () => {
     expect(Array.isArray(result.migrationsRun)).toBe(true);
   });
 
+  // -------------------------------------------------------------------------
+  // Claude Code prompt runtime — .claude/agents/squad.md (T4, Path A)
+  // -------------------------------------------------------------------------
+
+  it('init emits .claude/agents/squad.md with Claude Code front matter', async () => {
+    // runInit() already ran in beforeEach.
+    const claudePath = join(TEST_ROOT, '.claude', 'agents', 'squad.md');
+    expect(
+      existsSync(claudePath),
+      '.claude/agents/squad.md was not emitted by squad init — Claude Code will not register the coordinator',
+    ).toBe(true);
+
+    const content = await readFile(claudePath, 'utf-8');
+    const fm = /^---\r?\n([\s\S]*?)\r?\n---\r?\n/.exec(content)?.[1];
+    expect(fm, 'emitted file has no YAML front matter').toBeDefined();
+    // Claude Code requires a slug name + a description; `tools: ["*"]` is a
+    // Copilot-ism with no Claude Code equivalent and must not survive.
+    expect(fm).toMatch(/^name: squad$/m);
+    expect(fm).toMatch(/^description: .+$/m);
+    expect(fm).not.toMatch(/^tools:/m);
+    expect(fm).toMatch(/^model: inherit$/m);
+
+    // Body is the coordinator prompt, version-stamped like squad.agent.md.
+    expect(content).toContain(`<!-- version: ${getPackageVersion()} -->`);
+    expect(content).toContain('You are **Squad (Coordinator)**');
+    expect(content).not.toContain('`Squad v{version}`');
+  });
+
+  it('init emits the same coordinator body to both .github and .claude', async () => {
+    const stripFm = (s: string) => s.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '');
+    const copilot = await readFile(join(TEST_ROOT, '.github', 'agents', 'squad.agent.md'), 'utf-8');
+    const claude = await readFile(join(TEST_ROOT, '.claude', 'agents', 'squad.md'), 'utf-8');
+    expect(stripFm(claude)).toBe(stripFm(copilot));
+  });
+
+  it('upgrade refreshes .claude/agents/squad.md and reports it', async () => {
+    const agentPath = join(TEST_ROOT, '.github', 'agents', 'squad.agent.md');
+    const claudePath = join(TEST_ROOT, '.claude', 'agents', 'squad.md');
+
+    // Simulate a stale install: old version stamp + a hand-edited Claude file.
+    let content = await readFile(agentPath, 'utf-8');
+    content = content.replace(/<!-- version: [^>]+ -->/m, '<!-- version: 0.1.0 -->');
+    await writeFile(agentPath, content);
+    await writeFile(claudePath, '---\nname: squad\n---\n\nSTALE\n');
+
+    const result = await runUpgrade(TEST_ROOT);
+
+    expect(result.filesUpdated).toContain('.claude/agents/squad.md');
+    const upgraded = await readFile(claudePath, 'utf-8');
+    expect(upgraded).not.toContain('STALE');
+    expect(upgraded).toContain(`<!-- version: ${getPackageVersion()} -->`);
+    expect(upgraded).toMatch(/^---\nname: squad\n/);
+    expect(upgraded).toContain('model: inherit');
+  });
+
+  it('upgrade recreates .claude/agents/squad.md when it was deleted', async () => {
+    const claudePath = join(TEST_ROOT, '.claude', 'agents', 'squad.md');
+    rmSync(claudePath, { force: true });
+    expect(existsSync(claudePath)).toBe(false);
+
+    // Version-current path (no version edit) must still restore the file.
+    await runUpgrade(TEST_ROOT);
+
+    expect(
+      existsSync(claudePath),
+      'version-current upgrade did not restore a deleted .claude/agents/squad.md',
+    ).toBe(true);
+  });
+
   it('should overwrite squad-owned template files', async () => {
     const ceremoniePath = join(TEST_ROOT, '.squad', 'ceremonies.md');
     
@@ -173,7 +242,7 @@ describe('CLI: upgrade command', () => {
     // state-mcp command). Match a regex rather than literal version.
     expect(upgraded).toMatch(/args: \['-y', '@bradygaster\/squad-cli@[^']+', 'state-mcp'\]/);
     expect(upgraded).toContain('  EXAMPLE-github:');
-    expect(upgraded).toContain("    args: ['-y', '@anthropic/github-mcp-server']");
+    expect(upgraded).toContain("    args: ['-y', '@modelcontextprotocol/server-github']");
     expect(upgraded).toContain('      GITHUB_TOKEN: ${GITHUB_TOKEN}');
     expect(upgraded).not.toContain('EXAMPLE-azure-devops');
     const frontmatterEnd = upgraded.indexOf('\n---', 4);
@@ -539,7 +608,7 @@ describe('CLI: upgrade command', () => {
     const registry = JSON.parse(readFileSync(join(dir, '.squad', 'casting', 'registry.json'), 'utf8'));
     expect(registry).toHaveProperty('agents');
     const policy = JSON.parse(readFileSync(join(dir, '.squad', 'casting', 'policy.json'), 'utf8'));
-    expect(policy).toHaveProperty('casting_policy_version', '1.1');
+    expect(policy).toHaveProperty('casting_policy_version', '1.2');
     const history = JSON.parse(readFileSync(join(dir, '.squad', 'casting', 'history.json'), 'utf8'));
     expect(history).toHaveProperty('universe_usage_history');
     rmSync(dir, { recursive: true, force: true });

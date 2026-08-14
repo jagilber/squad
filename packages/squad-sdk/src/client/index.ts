@@ -12,9 +12,26 @@
 // Re-export core types and classes from adapter layer
 export {
   SquadClient,
+  normalizeToolNameForCopilot,
+  normalizeToolNameForWire,
+  normalizeToolsInConfig,
   type SquadClientOptions,
   type SquadConnectionState,
 } from '../adapter/client.js';
+
+// Runtime-provider seam: interface + factory + runtime resolution.
+export {
+  createRuntimeProvider,
+  resolveRuntimeId,
+  resolveEffectiveRuntime,
+  SQUAD_RUNTIME_ENV,
+  type SquadRuntimeProvider,
+  type SquadRuntimeId,
+  type SquadRuntimeSource,
+  type EffectiveRuntime,
+  type ResolveEffectiveRuntimeOptions,
+  type CreateRuntimeProviderOptions,
+} from '../adapter/provider.js';
 
 export type {
   SquadSession,
@@ -42,12 +59,51 @@ export { EventBus, type SquadEvent, type SquadEventType } from './event-bus.js';
 
 import { SquadClient as BaseSquadClient, type SquadClientOptions } from '../adapter/client.js';
 import type { SquadSession, SquadSessionConfig, SquadClientEventType, SquadClientEvent, SquadClientEventHandler } from '../adapter/types.js';
+import {
+  createRuntimeProvider,
+  resolveEffectiveRuntime,
+  type SquadRuntimeProvider,
+  type SquadRuntimeId,
+} from '../adapter/provider.js';
+import type { StorageProvider } from '../storage/index.js';
 import { SessionPool, type SessionPoolConfig } from './session-pool.js';
 import { EventBus, type SquadEventType } from './event-bus.js';
 
 export interface SquadClientWithPoolConfig extends SquadClientOptions {
   /** Session pool configuration */
   pool?: Partial<SessionPoolConfig>;
+}
+
+/**
+ * Pre-resolved runtime wiring handed to the {@link SquadClientWithPool}
+ * constructor by {@link createSquadClientWithPool}.
+ *
+ * This is a second, optional constructor argument on purpose: the existing
+ * one-argument `new SquadClientWithPool(config)` form keeps its exact prior
+ * behaviour (construct a Copilot `SquadClient` from `config`), which external
+ * consumers pinned to squad-sdk 0.11/0.12 depend on.
+ */
+export interface SquadClientWithPoolRuntime {
+  /** Already-constructed provider to use instead of a fresh Copilot client. */
+  provider: SquadRuntimeProvider;
+  /** The runtime id `provider` was constructed for. */
+  runtimeId: SquadRuntimeId;
+}
+
+/** Options accepted by {@link createSquadClientWithPool}. */
+export interface CreateSquadClientWithPoolConfig extends SquadClientWithPoolConfig {
+  /**
+   * Explicit runtime id. Highest precedence — see
+   * {@link createSquadClientWithPool} for the full order.
+   */
+  runtime?: SquadRuntimeId | string;
+  /**
+   * Path to the `.squad/` directory whose `config.json` carries the persistent
+   * `runtime` key. Omit to skip the config-file layer entirely.
+   */
+  squadDir?: string;
+  /** Storage provider used to read `.squad/config.json` (tests inject here). */
+  storage?: StorageProvider;
 }
 
 /**
@@ -78,12 +134,21 @@ export interface SquadClientWithPoolConfig extends SquadClientOptions {
  * ```
  */
 export class SquadClientWithPool {
-  private baseClient: BaseSquadClient;
+  private baseClient: SquadRuntimeProvider;
   public readonly pool: SessionPool;
   public readonly eventBus: EventBus;
-  
-  constructor(config: SquadClientWithPoolConfig = {}) {
-    this.baseClient = new BaseSquadClient(config);
+  /**
+   * Runtime backing this client. `'copilot'` for the synchronous constructor
+   * (unchanged legacy behaviour); whatever
+   * {@link createSquadClientWithPool} resolved otherwise.
+   */
+  public readonly runtimeId: SquadRuntimeId;
+
+  constructor(config: SquadClientWithPoolConfig = {}, runtime?: SquadClientWithPoolRuntime) {
+    // Legacy (one-arg) path is byte-compatible: a Copilot `SquadClient` built
+    // straight from `config`, exactly as before the provider seam existed.
+    this.baseClient = runtime?.provider ?? new BaseSquadClient(config);
+    this.runtimeId = runtime?.runtimeId ?? 'copilot';
     this.pool = new SessionPool(config.pool);
     this.eventBus = new EventBus();
     
@@ -138,6 +203,13 @@ export class SquadClientWithPool {
   /**
    * Create a new session and add it to the pool.
    * Throws if the pool is at capacity.
+   *
+   * Note: this emits `session.created` on the event bus TWICE — once via the
+   * pool's own `session.added` → `session.created` mapping in the constructor,
+   * and once explicitly below. That duplicate is long-standing behaviour, not
+   * an oversight, and `test/claude-runtime-pooled-client.test.ts` pins it
+   * deliberately; de-duplicating it would silently halve the event count for
+   * any consumer that counts them, so treat it as a breaking change.
    */
   async createSession(config: SquadSessionConfig = {}): Promise<SquadSession> {
     const session = await this.baseClient.createSession(config);
@@ -241,5 +313,50 @@ export class SquadClientWithPool {
     await this.pool.shutdown();
     await this.baseClient.disconnect();
   }
+}
+
+/**
+ * Runtime-aware factory for {@link SquadClientWithPool}.
+ *
+ * Resolves which LLM runtime should back the client, constructs it through
+ * {@link createRuntimeProvider}, and injects it. Async because the Claude
+ * provider (and its optional `@anthropic-ai/claude-agent-sdk` dependency) is
+ * imported dynamically, so the Copilot path never loads it.
+ *
+ * ## Runtime precedence
+ *
+ * Delegated wholesale to {@link resolveEffectiveRuntime} — the single
+ * canonical implementation, shared with `squad doctor` so the two can never
+ * disagree about which runtime is in effect. Summary (highest first):
+ * `config.runtime` → `SQUAD_RUNTIME` env → `runtime` in
+ * `<squadDir>/config.json` → `'copilot'`. See that function (and
+ * `docs/claude-runtime-integration.md`) for the rationale.
+ *
+ * An unrecognized value at ANY layer throws `Unknown squad runtime "<value>"`
+ * rather than falling back, so a typo cannot silently route (billed) work to
+ * the wrong runtime.
+ *
+ * @example
+ * ```typescript
+ * const client = await createSquadClientWithPool({
+ *   squadDir: '/repo/.squad',
+ *   pool: { maxConcurrent: 5 },
+ * });
+ * console.log(client.runtimeId); // 'claude' when .squad/config.json says so
+ * ```
+ */
+export async function createSquadClientWithPool(
+  config: CreateSquadClientWithPoolConfig = {}
+): Promise<SquadClientWithPool> {
+  const { runtime, squadDir, storage, pool, ...clientOptions } = config;
+
+  // Precedence lives in exactly one place — see resolveEffectiveRuntime.
+  // It validates too, so an unknown value throws here before any provider
+  // (or billing identity) is touched.
+  const { id: runtimeId } = resolveEffectiveRuntime({ runtime, squadDir, storage });
+
+  const provider = await createRuntimeProvider({ ...clientOptions, runtime: runtimeId });
+
+  return new SquadClientWithPool({ ...clientOptions, pool }, { provider, runtimeId });
 }
 

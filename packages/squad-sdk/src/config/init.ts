@@ -20,6 +20,7 @@ import { ENGINEERING_ROLE_IDS } from '../roles/catalog.js';
 import { getRoleById } from '../roles/index.js';
 import { ensureMemoryGovernanceDefaults } from '../memory/index.js';
 import { addSquadStateGitignoreBlock, removeSquadStateGitignoreBlock } from './gitignore-state.js';
+import { toClaudeSubagentDoc } from './claude-agent.js';
 
 // ============================================================================
 // Manifest-Curated Skills (must stay in sync with TEMPLATE_MANIFEST in CLI)
@@ -174,7 +175,7 @@ export interface InitOptions {
    * staged into the working-tree commit graph.
    * When 'local' (or undefined), removes the marker block if present.
    */
-  stateBackend?: 'local' | 'orphan' | 'two-layer' | 'external' | string;
+  stateBackend?: 'local' | 'orphan' | 'two-layer' | 'external-stub' | string;
 }
 
 /**
@@ -667,7 +668,7 @@ function buildMcpServerSpecs(isGitHub: boolean, cliVersion?: string): McpServerS
     ? {
         name: 'EXAMPLE-github',
         command: 'npx',
-        args: ['-y', '@anthropic/github-mcp-server'],
+        args: ['-y', '@modelcontextprotocol/server-github'],
         env: { GITHUB_TOKEN: '${GITHUB_TOKEN}' },
       }
     : {
@@ -1458,6 +1459,30 @@ ${projectDescription ? `- **Description:** ${projectDescription}\n` : ''}- **Cre
     }
   } else {
     skippedFiles.push(toRelativePath(agentFile));
+  }
+
+  // -------------------------------------------------------------------------
+  // Create .claude/agents/squad.md (Claude Code prompt runtime — Path A)
+  //
+  // Same coordinator body, Claude-Code front matter. Derived from the SAME
+  // template as squad.agent.md so the two can never drift.
+  // -------------------------------------------------------------------------
+
+  const claudeAgentFile = join(options.agentFileRoot ?? teamRoot, '.claude', 'agents', 'squad.md');
+  if (!storage.existsSync(claudeAgentFile) || !skipExisting) {
+    if (templatesDir && storage.existsSync(join(templatesDir, 'squad.agent.md.template'))) {
+      const source = storage.readSync(join(templatesDir, 'squad.agent.md.template')) ?? '';
+      // No MCP front-matter injection: Claude Code does not read MCP config
+      // from agent files (it uses .mcp.json), and an unknown key there is at
+      // best ignored, at worst a registration failure.
+      const claudeContent = stampVersionInContent(toClaudeSubagentDoc(source), version);
+      await storage.write(claudeAgentFile, claudeContent);
+      createdFiles.push(toRelativePath(claudeAgentFile));
+    } else {
+      warnings.push(`squad.agent.md template not found (${join(templatesDir || '.squad/templates', 'squad.agent.md.template')}) — .claude/agents/squad.md was not created or not refreshed`);
+    }
+  } else {
+    skippedFiles.push(toRelativePath(claudeAgentFile));
   }
 
   // -------------------------------------------------------------------------

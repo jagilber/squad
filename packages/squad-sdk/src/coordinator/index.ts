@@ -36,6 +36,7 @@ export {
 export {
   detectSpawnBackend,
   detectSpawnPlatform,
+  CLAUDE_SPAWN_TOOL_NAMES,
   truncateSessionName,
   buildSessionName,
   TaskSpawnBackend,

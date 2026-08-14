@@ -5,7 +5,7 @@
 
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { FSStorageProvider } from '@bradygaster/squad-sdk';
+import { FSStorageProvider, CLAUDE_AGENT_RELATIVE_PATH } from '@bradygaster/squad-sdk';
 
 const storage = new FSStorageProvider();
 
@@ -29,14 +29,27 @@ export interface TemplateFile {
  * - User-owned (overwriteOnUpgrade: false): team.md, routing.md, decisions.md, ceremonies.md, agent history/identity
  */
 export const TEMPLATE_MANIFEST: TemplateFile[] = [
-  // Core coordinator
+  // Core coordinator.
+  //
+  // Both entries share `source: 'squad.agent.md.template'` — one body, two
+  // front-matter dialects. Neither is copied by the generic upgrade loop
+  // (which filters `source !== 'squad.agent.md.template'`); they are written
+  // by the dedicated agent-template path in upgrade.ts / SDK initSquad so the
+  // version stamp and (Copilot-only) MCP front matter are applied.
   {
     source: 'squad.agent.md.template',
     destination: '../.github/agents/squad.agent.md',
     overwriteOnUpgrade: true,
     description: 'Squad coordinator agent prompt',
   },
-  
+  {
+    source: 'squad.agent.md.template',
+    // `../` because manifest destinations are resolved relative to `.squad/`.
+    destination: `../${CLAUDE_AGENT_RELATIVE_PATH}`,
+    overwriteOnUpgrade: true,
+    description: 'Squad coordinator agent prompt (Claude Code subagent)',
+  },
+
   // Casting system (squad-owned, overwrite on upgrade)
   // NOTE: These JSON files are read at runtime by the SDK and many agent
   // skills via their flat `.squad/casting-*.json` paths — do NOT route into
@@ -167,6 +180,15 @@ export const TEMPLATE_MANIFEST: TemplateFile[] = [
   },
   
   // User-owned files (never overwrite)
+  {
+    // ralph-instructions.md is read by execute.ts when `squad watch --execute` is run.
+    // User-owned so customizations survive upgrade.  Install path must match the
+    // existsSync lookup in execute.ts: path.join(teamRoot, '.squad', 'ralph-instructions.md').
+    source: 'ralph-instructions.md',
+    destination: 'ralph-instructions.md',
+    overwriteOnUpgrade: false,
+    description: 'Ralph autonomous-execution instructions (user-customizable override)',
+  },
   {
     source: 'ceremonies.md',
     destination: 'ceremonies.md',

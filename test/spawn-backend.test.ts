@@ -2,9 +2,95 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   SessionSpawnBackend,
   TaskSpawnBackend,
+  detectSpawnPlatform,
+  CLAUDE_SPAWN_TOOL_NAMES,
   type CreateSessionFn,
   type SpawnHandle,
 } from '@bradygaster/squad-sdk/coordinator';
+
+/**
+ * The real tool list reported by a Claude Code subagent on claude 2.1.224,
+ * captured from a `.claude/agents/toolprobe.md` probe run against the actual
+ * CLI. Note there is NO `Task` in it — Squad's first implementation keyed on
+ * `Task` and was therefore dead code on every real session.
+ *
+ * This fixture exists so the detector is tested against an OBSERVED
+ * environment, not against a tool set invented to match the implementation.
+ */
+const MEASURED_CLAUDE_CODE_TOOLS = [
+  'Agent', 'Bash', 'Edit', 'Glob', 'Grep', 'PowerShell', 'Read', 'Skill',
+  'ToolSearch', 'Write', 'EnterWorktree', 'ExitWorktree', 'Monitor',
+  'NotebookEdit', 'SendMessage', 'TaskStop', 'WebFetch', 'WebSearch',
+];
+
+describe('detectSpawnPlatform', () => {
+  it('maps create_session → app', () => {
+    expect(detectSpawnPlatform(['create_session', 'task'])).toBe('app');
+  });
+
+  it('maps runSubagent → vscode', () => {
+    expect(detectSpawnPlatform(['runSubagent'])).toBe('vscode');
+  });
+
+  it('detects claude from the MEASURED claude 2.1.224 tool list (which has no `Task`)', () => {
+    expect(MEASURED_CLAUDE_CODE_TOOLS).not.toContain('Task');
+    expect(
+      detectSpawnPlatform(MEASURED_CLAUDE_CODE_TOOLS),
+      'a real Claude Code tool list must be detected as claude — if this fails the ' +
+        'spawn-tool name has been renamed again; re-probe the CLI and update ' +
+        'CLAUDE_SPAWN_TOOL_NAMES with the measured name + version',
+    ).toBe('claude');
+  });
+
+  it('maps Agent → claude (the name current Claude Code actually exposes)', () => {
+    expect(detectSpawnPlatform(['Agent'])).toBe('claude');
+    expect(detectSpawnPlatform(new Set(['Read', 'Edit', 'Agent']))).toBe('claude');
+  });
+
+  it('still maps legacy `Task` → claude (older builds / other harnesses)', () => {
+    expect(detectSpawnPlatform(['Task'])).toBe('claude');
+  });
+
+  it('pins the accepted alias set as a documented contract', () => {
+    // Changing this list is a deliberate decision that requires re-probing the
+    // CLI — not something that should happen by accident. `Agent` is first
+    // because it is what claude 2.1.224 reports; `Task` is retained for
+    // backwards compatibility only.
+    expect([...CLAUDE_SPAWN_TOOL_NAMES]).toEqual(['Agent', 'Task']);
+    for (const name of CLAUDE_SPAWN_TOOL_NAMES) {
+      expect(detectSpawnPlatform([name]), `${name} must map to claude`).toBe('claude');
+    }
+  });
+
+  it('does NOT return claude when no Claude Code spawn tool is present', () => {
+    // Negative check: the measured tool list minus its spawn tool must NOT be
+    // detected as claude.
+    const withoutSpawnTool = MEASURED_CLAUDE_CODE_TOOLS.filter(
+      t => !CLAUDE_SPAWN_TOOL_NAMES.includes(t),
+    );
+    expect(detectSpawnPlatform(withoutSpawnTool)).not.toBe('claude');
+    expect(detectSpawnPlatform(['Read', 'Edit', 'task'])).not.toBe('claude');
+    expect(detectSpawnPlatform(['Read', 'Edit', 'task'])).toBe('cli');
+    expect(detectSpawnPlatform([])).toBe('cli');
+  });
+
+  it('is case-sensitive — lowercase `task`/`agent` are not Claude Code', () => {
+    expect(detectSpawnPlatform(['task'])).toBe('cli');
+    expect(detectSpawnPlatform(['agent'])).toBe('cli');
+    expect(detectSpawnPlatform(['Agent'])).toBe('claude');
+  });
+
+  it('does not confuse TaskStop with a spawn tool', () => {
+    // TaskStop ships alongside Agent; a substring/startsWith check would match
+    // it and mis-detect a platform that has no spawn tool at all.
+    expect(detectSpawnPlatform(['TaskStop'])).toBe('cli');
+  });
+
+  it('keeps app and vscode ahead of claude in the detection order', () => {
+    expect(detectSpawnPlatform(['create_session', 'Agent'])).toBe('app');
+    expect(detectSpawnPlatform(['runSubagent', 'Agent'])).toBe('vscode');
+  });
+});
 
 describe('spawn backends', () => {
   it('TaskSpawnBackend creates a real session and sends the initial prompt', async () => {

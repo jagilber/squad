@@ -14,6 +14,7 @@ import { execFileSync } from 'child_process';
 import { randomBytes } from 'crypto';
 import { runDoctor, getDoctorMode, checkNodeVersion, checkGitSyncHooks } from '@bradygaster/squad-cli/commands/doctor';
 import type { DoctorCheck } from '@bradygaster/squad-cli/commands/doctor';
+import { OrphanBranchBackend } from '@bradygaster/squad-sdk';
 
 const TEST_ROOT = join(process.cwd(), `.test-doctor-${randomBytes(4).toString('hex')}`);
 
@@ -69,8 +70,9 @@ describe('squad doctor', () => {
 
     const squadDirCheck = checks.find((c: DoctorCheck) => c.name === '.squad/ directory exists');
     expect(squadDirCheck?.status).toBe('fail');
-    // When .squad/ is missing the file checks are skipped — .squad/ + squad.agent.md + Node version + 2 ESM checks + Copilot CLI
-    expect(checks.length).toBe(6);
+    // When .squad/ is missing the file checks are skipped — .squad/ + squad.agent.md
+    // + Node version + 2 ESM checks + Copilot CLI + 3 claude-runtime checks
+    expect(checks.length).toBe(9);
   });
 
   it('detects remote mode from config.json with teamRoot', async () => {
@@ -322,6 +324,20 @@ describe('squad doctor', () => {
     expect(result?.message).toContain('squad install-hooks');
   });
 
+  it('reports FAIL when legacy stateBackend=git-notes and squad hooks are missing', async () => {
+    const squadDir = join(TEST_ROOT, '.squad');
+    await mkdir(squadDir, { recursive: true });
+    execFileSync('git', ['init', '--quiet', '-b', 'main'], { cwd: TEST_ROOT });
+    await writeFile(join(squadDir, 'config.json'), JSON.stringify({ stateBackend: 'git-notes' }));
+    await mkdir(join(TEST_ROOT, '.git', 'hooks'), { recursive: true });
+
+    const result = checkGitSyncHooks(TEST_ROOT, squadDir);
+    expect(result).toBeDefined();
+    expect(result?.status).toBe('fail');
+    expect(result?.message).toContain('two-layer');
+    expect(result?.message).toContain('squad install-hooks');
+  });
+
   it('reports FAIL when stateBackend=orphan and squad hooks are missing', async () => {
     const squadDir = join(TEST_ROOT, '.squad');
     await mkdir(squadDir, { recursive: true });
@@ -341,7 +357,7 @@ describe('squad doctor', () => {
     await writeFile(join(squadDir, 'config.json'), JSON.stringify({ stateBackend: 'two-layer' }));
     const hooksDir = join(TEST_ROOT, '.git', 'hooks');
     await mkdir(hooksDir, { recursive: true });
-    for (const hookName of ['pre-push', 'post-merge', 'post-rewrite', 'post-checkout']) {
+    for (const hookName of ['pre-push', 'post-merge', 'post-rewrite', 'post-checkout', 'pre-commit', 'post-commit']) {
       await writeFile(
         join(hooksDir, hookName),
         `#!/bin/sh\n# --- squad-sync-hook ---\n# squad sync hook\n`,
@@ -351,6 +367,206 @@ describe('squad doctor', () => {
     const result = checkGitSyncHooks(TEST_ROOT, squadDir);
     expect(result?.status).toBe('pass');
     expect(result?.message).toContain('two-layer');
+  });
+
+  it('reports FAIL when stateBackend=two-layer has sync hooks but no pre-commit/post-commit (#1190)', async () => {
+    const squadDir = join(TEST_ROOT, '.squad');
+    await mkdir(squadDir, { recursive: true });
+    execFileSync('git', ['init', '--quiet', '-b', 'main'], { cwd: TEST_ROOT });
+    await writeFile(join(squadDir, 'config.json'), JSON.stringify({ stateBackend: 'two-layer' }));
+    const hooksDir = join(TEST_ROOT, '.git', 'hooks');
+    await mkdir(hooksDir, { recursive: true });
+    // The #1185 upgrade path installed only the four sync hooks — the commit
+    // hooks that actually write to the squad-state branch were never installed.
+    for (const hookName of ['pre-push', 'post-merge', 'post-rewrite', 'post-checkout']) {
+      await writeFile(
+        join(hooksDir, hookName),
+        `#!/bin/sh\n# --- squad-sync-hook ---\n# squad sync hook\n`,
+      );
+    }
+
+    const result = checkGitSyncHooks(TEST_ROOT, squadDir);
+    expect(result).toBeDefined();
+    expect(result?.status).toBe('fail');
+    expect(result?.message).toContain('pre-commit');
+    expect(result?.message).toContain('post-commit');
+    expect(result?.message).toContain('squad install-hooks');
+  });
+
+  it.each(['two-layer', 'orphan', 'git-notes'] as const)('reports PASS when stateBackend=%s has decisions.md on squad-state only', async (stateBackend) => {
+    await scaffold(TEST_ROOT);
+    execFileSync('git', ['init', '--quiet', '-b', 'main'], { cwd: TEST_ROOT });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: TEST_ROOT });
+    execFileSync('git', ['config', 'user.name', 'Squad Test'], { cwd: TEST_ROOT });
+
+    const squadDir = join(TEST_ROOT, '.squad');
+    await writeFile(join(squadDir, 'config.json'), JSON.stringify({ stateBackend }));
+    new OrphanBranchBackend(TEST_ROOT).write('decisions.md', '# Decisions\n\nStored in squad-state.\n');
+    await rm(join(squadDir, 'decisions.md'), { force: true });
+
+    const hooksDir = join(TEST_ROOT, '.git', 'hooks');
+    await mkdir(hooksDir, { recursive: true });
+    for (const hookName of ['pre-push', 'post-merge', 'post-rewrite', 'post-checkout']) {
+      await writeFile(
+        join(hooksDir, hookName),
+        `#!/bin/sh\n# --- squad-sync-hook ---\n# squad sync hook\n`,
+      );
+    }
+
+    const checks = await runDoctor(TEST_ROOT);
+    const decisionsCheck = checks.find((c: DoctorCheck) => c.name === 'decisions.md exists');
+    expect(decisionsCheck?.status).toBe('pass');
+    expect(decisionsCheck?.message).toContain('squad-state');
+  });
+
+  // ── claude runtime section ────────────────────────────────────────
+
+  it('reports the effective runtime as copilot by default and never fails the claude checks', async () => {
+    const prev = process.env.SQUAD_RUNTIME;
+    delete process.env.SQUAD_RUNTIME;
+    try {
+      await scaffold(TEST_ROOT);
+      const checks = await runDoctor(TEST_ROOT);
+
+      const runtime = checks.find((c: DoctorCheck) => c.name === 'squad runtime selected');
+      expect(runtime?.status).toBe('pass');
+      expect(runtime?.message).toContain('copilot');
+      expect(runtime?.message).toContain('SQUAD_RUNTIME not set');
+
+      // Graceful degradation: on a copilot-only machine neither the CLI nor
+      // the credential check may succeed — but neither may fail doctor.
+      const cli = checks.find((c: DoctorCheck) => c.name === 'Claude CLI available');
+      const auth = checks.find((c: DoctorCheck) => c.name === 'Claude runtime auth');
+      expect(cli).toBeDefined();
+      expect(auth).toBeDefined();
+      expect(cli?.status).not.toBe('fail');
+      expect(auth?.status).not.toBe('fail');
+    } finally {
+      if (prev === undefined) delete process.env.SQUAD_RUNTIME;
+      else process.env.SQUAD_RUNTIME = prev;
+    }
+  });
+
+  it('explains that the runtime came from SQUAD_RUNTIME when the env var is set', async () => {
+    const prev = process.env.SQUAD_RUNTIME;
+    process.env.SQUAD_RUNTIME = 'claude';
+    try {
+      await scaffold(TEST_ROOT);
+      const checks = await runDoctor(TEST_ROOT);
+      const runtime = checks.find((c: DoctorCheck) => c.name === 'squad runtime selected');
+      expect(runtime?.status).toBe('pass');
+      expect(runtime?.message).toContain('claude');
+      expect(runtime?.message).toContain('from SQUAD_RUNTIME=claude');
+    } finally {
+      if (prev === undefined) delete process.env.SQUAD_RUNTIME;
+      else process.env.SQUAD_RUNTIME = prev;
+    }
+  });
+
+  it('reports an unknown SQUAD_RUNTIME as a check failure instead of throwing', async () => {
+    const prev = process.env.SQUAD_RUNTIME;
+    process.env.SQUAD_RUNTIME = 'gemini';
+    try {
+      await scaffold(TEST_ROOT);
+      // The whole point: runDoctor must resolve, not reject.
+      const checks = await runDoctor(TEST_ROOT);
+      const runtime = checks.find((c: DoctorCheck) => c.name === 'squad runtime selected');
+      expect(runtime?.status).toBe('fail');
+      expect(runtime?.message).toContain('Unknown squad runtime');
+      expect(runtime?.message).toContain('SQUAD_RUNTIME');
+    } finally {
+      if (prev === undefined) delete process.env.SQUAD_RUNTIME;
+      else process.env.SQUAD_RUNTIME = prev;
+    }
+  });
+
+  // ── runtime precedence: doctor must agree with the client factory ──
+  //
+  // Regression guard for the measured bug: doctor called bare
+  // resolveRuntimeId(), which only sees env → default, so a repo whose
+  // .squad/config.json said "claude" was green-checked as "copilot" while
+  // createSquadClientWithPool() would have constructed Claude.
+
+  /** Write a `runtime` value into the scaffolded `.squad/config.json`. */
+  async function writeRuntimeConfigJson(root: string, runtime: string): Promise<void> {
+    await writeFile(join(root, '.squad', 'config.json'), JSON.stringify({ version: 1, runtime }, null, 2));
+  }
+
+  /** Run body with SQUAD_RUNTIME set (or deleted), always restoring it. */
+  async function withEnvRuntime(value: string | undefined, body: () => Promise<void>): Promise<void> {
+    const prev = process.env.SQUAD_RUNTIME;
+    if (value === undefined) delete process.env.SQUAD_RUNTIME;
+    else process.env.SQUAD_RUNTIME = value;
+    try {
+      await body();
+    } finally {
+      if (prev === undefined) delete process.env.SQUAD_RUNTIME;
+      else process.env.SQUAD_RUNTIME = prev;
+    }
+  }
+
+  it('reads the runtime from .squad/config.json and attributes it to that file', async () => {
+    await withEnvRuntime(undefined, async () => {
+      await scaffold(TEST_ROOT);
+      await writeRuntimeConfigJson(TEST_ROOT, 'claude');
+
+      const checks = await runDoctor(TEST_ROOT);
+      const runtime = checks.find((c: DoctorCheck) => c.name === 'squad runtime selected');
+      expect(runtime?.status).toBe('pass');
+      expect(runtime?.message).toContain('claude');
+      expect(runtime?.message).toContain('config.json');
+      // It must NOT claim the copilot default when the file says otherwise.
+      expect(runtime?.message).not.toContain('SQUAD_RUNTIME not set');
+    });
+  });
+
+  it('agrees with createSquadClientWithPool about the effective runtime', async () => {
+    await withEnvRuntime(undefined, async () => {
+      await scaffold(TEST_ROOT);
+      await writeRuntimeConfigJson(TEST_ROOT, 'claude');
+
+      const { resolveEffectiveRuntime } = await import('@bradygaster/squad-sdk/client');
+      const fromSdk = resolveEffectiveRuntime({ squadDir: join(TEST_ROOT, '.squad') });
+      expect(fromSdk).toMatchObject({ id: 'claude', source: 'config' });
+
+      const checks = await runDoctor(TEST_ROOT);
+      const runtime = checks.find((c: DoctorCheck) => c.name === 'squad runtime selected');
+      expect(runtime?.message).toContain(fromSdk.id);
+    });
+  });
+
+  it('lets SQUAD_RUNTIME override a config.json runtime, matching the factory', async () => {
+    await withEnvRuntime('copilot', async () => {
+      await scaffold(TEST_ROOT);
+      await writeRuntimeConfigJson(TEST_ROOT, 'claude');
+
+      const checks = await runDoctor(TEST_ROOT);
+      const runtime = checks.find((c: DoctorCheck) => c.name === 'squad runtime selected');
+      expect(runtime?.status).toBe('pass');
+      expect(runtime?.message).toContain('copilot');
+      expect(runtime?.message).toContain('from SQUAD_RUNTIME=copilot');
+    });
+  });
+
+  it('reports an unknown runtime in config.json as a check failure, not a throw', async () => {
+    await withEnvRuntime(undefined, async () => {
+      await scaffold(TEST_ROOT);
+      await writeRuntimeConfigJson(TEST_ROOT, 'gemini');
+
+      // runDoctor must resolve (doctor always exits 0), not reject.
+      const checks = await runDoctor(TEST_ROOT);
+      const runtime = checks.find((c: DoctorCheck) => c.name === 'squad runtime selected');
+      expect(runtime?.status).toBe('fail');
+      expect(runtime?.message).toContain('Unknown squad runtime "gemini"');
+      // The remedy must name the file the user has to edit.
+      expect(runtime?.message).toContain('config.json');
+
+      // And the section stays non-fatal for Copilot-only users.
+      const cli = checks.find((c: DoctorCheck) => c.name === 'Claude CLI available');
+      const auth = checks.find((c: DoctorCheck) => c.name === 'Claude runtime auth');
+      expect(cli?.status).not.toBe('fail');
+      expect(auth?.status).not.toBe('fail');
+    });
   });
 
   it('checkGitSyncHooks returns FAIL when hook file lacks squad marker', async () => {
@@ -396,7 +612,7 @@ describe('checkGitSyncHooks — git rev-parse --git-dir resolution', () => {
     // Install squad hooks in the actual .git/hooks dir (same as git rev-parse --git-dir → '.git')
     const hooksDir = join(repoDir, '.git', 'hooks');
     await mkdir(hooksDir, { recursive: true });
-    for (const hookName of ['pre-push', 'post-merge', 'post-rewrite', 'post-checkout']) {
+    for (const hookName of ['pre-push', 'post-merge', 'post-rewrite', 'post-checkout', 'pre-commit', 'post-commit']) {
       await writeFile(
         join(hooksDir, hookName),
         `#!/bin/sh\n# --- squad-sync-hook ---\n# squad sync hook\n`,

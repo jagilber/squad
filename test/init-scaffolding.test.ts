@@ -416,13 +416,21 @@ describe('squad.agent.md template handling (#730)', () => {
 
     const result = await initSquad(sdkOptions(TEST_ROOT), maskedStorage as typeof realStorage);
 
-    // Warning should be present
-    expect(result.warnings.length).toBe(1);
-    expect(result.warnings[0]).toContain('squad.agent.md template not found');
+    // One warning per agent file that could not be written: the Copilot copy
+    // (.github/agents/squad.agent.md) and the Claude Code copy
+    // (.claude/agents/squad.md) are both derived from this single template.
+    expect(result.warnings.length).toBe(2);
+    for (const w of result.warnings) {
+      expect(w).toContain('squad.agent.md template not found');
+    }
+    expect(result.warnings.some(w => w.includes('Copilot agent file'))).toBe(true);
+    expect(result.warnings.some(w => w.includes('.claude/agents/squad.md'))).toBe(true);
 
-    // squad.agent.md should NOT be in createdFiles
+    // Neither agent file should be in createdFiles
     const agentEntry = result.createdFiles.find(f => f.includes('squad.agent.md'));
     expect(agentEntry).toBeUndefined();
+    const claudeEntry = result.createdFiles.find(f => f.includes('.claude'));
+    expect(claudeEntry).toBeUndefined();
 
     // Other files should still be created
     expect(result.createdFiles.length).toBeGreaterThan(0);
