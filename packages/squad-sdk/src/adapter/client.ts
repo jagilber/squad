@@ -52,6 +52,14 @@ export function normalizeToolNameForCopilot(name: string): string {
 }
 
 /**
+ * Runtime-neutral alias for {@link normalizeToolNameForCopilot}: the
+ * Anthropic tool-name grammar is the same `^[a-zA-Z0-9_-]+$`, so the Claude
+ * runtime provider reuses the identical normalization. Prefer this name in
+ * new code; the Copilot-named export remains for compatibility.
+ */
+export const normalizeToolNameForWire = normalizeToolNameForCopilot;
+
+/**
  * Normalize all tool-name surfaces in a `SquadSessionConfig` before the
  * config is forwarded to the Copilot SDK external-tool API.
  *

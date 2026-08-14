@@ -667,7 +667,7 @@ function buildMcpServerSpecs(isGitHub: boolean, cliVersion?: string): McpServerS
     ? {
         name: 'EXAMPLE-github',
         command: 'npx',
-        args: ['-y', '@anthropic/github-mcp-server'],
+        args: ['-y', '@modelcontextprotocol/server-github'],
         env: { GITHUB_TOKEN: '${GITHUB_TOKEN}' },
       }
     : {

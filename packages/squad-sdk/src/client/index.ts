@@ -13,10 +13,21 @@
 export {
   SquadClient,
   normalizeToolNameForCopilot,
+  normalizeToolNameForWire,
   normalizeToolsInConfig,
   type SquadClientOptions,
   type SquadConnectionState,
 } from '../adapter/client.js';
+
+// Runtime-provider seam: interface + factory + runtime resolution.
+export {
+  createRuntimeProvider,
+  resolveRuntimeId,
+  SQUAD_RUNTIME_ENV,
+  type SquadRuntimeProvider,
+  type SquadRuntimeId,
+  type CreateRuntimeProviderOptions,
+} from '../adapter/provider.js';
 
 export type {
   SquadSession,

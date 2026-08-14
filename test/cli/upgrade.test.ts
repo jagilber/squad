@@ -173,7 +173,7 @@ describe('CLI: upgrade command', () => {
     // state-mcp command). Match a regex rather than literal version.
     expect(upgraded).toMatch(/args: \['-y', '@bradygaster\/squad-cli@[^']+', 'state-mcp'\]/);
     expect(upgraded).toContain('  EXAMPLE-github:');
-    expect(upgraded).toContain("    args: ['-y', '@anthropic/github-mcp-server']");
+    expect(upgraded).toContain("    args: ['-y', '@modelcontextprotocol/server-github']");
     expect(upgraded).toContain('      GITHUB_TOKEN: ${GITHUB_TOKEN}');
     expect(upgraded).not.toContain('EXAMPLE-azure-devops');
     const frontmatterEnd = upgraded.indexOf('\n---', 4);
