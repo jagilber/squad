@@ -12,7 +12,7 @@
 // --- Types ---
 
 /** Platform environment for spawn dispatch */
-export type SpawnPlatform = 'cli' | 'app' | 'vscode';
+export type SpawnPlatform = 'cli' | 'app' | 'vscode' | 'claude';
 
 /** Configuration for spawning an agent */
 export interface SpawnRequest {
@@ -353,7 +353,35 @@ export function detectSpawnBackend(
 }
 
 /**
+ * Tool names that identify a Claude Code session, newest first.
+ *
+ * MEASURED, not guessed. Probed against the real CLI (claude 2.1.224) with a
+ * `.claude/agents/toolprobe.md` subagent that reports its own tool list:
+ *
+ *   claude -p "Reply with exactly one line: SPAWN_TOOL: <exact name of the tool
+ *              you would use to delegate work to a subagent>…"
+ *   → SPAWN_TOOL: Agent
+ *   → HAS_TASK:   no   (both at top level and inside the subagent)
+ *
+ * `Task` was the name in earlier builds and is still used by some non-Anthropic
+ * harnesses, so it is retained as an alias — but `Agent` is what current Claude
+ * Code actually exposes. Squad shipped a `Task`-only check first; it was dead
+ * code on every real session. Re-probe before editing this list, and record the
+ * version you probed.
+ *
+ * Case matters: lowercase `task` is the Copilot CLI tool (`'cli'`), a different
+ * tool with a different parameter shape. It must never match here.
+ */
+export const CLAUDE_SPAWN_TOOL_NAMES: readonly string[] = ['Agent', 'Task'];
+
+/**
  * Detect spawn platform from available tools (returns platform type only).
+ *
+ * Detection order (first match wins):
+ * 1. `create_session`        → `'app'`     (Copilot App sub-sessions)
+ * 2. `runSubagent`           → `'vscode'`  (VS Code Copilot Chat)
+ * 3. `Agent` / `Task`        → `'claude'`  (Claude Code — see CLAUDE_SPAWN_TOOL_NAMES)
+ * 4. otherwise               → `'cli'`     (Copilot CLI lowercase `task` / fallback)
  *
  * @param availableTools - Set of tool names available in the current environment
  */
@@ -366,6 +394,7 @@ export function detectSpawnPlatform(
 
   if (tools.has('create_session')) return 'app';
   if (tools.has('runSubagent')) return 'vscode';
+  if (CLAUDE_SPAWN_TOOL_NAMES.some(name => tools.has(name))) return 'claude';
   return 'cli';
 }
 

@@ -7,7 +7,7 @@
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { FSStorageProvider } from '@bradygaster/squad-sdk';
+import { FSStorageProvider, toClaudeSubagentDoc } from '@bradygaster/squad-sdk';
 import { success, warn, info, dim, bold } from './output.js';
 import { fatal } from './errors.js';
 import { detectSquadDir } from './detect-squad-dir.js';
@@ -272,6 +272,55 @@ function writeAgentTemplate(agentSrc: string, agentDest: string, cliVersion: str
 
   storage.writeSync(agentDest, agentContent);
   stampVersion(agentDest, cliVersion);
+}
+
+/**
+ * Resolve the on-disk path for the Claude Code coordinator from the template
+ * manifest. Returns null when no such entry is registered (emission is then a
+ * no-op, so the manifest entry is load-bearing rather than decorative).
+ *
+ * @param squadDir The resolved `.squad/` directory — manifest destinations are
+ *                 relative to it (`../.claude/agents/squad.md`).
+ */
+function resolveClaudeAgentDest(squadDir: string): string | null {
+  const entry = TEMPLATE_MANIFEST.find(
+    f => f.source === 'squad.agent.md.template' && f.destination.includes('.claude/'),
+  );
+  return entry ? path.resolve(squadDir, entry.destination) : null;
+}
+
+/**
+ * Emit `.claude/agents/squad.md` — the same coordinator body as
+ * `.github/agents/squad.agent.md`, re-fronted with Claude Code's subagent
+ * front matter (see `toClaudeSubagentDoc`).
+ *
+ * Manifest entry: `squad.agent.md.template` → `../.claude/agents/squad.md`.
+ * Written here rather than by the generic copy loop so the version stamp is
+ * applied and the front matter is translated instead of copied verbatim.
+ *
+ * @returns true if the file was written (false on dry-run or missing template)
+ */
+function writeClaudeAgentTemplate(
+  agentSrc: string,
+  claudeDest: string | null,
+  cliVersion: string,
+  options?: { dryRun?: boolean },
+): boolean {
+  if (!claudeDest) return false;
+  if (!storage.existsSync(agentSrc)) return false;
+
+  if (options?.dryRun) {
+    info(storage.existsSync(claudeDest)
+      ? '.claude/agents/squad.md would be refreshed from the latest template'
+      : '.claude/agents/squad.md does not exist — would create from template');
+    return false;
+  }
+
+  const content = toClaudeSubagentDoc(storage.readSync(agentSrc) ?? '');
+  storage.mkdirSync(path.dirname(claudeDest), { recursive: true });
+  storage.writeSync(claudeDest, content);
+  stampVersion(claudeDest, cliVersion);
+  return true;
 }
 
 /**
@@ -1091,6 +1140,10 @@ export async function runUpgrade(dest: string, options: UpgradeOptions = {}): Pr
 
   const agentDest = path.join(dest, '.github', 'agents', 'squad.agent.md');
   const oldVersion = readInstalledVersion(agentDest) ?? '0.0.0';
+  // The Claude Code coordinator destination comes from TEMPLATE_MANIFEST, not a
+  // literal — drop the manifest entry and the emission stops, which is what the
+  // manifest-registration test is guarding.
+  const claudeAgentDest = resolveClaudeAgentDest(squadDirInfo.path);
   const squadConfig = readSquadConfig(squadDirInfo.path);
   const mcpConfigMode = detectMcpConfigMode(squadConfig, agentDest);
   const isGitHubForMcp = detectIsGitHubForMcp(dest, squadConfig);
@@ -1107,6 +1160,7 @@ export async function runUpgrade(dest: string, options: UpgradeOptions = {}): Pr
     const agentSrc = path.join(templatesDir, 'squad.agent.md.template');
     if (storage.existsSync(agentSrc)) {
       writeAgentTemplate(agentSrc, agentDest, cliVersion, mcpConfigMode, isGitHubForMcp, { dryRun: true });
+      writeClaudeAgentTemplate(agentSrc, claudeAgentDest, cliVersion, { dryRun: true });
     }
     const filesToUpgrade = TEMPLATE_MANIFEST.filter(f => f.overwriteOnUpgrade && f.source !== 'squad.agent.md.template');
     if (filesToUpgrade.length > 0) {
@@ -1150,6 +1204,10 @@ export async function runUpgrade(dest: string, options: UpgradeOptions = {}): Pr
       writeAgentTemplate(agentSrc, agentDest, cliVersion, mcpConfigMode, isGitHubForMcp);
       success('upgraded squad.agent.md');
       filesUpdated.push('squad.agent.md');
+      if (writeClaudeAgentTemplate(agentSrc, claudeAgentDest, cliVersion)) {
+        success('upgraded .claude/agents/squad.md');
+        filesUpdated.push('.claude/agents/squad.md');
+      }
     } else {
       warn('squad.agent.md.template not found — squad.agent.md was not refreshed. Reinstall or repair the CLI to restore the missing template.');
     }
@@ -1179,6 +1237,11 @@ export async function runUpgrade(dest: string, options: UpgradeOptions = {}): Pr
   const fromLabel = oldVersion === '0.0.0' || !oldVersion ? 'unknown' : oldVersion;
   success(`upgraded coordinator from ${fromLabel} to ${cliVersion}`);
   filesUpdated.push('squad.agent.md');
+
+  if (writeClaudeAgentTemplate(agentSrc, claudeAgentDest, cliVersion)) {
+    success('upgraded .claude/agents/squad.md (Claude Code coordinator)');
+    filesUpdated.push('.claude/agents/squad.md');
+  }
 
   // Upgrade squad-owned files from template manifest
   // Exclude squad.agent.md — already copied and version-stamped above

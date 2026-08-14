@@ -8,6 +8,9 @@
  *   packages/squad-cli/templates/     (CLI package)
  *   packages/squad-sdk/templates/     (SDK package)
  *   .github/agents/squad.agent.md     (GitHub agent — squad.agent.md only)
+ *   .claude/agents/squad.md           (Claude Code subagent — derived from
+ *                                      squad.agent.md with translated front
+ *                                      matter; see toClaudeSubagentDoc below)
  *
  * Only copies files that exist in .squad-templates/. Target directories
  * that don't exist are skipped with a warning.
@@ -47,6 +50,10 @@ const MIRROR_TARGETS = [
 const AGENT_MD_TARGET = join(ROOT, '.github', 'agents');
 const AGENT_MD_FILE = 'squad.agent.md';
 
+// ...and, front-matter-translated, to .claude/agents/squad.md so the repo
+// dogfoods its own coordinator under the Claude Code runtime too.
+const CLAUDE_AGENT_TARGET = join(ROOT, '.claude', 'agents', 'squad.md');
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -64,6 +71,61 @@ function collectFiles(dir, base = '') {
     }
   }
   return files;
+}
+
+/**
+ * Translate Copilot agent front matter into Claude Code subagent front matter.
+ *
+ * MUST stay behaviourally identical to `toClaudeSubagentDoc()` in
+ * packages/squad-sdk/src/config/claude-agent.ts — that TS function is what
+ * `squad init` / `squad upgrade` ship, this copy is what the repo's own
+ * .claude/agents/squad.md is built from. test/claude-agent-emission.test.ts
+ * pins the two together byte-for-byte; if you edit one, edit both.
+ */
+function toClaudeSubagentDoc(agentMarkdown) {
+  const DROPPED = new Set(['tools', 'mcp-servers', 'mcp_servers', 'model']);
+  let frontmatter = '';
+  let body = agentMarkdown;
+  if (/^---\r?\n/.test(agentMarkdown)) {
+    const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(agentMarkdown);
+    if (m) {
+      frontmatter = m[1] ?? '';
+      body = agentMarkdown.slice(m[0].length);
+    }
+  }
+
+  const readScalar = (key) => {
+    const raw = new RegExp(`^${key}:[ \\t]*(.*)$`, 'm').exec(frontmatter)?.[1]?.trim();
+    if (raw === undefined || raw === '') return undefined;
+    const unquoted = /^"(.*)"$/.exec(raw)?.[1] ?? /^'(.*)'$/.exec(raw)?.[1] ?? raw;
+    return unquoted.trim() || undefined;
+  };
+
+  const rawName = readScalar('name') ?? 'squad';
+  const name = rawName.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'squad';
+  const description = readScalar('description')
+    ?? "Your AI team. Describe what you're building, get a team of specialists that live in your repo.";
+
+  const passthrough = [];
+  for (const line of frontmatter.split(/\r?\n/)) {
+    const key = /^([A-Za-z0-9_-]+):/.exec(line)?.[1];
+    if (!key) continue;
+    if (key === 'name' || key === 'description') continue;
+    if (DROPPED.has(key)) continue;
+    passthrough.push(line.trimEnd());
+  }
+
+  const quoted = `"${description.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r?\n/g, ' ')}"`;
+  const header = [
+    '---',
+    `name: ${name}`,
+    `description: ${quoted}`,
+    ...passthrough,
+    'model: inherit',
+    '---',
+  ].join('\n');
+
+  return header + '\n' + (body.startsWith('\n') || body.startsWith('\r\n') ? body : '\n' + body);
 }
 
 /** Copy a single file, creating parent dirs as needed. Returns true if written. */
@@ -116,11 +178,23 @@ for (const relFile of sourceFiles) {
     copyFile(srcPath, dest);
   }
 
+  // Derived target: .claude/agents/squad.md (same body, Claude Code front matter).
+  // Unlike the mirror targets this one is NOT byte-identical to the source, so it
+  // is written separately and reported separately.
+  let derivedNote = '';
+  if (relFile === AGENT_MD_FILE) {
+    const derived = toClaudeSubagentDoc(readFileSync(srcPath, 'utf-8'));
+    const destDir = dirname(CLAUDE_AGENT_TARGET);
+    if (!existsSync(destDir)) mkdirSync(destDir, { recursive: true });
+    writeFileSync(CLAUDE_AGENT_TARGET, derived);
+    derivedNote = ` (+ .claude/agents/squad.md, front matter translated)`;
+  }
+
   totalCopied++;
   const label = targets.length === 1
     ? `1 target`
     : `${targets.length} targets`;
-  console.log(`  ✅ ${relFile} → ${label}`);
+  console.log(`  ✅ ${relFile} → ${label}${derivedNote}`);
 }
 
 console.log(`\n📋 Synced ${totalCopied} file(s) from .squad-templates/`);

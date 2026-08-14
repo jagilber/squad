@@ -12,9 +12,11 @@ Before spawning agents, determine the platform by checking available tools:
 
 2. **VS Code mode** — `runSubagent` or `agent` tool is available → conditional behavior. Use `runSubagent` with the task prompt. Drop `agent_type`, `mode`, and `model` parameters. Multiple subagents in one turn run concurrently (equivalent to background mode). Results return automatically — no `read_agent` needed.
 
-3. **Fallback mode** — neither `task` nor `runSubagent`/`agent` available → work inline. Do not apologize or explain the limitation. Execute the task directly.
+3. **Claude Code mode** — the `Agent` tool is available (named `Task` in older builds) → conditional behavior. Use `Agent` with `subagent_type: "general-purpose"`, `description`, and `prompt`. Drop `agent_type`, `mode`, `model`, and `name`. Multiple `Agent` calls in one turn run concurrently (equivalent to background mode). Results return on the tool result — no `read_agent` needed. Subagents also receive `Agent`, so nested dispatch works.
 
-If both `task` and `runSubagent` are available, prefer `task` (richer parameter surface).
+4. **Fallback mode** — none of `task`, `runSubagent`/`agent`, or `Agent` available → work inline. Do not apologize or explain the limitation. Execute the task directly.
+
+If both `task` and `runSubagent` are available, prefer `task` (richer parameter surface). `task` (Copilot CLI) and `Agent` (Claude Code) are different tools on different platforms — never substitute one name for the other.
 
 #### VS Code Spawn Adaptations
 

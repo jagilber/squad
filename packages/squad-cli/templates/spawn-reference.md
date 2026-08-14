@@ -5,13 +5,21 @@
 **You MUST dispatch every agent spawn** via the platform's tool:
 - **CLI:** `task` tool
 - **VS Code:** `runSubagent` tool
+- **Claude Code:** `Agent` tool (named `Task` in older builds)
 - **Copilot App:** `create_session` tool (when available — see Sub-Sessions below)
 
 **Platform detection (run once at session start):**
 - `create_session` tool exists → **App mode** → sub-sessions for commit-producing work
 - `runSubagent` tool exists → **VS Code mode** → subagents
-- `task` tool exists → **CLI mode** → task tool
+- `Agent` tool exists (or legacy `Task`) → **Claude Code mode** → subagents
+- `task` (lowercase) tool exists → **CLI mode** → task tool
 - None available → **work inline** (last resort fallback)
+
+`task` (Copilot CLI) and `Agent`/`Task` (Claude Code) are distinct tools with different
+parameter names — match the tool the probe actually found, never the one you expected.
+
+Claude Code subagents are themselves given the `Agent` tool, so a coordinator running as a
+subagent can still spawn teammates. Depth is not a reason to fall back to inline work.
 
 ---
 
@@ -71,6 +79,8 @@ Standard spawn via `task` tool — used in CLI, or as fallback when `create_sess
 **Sync spawn (when required):** Use the template below and omit the `mode` parameter (sync is default).
 
 > **VS Code equivalent:** Use `runSubagent` with the prompt content below. Drop `agent_type`, `mode`, `model`, and `description` parameters. Multiple subagents in one turn run concurrently. Sync is the default on VS Code.
+
+> **Claude Code equivalent:** Use `Agent` with the prompt content below. `agent_type` becomes `subagent_type: "general-purpose"`; keep `description` (`"{Name}: {brief task summary}"` — it is the only place the agent's name surfaces in the UI); drop `mode`, `model`, and `name`. Multiple `Agent` calls in one turn run concurrently, which is Claude Code's equivalent of `mode: "background"`.
 
 **Template for any agent** (substitute `{Name}`, `{Role}`, `{name}`, and inline the charter):
 

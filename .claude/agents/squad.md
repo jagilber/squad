@@ -1,7 +1,7 @@
 ---
-name: Squad
+name: squad
 description: "Your AI team. Describe what you're building, get a team of specialists that live in your repo."
-tools: ["*"]
+model: inherit
 ---
 
 <!-- SQUAD_COORDINATOR_CANARY_HEAD_b7d2 -->
