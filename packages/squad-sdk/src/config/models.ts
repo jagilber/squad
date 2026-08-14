@@ -628,6 +628,15 @@ export interface ModelPreferenceConfig {
   agentReasoningEffortOverrides?: Record<string, string>;
   defaultContextTier?: string;
   agentContextTierOverrides?: Record<string, string>;
+  /**
+   * Persistent LLM runtime selection (the {@link SquadRuntimeId} behind the
+   * `SquadRuntimeProvider` seam). Typed as a string union for documentation,
+   * but deliberately NOT validated on read — see
+   * {@link readRuntimePreference}.
+   */
+  runtime?: 'copilot' | 'claude';
+  /** Free-form, runtime-specific options handed to the runtime provider. */
+  runtimeConfig?: Record<string, unknown>;
 }
 
 /**
@@ -806,6 +815,161 @@ export function writeAgentModelOverrides(
     delete config.agentModelOverrides;
   } else {
     config.agentModelOverrides = overrides;
+  }
+
+  storage.writeSync(configPath, JSON.stringify(config, null, 2) + '\n');
+}
+
+// ============================================================================
+// Persistent Runtime Preference (`.squad/config.json` → `runtime`)
+// ============================================================================
+
+/**
+ * Valid squad runtime ids accepted in `.squad/config.json`.
+ *
+ * Duplicated here as a plain literal list (rather than importing
+ * `SquadRuntimeId` from `adapter/provider.ts`) so the config layer keeps no
+ * dependency on the adapter layer. `resolveRuntimeId()` in
+ * `adapter/provider.ts` remains the single *enforcing* validator.
+ */
+export const VALID_SQUAD_RUNTIMES = ['copilot', 'claude'] as const;
+
+/** Union of the values in {@link VALID_SQUAD_RUNTIMES}. */
+export type ValidSquadRuntime = (typeof VALID_SQUAD_RUNTIMES)[number];
+
+/**
+ * Reads the persistent runtime preference from `.squad/config.json`.
+ *
+ * Mirrors {@link readModelPreference} exactly, including its
+ * missing-file/parse-error behaviour (returns `null`, never throws) — and,
+ * deliberately, its lack of value validation: an unrecognized runtime string
+ * is returned as-is so the caller hands it to `resolveRuntimeId()`, which
+ * throws `Unknown squad runtime "<value>"`. Filtering it to `null` here would
+ * silently route work to the default (billed) runtime on a typo, which is
+ * exactly the failure mode the seam is designed to prevent.
+ *
+ * @param squadDir - Path to the `.squad/` directory
+ * @returns The runtime string if set, or null
+ */
+export function readRuntimePreference(squadDir: string, storage: StorageProvider = new FSStorageProvider()): string | null {
+  const configPath = join(squadDir, 'config.json');
+  if (!storage.existsSync(configPath)) {
+    return null;
+  }
+  try {
+    const raw = storage.readSync(configPath);
+    if (raw === undefined) return null;
+    const parsed = JSON.parse(raw);
+    if (
+      parsed !== null &&
+      typeof parsed === 'object' &&
+      typeof parsed.runtime === 'string' &&
+      parsed.runtime.length > 0
+    ) {
+      return parsed.runtime;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Writes a persistent runtime preference to `.squad/config.json`.
+ * Merges with existing config — does not overwrite other fields.
+ *
+ * Mirrors {@link writeModelPreference}: no value validation happens here (the
+ * `squad config runtime` CLI validates before calling, and `resolveRuntimeId()`
+ * is the enforcing gate at read time).
+ *
+ * @param squadDir - Path to the `.squad/` directory
+ * @param runtime - Runtime id to persist, or null to clear
+ */
+export function writeRuntimePreference(squadDir: string, runtime: string | null, storage: StorageProvider = new FSStorageProvider()): void {
+  const configPath = join(squadDir, 'config.json');
+  let config: Record<string, unknown> = {};
+  if (storage.existsSync(configPath)) {
+    try {
+      const raw = storage.readSync(configPath);
+      config = raw !== undefined ? JSON.parse(raw) : { version: 1 };
+    } catch {
+      config = { version: 1 };
+    }
+  } else {
+    config = { version: 1 };
+  }
+
+  if (runtime === null) {
+    delete config.runtime;
+  } else {
+    config.runtime = runtime;
+  }
+
+  storage.writeSync(configPath, JSON.stringify(config, null, 2) + '\n');
+}
+
+/**
+ * Reads the runtime-specific options block from `.squad/config.json`.
+ *
+ * Mirrors {@link readAgentModelOverrides}' shape checks; values are opaque to
+ * squad and are handed to the runtime provider verbatim.
+ *
+ * @param squadDir - Path to the `.squad/` directory
+ * @returns The `runtimeConfig` object, or null when absent/malformed
+ */
+export function readRuntimeConfig(squadDir: string, storage: StorageProvider = new FSStorageProvider()): Record<string, unknown> | null {
+  const configPath = join(squadDir, 'config.json');
+  if (!storage.existsSync(configPath)) {
+    return null;
+  }
+  try {
+    const raw = storage.readSync(configPath);
+    if (raw === undefined) return null;
+    const parsed = JSON.parse(raw);
+    if (
+      parsed !== null &&
+      typeof parsed === 'object' &&
+      typeof parsed.runtimeConfig === 'object' &&
+      parsed.runtimeConfig !== null &&
+      !Array.isArray(parsed.runtimeConfig)
+    ) {
+      return parsed.runtimeConfig as Record<string, unknown>;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Writes the runtime-specific options block to `.squad/config.json`.
+ * Merges with existing config — does not overwrite other fields.
+ *
+ * @param squadDir - Path to the `.squad/` directory
+ * @param runtimeConfig - Options object to persist, or null/empty to clear
+ */
+export function writeRuntimeConfig(
+  squadDir: string,
+  runtimeConfig: Record<string, unknown> | null,
+  storage: StorageProvider = new FSStorageProvider()
+): void {
+  const configPath = join(squadDir, 'config.json');
+  let config: Record<string, unknown> = {};
+  if (storage.existsSync(configPath)) {
+    try {
+      const raw = storage.readSync(configPath);
+      config = raw !== undefined ? JSON.parse(raw) : { version: 1 };
+    } catch {
+      config = { version: 1 };
+    }
+  } else {
+    config = { version: 1 };
+  }
+
+  if (runtimeConfig === null || Object.keys(runtimeConfig).length === 0) {
+    delete config.runtimeConfig;
+  } else {
+    config.runtimeConfig = runtimeConfig;
   }
 
   storage.writeSync(configPath, JSON.stringify(config, null, 2) + '\n');

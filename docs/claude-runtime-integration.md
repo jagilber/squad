@@ -145,3 +145,42 @@ template-sync machinery and adding Claude Code's `Task` tool to the spawn ladder
 
 Incidental fix queued for Stage 2: `config/init.ts:670` and `cli/core/upgrade.ts:76` reference the
 nonexistent package `@anthropic/github-mcp-server` (should be `@modelcontextprotocol/server-github`).
+
+## 5. Runtime selection precedence (config plumbing)
+
+`.squad/config.json` gained a `runtime` key (plus a free-form `runtimeConfig` object) alongside
+`defaultModel` / `defaultContextTier`. Accessors live in `packages/squad-sdk/src/config/models.ts`
+(`readRuntimePreference` / `writeRuntimePreference` / `readRuntimeConfig` / `writeRuntimeConfig`),
+mirroring `readModelPreference` / `writeModelPreference` — missing file or unparseable JSON yields
+`null`, and writes merge into the existing config rather than replacing it.
+
+**Precedence, highest first** — implemented once, in `resolveEffectiveRuntime()`
+(`packages/squad-sdk/src/adapter/provider.ts`, re-exported from
+`@bradygaster/squad-sdk/client`):
+
+1. explicit `runtime` option → `source: 'explicit'`
+2. the `SQUAD_RUNTIME` environment variable → `source: 'env'`
+3. `runtime` in `<squadDir>/config.json` (only consulted when `squadDir` is supplied) → `'config'`
+4. `'copilot'` — the default applied inside `resolveRuntimeId()` → `'default'`
+
+It returns `{ id, source, value }` so a consumer can explain *why* a runtime is in effect without
+re-deriving the ordering. **Every consumer must call it** rather than reimplementing the layering:
+`createSquadClientWithPool` (`client/index.ts`) and `squad doctor`
+(`checkRuntimeSelection`, `packages/squad-cli/src/cli/commands/doctor.ts`) both do. This is not
+stylistic — doctor originally called bare `resolveRuntimeId()`, which only sees env → default, so on
+a repo with `{"runtime":"claude"}` in `.squad/config.json` it printed a green
+`✅ squad runtime selected — copilot` while the factory would have constructed Claude.
+
+`resolveRuntimeId()` itself is unchanged (`explicit → env → 'copilot'`); precedence is expressed by
+choosing which value the wrapper passes as its explicit argument. The env var sits above the config
+file on purpose: a shell can override a checked-in project preference for a single run without
+editing tracked state.
+
+Validation is deliberately *not* performed on read. `readRuntimePreference` returns whatever string
+is in the file so `resolveRuntimeId()` can throw ``Unknown squad runtime "<value>"`` — filtering a
+typo to `null` would silently route (billed) work to the default runtime. The
+`squad config runtime <copilot|claude>` CLI validates before writing, and
+`squad config runtime` with no argument prints the configured value, any `SQUAD_RUNTIME` override,
+and the resulting effective runtime. `squad doctor` surfaces an unknown value as a check failure
+with the offending value and the file to edit — still exiting 0, since doctor is a diagnostic, not
+a gate.

@@ -12,6 +12,9 @@
  *   squad config context-tier <tier> --agent <n>       — pin context tier to a specific agent
  *   squad config context-tier --clear                  — clear default context tier override
  *   squad config context-tier --clear --agent <n>      — clear a specific agent's override
+ *   squad config runtime                        — show current LLM runtime configuration
+ *   squad config runtime <copilot|claude>       — set the persistent runtime
+ *   squad config runtime --clear                — clear the runtime preference
  */
 
 import { join } from 'node:path';
@@ -25,7 +28,10 @@ import {
   writeContextTier,
   readAgentContextTierOverrides,
   writeAgentContextTierOverrides,
+  readRuntimePreference,
+  writeRuntimePreference,
   VALID_CONTEXT_TIERS,
+  VALID_SQUAD_RUNTIMES,
   MODEL_CATALOG,
 } from '@bradygaster/squad-sdk/config';
 import { fatal } from '../core/errors.js';
@@ -77,6 +83,14 @@ function isValidTier(name: string): boolean {
 
 function showAvailableTiers(): void {
   console.log(`\n  Available context tiers: ${DIM}${VALID_CONTEXT_TIERS.join(', ')}${RESET}\n`);
+}
+
+function isValidRuntime(name: string): boolean {
+  return (VALID_SQUAD_RUNTIMES as readonly string[]).includes(name);
+}
+
+function showAvailableRuntimes(): void {
+  console.log(`\n  Available runtimes: ${DIM}${VALID_SQUAD_RUNTIMES.join(', ')}${RESET}\n`);
 }
 
 function parseFlags(args: string[]): { clear: boolean; agent: string | null; positional: string[] } {
@@ -242,6 +256,58 @@ async function runContextTierSubcommand(squadDir: string, subArgs: string[]): Pr
   showAvailableTiers();
 }
 
+async function runRuntimeSubcommand(squadDir: string, subArgs: string[]): Promise<void> {
+  const { clear, agent, positional } = parseFlags(subArgs);
+  const runtimeArg = positional[0] ?? null;
+
+  // Runtime is a whole-squad setting: one CLI process talks to one runtime,
+  // so there is deliberately no --agent form here.
+  if (agent) {
+    fatal('squad config runtime has no per-agent form — the runtime is squad-wide.');
+    return;
+  }
+
+  // --- Clear ---
+  if (clear) {
+    writeRuntimePreference(squadDir, null);
+    console.log(`${GREEN}✓${RESET} Runtime preference cleared (reverted to ${BOLD}copilot${RESET}).`);
+    return;
+  }
+
+  // --- Set runtime ---
+  if (runtimeArg) {
+    if (!isValidRuntime(runtimeArg)) {
+      console.error(`${RED}✗${RESET} Unknown runtime: ${BOLD}${runtimeArg}${RESET}`);
+      showAvailableRuntimes();
+      process.exit(1);
+    }
+    writeRuntimePreference(squadDir, runtimeArg);
+    console.log(`${GREEN}✓${RESET} Runtime set to ${BOLD}${runtimeArg}${RESET}`);
+    if (runtimeArg === 'claude') {
+      console.log(`  ${DIM}Requires the claude CLI and the optional dependency @anthropic-ai/claude-agent-sdk.${RESET}`);
+    }
+    return;
+  }
+
+  // --- Show current config ---
+  // Precedence (see createSquadClientWithPool in squad-sdk): explicit option →
+  // SQUAD_RUNTIME env → .squad/config.json runtime → 'copilot'.
+  const configured = readRuntimePreference(squadDir);
+  const envRuntime = process.env.SQUAD_RUNTIME;
+  const effective = envRuntime ?? configured ?? 'copilot';
+
+  console.log(`\n${BOLD}Runtime configuration:${RESET}`);
+  console.log(`  Configured runtime: ${configured ? BOLD + configured + RESET : `${DIM}(unset → copilot)${RESET}`}`);
+  if (envRuntime) {
+    console.log(`  ${YELLOW}SQUAD_RUNTIME${RESET} env override: ${BOLD}${envRuntime}${RESET} ${DIM}(wins over config.json)${RESET}`);
+  }
+  console.log(`  Effective runtime:  ${BOLD}${effective}${RESET}`);
+  if (!isValidRuntime(effective)) {
+    console.log(`  ${RED}✗${RESET} "${effective}" is not a known runtime — squad will refuse to start.`);
+  }
+  showAvailableRuntimes();
+}
+
 export async function runConfig(cwd: string, subArgs: string[]): Promise<void> {
   const squadDir = resolveSquadDir(cwd);
   if (!squadDir) {
@@ -261,6 +327,11 @@ export async function runConfig(cwd: string, subArgs: string[]): Promise<void> {
     return;
   }
 
+  if (sub === 'runtime') {
+    await runRuntimeSubcommand(squadDir, subArgs.slice(1));
+    return;
+  }
+
   // No subcommand or unknown — show usage
   console.log(`\n${BOLD}squad config${RESET} — manage squad configuration\n`);
   console.log(`  ${BOLD}squad config model${RESET}                          — show current model config`);
@@ -273,4 +344,7 @@ export async function runConfig(cwd: string, subArgs: string[]): Promise<void> {
   console.log(`  ${BOLD}squad config context-tier <tier> --agent <name>${RESET} — pin context tier to agent`);
   console.log(`  ${BOLD}squad config context-tier --clear${RESET}            — clear default context tier`);
   console.log(`  ${BOLD}squad config context-tier --clear --agent <name>${RESET} — clear agent override\n`);
+  console.log(`  ${BOLD}squad config runtime${RESET}                         — show current LLM runtime config`);
+  console.log(`  ${BOLD}squad config runtime <copilot|claude>${RESET}        — set the runtime`);
+  console.log(`  ${BOLD}squad config runtime --clear${RESET}                 — clear the runtime preference\n`);
 }

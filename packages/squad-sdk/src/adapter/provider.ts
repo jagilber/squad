@@ -31,6 +31,8 @@ import type {
   SquadClientEventHandler,
 } from './types.js';
 import type { SquadConnectionState, SquadClientOptions } from './client.js';
+import { readRuntimePreference } from '../config/models.js';
+import type { StorageProvider } from '../storage/index.js';
 
 /** Identifier of a concrete LLM runtime behind the provider seam. */
 export type SquadRuntimeId = 'copilot' | 'claude';
@@ -89,6 +91,95 @@ export function resolveRuntimeId(explicit?: string): SquadRuntimeId {
     `Unknown squad runtime "${raw}". Valid values: "copilot", "claude" ` +
     `(set via the runtime option or the ${SQUAD_RUNTIME_ENV} environment variable).`
   );
+}
+
+/**
+ * Which layer supplied the effective runtime id. Returned by
+ * {@link resolveEffectiveRuntime} so callers can explain *why* a runtime is in
+ * effect without re-deriving the precedence themselves.
+ */
+export type SquadRuntimeSource = 'explicit' | 'env' | 'config' | 'default';
+
+/** Options accepted by {@link resolveEffectiveRuntime}. */
+export interface ResolveEffectiveRuntimeOptions {
+  /** Explicit runtime id (highest precedence). */
+  runtime?: SquadRuntimeId | string;
+  /**
+   * Path to the `.squad/` directory whose `config.json` may carry a `runtime`
+   * key. Omit to skip the config-file layer entirely.
+   */
+  squadDir?: string;
+  /** Storage provider used to read `.squad/config.json` (tests inject here). */
+  storage?: StorageProvider;
+}
+
+/** Result of {@link resolveEffectiveRuntime}. */
+export interface EffectiveRuntime {
+  /** The validated, normalized runtime id. */
+  id: SquadRuntimeId;
+  /** Which layer it came from. */
+  source: SquadRuntimeSource;
+  /** The raw string `id` was resolved from (`'copilot'` when `source` is `'default'`). */
+  value: string;
+}
+
+/**
+ * Resolve the effective runtime id **and its provenance** across every input
+ * layer. This is the single, canonical home of Squad's runtime precedence —
+ * every consumer (the pooled-client factory, `squad doctor`, …) must call this
+ * rather than re-implementing the layering, because a consumer that only
+ * consults a subset reports a runtime different from the one that will
+ * actually be constructed. (`squad doctor` did exactly that before this
+ * helper existed: it called bare `resolveRuntimeId()`, never read
+ * `.squad/config.json`, and confidently green-checked "copilot" on a repo
+ * configured for claude.)
+ *
+ * ## Precedence, highest first
+ *
+ * 1. `options.runtime` — the explicit programmatic argument → `'explicit'`
+ * 2. the `SQUAD_RUNTIME` environment variable → `'env'`
+ * 3. `runtime` in `<squadDir>/config.json` → `'config'`
+ * 4. `'copilot'` → `'default'`
+ *
+ * The env var deliberately sits above the config file so a shell can override
+ * a checked-in project preference for a single run without editing tracked
+ * state.
+ *
+ * Validation is delegated to {@link resolveRuntimeId} — which is left
+ * untouched — so an unrecognized value at ANY layer throws
+ * `Unknown squad runtime "<value>"` rather than falling back. A typo must
+ * never silently route (billed) work to the default runtime.
+ */
+export function resolveEffectiveRuntime(
+  options: ResolveEffectiveRuntimeOptions = {}
+): EffectiveRuntime {
+  const { runtime, squadDir, storage } = options;
+
+  let raw: string | undefined;
+  let source: SquadRuntimeSource;
+
+  if (runtime !== undefined) {
+    raw = runtime;
+    source = 'explicit';
+  } else if (process.env[SQUAD_RUNTIME_ENV] !== undefined) {
+    // Note: an empty-string env var is NOT skipped — it reaches
+    // resolveRuntimeId and throws, exactly as bare resolveRuntimeId() does.
+    raw = process.env[SQUAD_RUNTIME_ENV];
+    source = 'env';
+  } else {
+    const fromConfig = squadDir ? readRuntimePreference(squadDir, storage) : null;
+    if (fromConfig !== null) {
+      raw = fromConfig;
+      source = 'config';
+    } else {
+      raw = undefined;
+      source = 'default';
+    }
+  }
+
+  // Throws on an unknown value; applies the 'copilot' default when raw is undefined.
+  const id = resolveRuntimeId(raw);
+  return { id, source, value: raw ?? 'copilot' };
 }
 
 /** Options accepted by {@link createRuntimeProvider}. */
