@@ -127,6 +127,14 @@ template-sync machinery and adding Claude Code's `Task` tool to the spawn ladder
 **Decision (2026-08-14): do both, staged.**
 
 1. **Stage 0 (done)** — spikes above; this report.
+   **Stage 2 core (done, branch `claude-runtime-provider`)** — `SquadRuntimeProvider` seam
+   (`adapter/provider.ts`), `adapter/providers/claude.ts` + `copilot.ts`, `SQUAD_RUNTIME` env
+   selection, wire-name alias, MCP package-name fix; 26 seam-faked tests + adjacent suites green.
+   **Spike C (measured 2026-08-14): the provider works end-to-end on the real agent SDK** —
+   Copilot-flavored `claude-haiku-4.5` mapped and served as `claude-haiku-4-5-20251001`; a
+   dotted-name squad tool (`squad.report_status`) round-tripped through the in-process MCP server;
+   events `turn_start/message_delta/message/usage/turn_end/idle` all fired; `sendAndWait` returned
+   the expected result (28 in / 354 out tokens). Script: `.spike/spike-c-claude-provider.mjs`.
 2. **Stage 1** — copilot-ui shim: `server/squad/claudeSquadClient.ts` backed by the existing Claude
    provider machinery; branch client construction on active provider; un-gate
    `CLAUDE_CAPABILITIES.squadAgents`, `messagingLane` refusal, TitleBar forced-disable; tests via
