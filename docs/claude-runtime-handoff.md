@@ -25,7 +25,7 @@ files, pattern to follow, and verification command.*
 | Tests (26 seam-faked) + adjacent suites | ✅ GREEN | `npx vitest run test/claude-runtime-provider.test.ts test/adapter-client.test.ts test/tool-name-normalization.test.ts test/model-selector-policy.test.ts test/cli/upgrade.test.ts` |
 | MCP package-name bug (`@anthropic/github-mcp-server` → `@modelcontextprotocol/server-github`) | ✅ FIXED | init.ts / upgrade.ts / upgrade.test.ts |
 | Index-server write-back | ✅ DONE | entry `squad-on-claude-runtime-integration` v1.0.0 |
-| CUI shim (Stage 1) | ⏳ AGENT IN FLIGHT | branch `squad-on-claude` in copilot-ui — check `git -C C:\github\jagilber-dev\copilot-ui log squad-on-claude --oneline` |
+| CUI shim (Stage 1) | ⬜ NOT STARTED (spec: `docs/cui-squad-on-claude-handoff.md`) | branch `squad-on-claude` exists in copilot-ui with ZERO commits (implementation agent was stopped before writing code) |
 | Config plumbing (`.squad/config.json` `runtime` key) | ⬜ TODO (spec below) | |
 | Wire factory into `SquadClientWithPool` / squad-cli | ⬜ TODO (spec below) | |
 | Path A: `.claude/agents/squad.md` emission | ⬜ TODO (spec below, larger) | |
@@ -33,9 +33,10 @@ files, pattern to follow, and verification command.*
 
 ## Remaining work — execution specs
 
-### T1. Verify/complete the CUI shim (Stage 1)
-Repo `C:\github\jagilber-dev\copilot-ui`, branch `squad-on-claude`. If the branch has commits,
-review against this contract; if not, implement it:
+### T1. Implement the CUI shim (Stage 1) — MOVED
+Full self-contained spec: **`docs/cui-squad-on-claude-handoff.md`** (paste it into the copilot-ui
+repo). Repo `C:\github\jagilber-dev\copilot-ui`, branch `squad-on-claude` (exists, zero commits —
+nothing landed). Summary of the contract, for reference only:
 - New `server/squad/claudeSquadClient.ts`: duck-typed client `{ isConnected, connect, disconnect,
   shutdown?, createSession(opts), resumeSession(id,opts), pool:{add,remove,findByAgent,size} }`,
   session wrapper `{ sessionId, on(event,h), sendMessage({prompt}) }` backed by the EXISTING
