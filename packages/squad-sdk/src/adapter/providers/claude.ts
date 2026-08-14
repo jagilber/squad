@@ -57,11 +57,26 @@ import type {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type SdkMessage = any;
 
+/**
+ * The object `query()` returns: the SDK message stream **and** the control
+ * surface hanging off it.
+ *
+ * `interrupt()` is the agent SDK's turn-level cancellation control (see
+ * `Query.interrupt()` in `@anthropic-ai/claude-agent-sdk/sdk.d.ts`). It is
+ * documented as "only supported when streaming input/output is used" — which
+ * is exactly the mode this provider runs in — and it aborts the *in-flight
+ * turn* while leaving the query (and therefore the session) alive to accept
+ * further input. It is typed optional here because older CLI/SDK builds may
+ * not expose it; {@link ClaudeSessionAdapter.abort} degrades loudly when it is
+ * missing rather than pretending turn-level abort happened.
+ */
+export type ClaudeQuery = AsyncIterable<SdkMessage> & {
+  interrupt?(): Promise<unknown>;
+};
+
 /** The slice of `@anthropic-ai/claude-agent-sdk` this provider consumes. */
 export interface ClaudeSdkFacade {
-  query(params: { prompt: AsyncIterable<SdkMessage>; options?: Record<string, unknown> }): AsyncIterable<SdkMessage> & {
-    interrupt?(): Promise<void>;
-  };
+  query(params: { prompt: AsyncIterable<SdkMessage>; options?: Record<string, unknown> }): ClaudeQuery;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   tool(name: string, description: string, inputSchema: any, handler: (args: any, extra: unknown) => Promise<any>): unknown;
   createSdkMcpServer(options: { name: string; version?: string; tools?: unknown[] }): unknown;
@@ -94,20 +109,34 @@ export async function loadDefaultClaudeSdk(): Promise<ClaudeSdkFacade> {
  * the claude CLI accepts. Strategy:
  * 1. exact override map
  * 2. dot→dash normalization for `claude-*` ids (`claude-sonnet-4.6` → `claude-sonnet-4-6`)
- * 3. family alias fallback (`opus` / `sonnet` / `haiku`)
+ * 3. family alias fallback (`opus` / `sonnet` / `haiku` / `fable`)
  * 4. non-Claude models (gpt-*, gemini-*) → `undefined` (CLI default applies)
+ *
+ * Family aliases are returned bare and left for the CLI to resolve to its
+ * current newest member, rather than being pinned to a hard-coded catalog id
+ * here — so this mapping cannot go stale as new models ship.
+ *
+ * The alias set is EMPIRICAL, not guessed. Measured against claude 2.1.224 on
+ * 2026-08-14 — `claude --model <alias> -p ...` returned a normal completion for
+ * each of opus, sonnet, haiku and fable. Re-measure before adding to this list;
+ * an alias the CLI does not accept is not an error, it silently serves a
+ * different model (see CLAUDE_MODEL_ALIASES tests).
  */
+export const CLAUDE_MODEL_ALIASES = ['opus', 'sonnet', 'haiku', 'fable'] as const;
+
+const CLAUDE_ALIAS_RE = new RegExp(`^(${CLAUDE_MODEL_ALIASES.join('|')})$`);
+
 export function toClaudeModelId(model: string | undefined): string | undefined {
   if (!model) return undefined;
   const m = model.trim().toLowerCase();
-  if (!m.includes('claude') && !/^(opus|sonnet|haiku)$/.test(m)) {
+  if (!m.includes('claude') && !CLAUDE_ALIAS_RE.test(m)) {
     return undefined; // gpt-*, gemini-*, … — not servable on this runtime
   }
-  if (/^(opus|sonnet|haiku)$/.test(m)) return m;
+  if (CLAUDE_ALIAS_RE.test(m)) return m;
   const dashed = m.replace(/\./g, '-');
   if (/^claude-[a-z]+-\d/.test(dashed)) return dashed;
   // Unrecognized claude-ish id — fall back to the family alias.
-  for (const family of ['opus', 'sonnet', 'haiku'] as const) {
+  for (const family of CLAUDE_MODEL_ALIASES) {
     if (m.includes(family)) return family;
   }
   return undefined;
@@ -213,32 +242,86 @@ const SHORT_ALIAS: Record<string, string> = Object.fromEntries(
   Object.entries(DOTTED_ALIAS).map(([k, v]) => [v, k])
 );
 
+// ── Transcript ─────────────────────────────────────────────────────────────
+
+/**
+ * Hard cap on how many turns a single {@link ClaudeSessionAdapter} retains for
+ * {@link ClaudeSessionAdapter.getMessages}.
+ *
+ * A long-lived session streams unboundedly, so the transcript is a bounded
+ * ring: once it is full the **oldest** entries are evicted. Eviction is never
+ * silent — `getMessages()` prepends a `role: 'system'` notice carrying
+ * `truncated: { droppedCount, limit }`, and the running count is also readable
+ * via {@link ClaudeSessionAdapter.droppedTranscriptEntries}.
+ *
+ * 500 entries ≈ 250 user/assistant exchanges, which comfortably covers the
+ * "does this session have history / when was it last active" questions hosts
+ * ask of `getMessages()` without pinning an unbounded amount of model output
+ * in memory.
+ */
+export const CLAUDE_TRANSCRIPT_MAX_ENTRIES = 500;
+
+/** One retained turn of a Claude session transcript. */
+export interface ClaudeTranscriptEntry {
+  /**
+   * `user` / `assistant` are real turns. `system` is only ever used for the
+   * synthetic truncation notice `getMessages()` prepends.
+   */
+  role: 'user' | 'assistant' | 'system';
+  /** Flattened text of the turn (may be empty for a tool-only assistant turn). */
+  content: string;
+  /** ISO-8601 time the entry was recorded by this adapter. */
+  timestamp: string;
+  sessionId: string;
+  /** Model reported by the SDK for an assistant turn, when present. */
+  model?: string;
+  /** Names of tools the assistant invoked in this turn, when any. */
+  toolUses?: string[];
+  /** Attachments carried by a user turn, as supplied to `sendMessage()`. */
+  attachments?: SquadMessageOptions['attachments'];
+  /** Set only on the synthetic truncation notice. */
+  truncated?: { droppedCount: number; limit: number };
+}
+
 /**
  * `SquadSession` over a streaming-input agent-SDK query.
  */
 export class ClaudeSessionAdapter implements SquadSession {
   readonly sessionId: string;
   private readonly input: AsyncQueue<SdkMessage>;
+  private readonly stream: ClaudeQuery;
   private readonly handlers = new Map<string, Set<SquadSessionEventHandler>>();
   private readonly resultWaiters: Array<(result: unknown) => void> = [];
   private readonly model: string | undefined;
   private readonly abortController: AbortController;
+  private readonly transcript: ClaudeTranscriptEntry[] = [];
+  private readonly transcriptLimit = CLAUDE_TRANSCRIPT_MAX_ENTRIES;
+  private transcriptDropped = 0;
+  /** Set by `abort()` so the interrupted turn's `result` is not reported as an error. */
+  private interruptRequested = false;
   private closed = false;
   private pumpDone: Promise<void>;
 
   constructor(opts: {
     sessionId: string;
     input: AsyncQueue<SdkMessage>;
-    stream: AsyncIterable<SdkMessage>;
+    /** The `query()` return value — message stream *and* control surface. */
+    stream: ClaudeQuery;
     model?: string;
     abortController: AbortController;
     onClosed?: (sessionId: string) => void;
   }) {
     this.sessionId = opts.sessionId;
     this.input = opts.input;
+    this.stream = opts.stream;
     this.model = opts.model;
     this.abortController = opts.abortController;
     this.pumpDone = this.pump(opts.stream, opts.onClosed);
+  }
+
+  /** How many transcript entries have been evicted by the bounded-ring cap. */
+  get droppedTranscriptEntries(): number {
+    return this.transcriptDropped;
   }
 
   // ── Event surface ──────────────────────────────────────────────────────
@@ -268,15 +351,98 @@ export class ClaudeSessionAdapter implements SquadSession {
 
   // ── Message surface ────────────────────────────────────────────────────
 
+  /**
+   * Push one user turn into the query's streaming input.
+   *
+   * `options.attachments` are translated into additional `text` content blocks
+   * appended after the prompt, so every attachment's path reaches the model
+   * (see {@link renderAttachment} for the per-variant mapping). Nothing is ever
+   * dropped silently: an attachment this adapter cannot map is passed through
+   * as JSON **and** raises a session `error` event.
+   */
   async sendMessage(options: SquadMessageOptions): Promise<void> {
     if (this.closed) throw new Error(`Claude session ${this.sessionId} is closed.`);
+    const content = this.buildUserContent(options);
     this.dispatch({ type: 'turn_start' });
+    this.recordTranscript({
+      role: 'user',
+      content: content.map((b) => b.text).join('\n\n'),
+      timestamp: new Date().toISOString(),
+      sessionId: this.sessionId,
+      ...(options.attachments?.length ? { attachments: options.attachments } : {}),
+    });
     this.input.push({
       type: 'user',
-      message: { role: 'user', content: [{ type: 'text', text: options.prompt }] },
+      message: { role: 'user', content },
       parent_tool_use_id: null,
       session_id: this.sessionId,
     });
+  }
+
+  /** Prompt block + one block per attachment. */
+  private buildUserContent(options: SquadMessageOptions): Array<{ type: 'text'; text: string }> {
+    const blocks: Array<{ type: 'text'; text: string }> = [{ type: 'text', text: options.prompt }];
+    for (const attachment of options.attachments ?? []) {
+      blocks.push({ type: 'text', text: this.renderAttachment(attachment) });
+    }
+    return blocks;
+  }
+
+  /**
+   * Render one {@link SquadMessageOptions.attachments} entry as prompt text.
+   *
+   * Mapping (the agent SDK's user turns are text content blocks, so every
+   * variant becomes a labelled text block the model can act on — the claude
+   * CLI's own file tools resolve the emitted paths):
+   *
+   * | variant     | rendered as                                                       |
+   * |-------------|-------------------------------------------------------------------|
+   * | `file`      | `[attachment:file] <path> (<displayName>)`                          |
+   * | `directory` | `[attachment:directory] <path> (<displayName>)`                     |
+   * | `selection` | `[attachment:selection] <filePath>#L<start>-L<end> (<displayName>)` plus the selected text in a fenced block when `text` is supplied |
+   *
+   * `selection` line numbers are rendered 1-based (the contract's
+   * `line`/`character` are 0-based, editor-style).
+   *
+   * A variant this adapter does not recognize, or one missing its path, is
+   * emitted as `[attachment:unmapped] <json>` **and** reported through a
+   * session `error` event — visible degradation, never a silent drop.
+   */
+  private renderAttachment(attachment: NonNullable<SquadMessageOptions['attachments']>[number]): string {
+    const a = attachment as unknown as Record<string, unknown>;
+    const displayName = typeof a['displayName'] === 'string' && a['displayName'] ? ` (${a['displayName']})` : '';
+    const kind = typeof a['type'] === 'string' ? a['type'] : '';
+
+    if (kind === 'file' || kind === 'directory') {
+      const path = typeof a['path'] === 'string' ? a['path'].trim() : '';
+      if (!path) return this.unmappedAttachment(attachment, `${kind} attachment has no "path"`);
+      return `[attachment:${kind}] ${path}${displayName}`;
+    }
+
+    if (kind === 'selection') {
+      const filePath = typeof a['filePath'] === 'string' ? a['filePath'].trim() : '';
+      if (!filePath) return this.unmappedAttachment(attachment, 'selection attachment has no "filePath"');
+      const sel = a['selection'] as { start?: { line?: number }; end?: { line?: number } } | undefined;
+      const start = typeof sel?.start?.line === 'number' ? sel.start.line + 1 : undefined;
+      const end = typeof sel?.end?.line === 'number' ? sel.end.line + 1 : undefined;
+      const range = start !== undefined && end !== undefined ? `#L${start}-L${end}` : '';
+      const text = typeof a['text'] === 'string' && a['text'] ? `\n\`\`\`\n${a['text']}\n\`\`\`` : '';
+      return `[attachment:selection] ${filePath}${range}${displayName}${text}`;
+    }
+
+    return this.unmappedAttachment(attachment, `unsupported attachment type ${JSON.stringify(kind)}`);
+  }
+
+  /** Loud fallback: keep the payload in the prompt and surface an error event. */
+  private unmappedAttachment(attachment: unknown, reason: string): string {
+    const json = JSON.stringify(attachment);
+    this.dispatch({
+      type: 'error',
+      message:
+        `Claude session ${this.sessionId}: ${reason}. The attachment was forwarded to the model ` +
+        `as raw JSON rather than dropped, but it will not be interpreted as a file reference: ${json}`,
+    });
+    return `[attachment:unmapped] ${json}`;
   }
 
   async sendAndWait(options: SquadMessageOptions, timeout = 60_000): Promise<unknown> {
@@ -296,12 +462,97 @@ export class ClaudeSessionAdapter implements SquadSession {
     return waiter;
   }
 
+  /**
+   * Abort the **current turn**, leaving the session usable.
+   *
+   * Implemented with the agent SDK's own `query.interrupt()` control request,
+   * which is available precisely because this provider runs in streaming-input
+   * mode. The query — and therefore the underlying CLI session, its context and
+   * its resume id — survives, so a subsequent `sendMessage()` works normally.
+   * The interrupted turn still produces a `result` frame; the pump recognizes
+   * its `terminal_reason` (`aborted_streaming` / `aborted_tools`) and closes the
+   * turn with `turn_end` + `idle` instead of a spurious `error`.
+   *
+   * Degradation, both loud:
+   * - If the loaded SDK build exposes no `interrupt()`, this falls back to
+   *   aborting the whole session (the pre-existing behaviour) **and** emits an
+   *   `error` event saying so — subsequent `sendMessage()` calls will throw
+   *   `Claude session <id> is closed.`
+   * - If `interrupt()` rejects, the error is emitted as a session `error` event
+   *   and rethrown; the session is left alone rather than silently torn down.
+   *
+   * No-op on an already-closed session.
+   */
   async abort(): Promise<void> {
-    this.abortController.abort();
+    if (this.closed) return;
+
+    const interrupt = this.stream.interrupt;
+    if (typeof interrupt !== 'function') {
+      this.dispatch({
+        type: 'error',
+        message:
+          `Claude session ${this.sessionId}: the loaded @anthropic-ai/claude-agent-sdk build exposes no ` +
+          `query.interrupt(), so abort() terminated the whole session rather than just the current turn. ` +
+          `Further sendMessage() calls on this session will throw.`,
+      });
+      this.abortController.abort();
+      return;
+    }
+
+    this.interruptRequested = true;
+    try {
+      await interrupt.call(this.stream);
+    } catch (err) {
+      this.interruptRequested = false;
+      const message = err instanceof Error ? err.message : String(err);
+      this.dispatch({
+        type: 'error',
+        message: `Claude session ${this.sessionId}: interrupt failed, the turn may still be running — ${message}`,
+      });
+      throw err instanceof Error ? err : new Error(message);
+    }
   }
 
+  /**
+   * The session transcript accumulated by the message pump.
+   *
+   * Contains the user turns this adapter sent (including their rendered
+   * attachments) and the assistant turns the SDK streamed back, oldest first.
+   * Bounded at {@link CLAUDE_TRANSCRIPT_MAX_ENTRIES}; when entries have been
+   * evicted the returned array is prefixed with a `role: 'system'` notice
+   * carrying `truncated: { droppedCount, limit }` so truncation is visible to
+   * the caller rather than silent.
+   *
+   * Note this is *this adapter's* view of the conversation, not a re-read of
+   * the CLI's on-disk transcript: it covers the turns seen since the session
+   * object was constructed. For a resumed session it therefore starts empty and
+   * grows from the resume point — which is exactly what a host probing for
+   * "has this session been active" needs, and is honest about what it knows.
+   */
   async getMessages(): Promise<unknown[]> {
-    return []; // transcript retrieval is not part of the v1 surface
+    if (this.transcriptDropped > 0) {
+      const notice: ClaudeTranscriptEntry = {
+        role: 'system',
+        content:
+          `[squad] transcript truncated: ${this.transcriptDropped} earlier entr` +
+          `${this.transcriptDropped === 1 ? 'y was' : 'ies were'} evicted to stay within the ` +
+          `${this.transcriptLimit}-entry per-session cap (CLAUDE_TRANSCRIPT_MAX_ENTRIES).`,
+        timestamp: new Date().toISOString(),
+        sessionId: this.sessionId,
+        truncated: { droppedCount: this.transcriptDropped, limit: this.transcriptLimit },
+      };
+      return [notice, ...this.transcript];
+    }
+    return [...this.transcript];
+  }
+
+  /** Append one entry, evicting oldest entries past the cap. */
+  private recordTranscript(entry: ClaudeTranscriptEntry): void {
+    this.transcript.push(entry);
+    while (this.transcript.length > this.transcriptLimit) {
+      this.transcript.shift();
+      this.transcriptDropped += 1;
+    }
   }
 
   async close(): Promise<void> {
@@ -348,16 +599,34 @@ export class ClaudeSessionAdapter implements SquadSession {
         break;
       }
       case 'assistant': {
-        const blocks: Array<{ type: string; text?: string; thinking?: string }> =
+        const blocks: Array<{ type: string; text?: string; thinking?: string; name?: string }> =
           msg.message?.content ?? [];
         const text = blocks.filter((b) => b.type === 'text').map((b) => b.text ?? '').join('');
         if (text) this.dispatch({ type: 'message', content: text, model: msg.message?.model });
         const thinking = blocks.filter((b) => b.type === 'thinking').map((b) => b.thinking ?? '').join('');
         if (thinking) this.dispatch({ type: 'reasoning', content: thinking });
+        const toolUses = blocks.filter((b) => b.type === 'tool_use').map((b) => b.name ?? 'unknown');
+        if (blocks.length > 0) {
+          this.recordTranscript({
+            role: 'assistant',
+            content: text,
+            timestamp: new Date().toISOString(),
+            sessionId: this.sessionId,
+            ...(typeof msg.message?.model === 'string' ? { model: msg.message.model } : {}),
+            ...(toolUses.length ? { toolUses } : {}),
+          });
+        }
         break;
       }
       case 'result': {
-        const isError = msg.subtype !== 'success' || msg.is_error === true;
+        // A turn cancelled by abort()/interrupt() is not a failure — the SDK
+        // reports it as an error subtype with an `aborted_*` terminal_reason.
+        const aborted =
+          this.interruptRequested ||
+          msg.terminal_reason === 'aborted_streaming' ||
+          msg.terminal_reason === 'aborted_tools';
+        this.interruptRequested = false;
+        const isError = !aborted && (msg.subtype !== 'success' || msg.is_error === true);
         if (isError) {
           this.dispatch({
             type: 'error',

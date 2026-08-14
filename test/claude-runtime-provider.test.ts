@@ -10,7 +10,9 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   ClaudeRuntimeProvider,
   ClaudeSessionAdapter,
+  CLAUDE_TRANSCRIPT_MAX_ENTRIES,
   toClaudeModelId,
+  CLAUDE_MODEL_ALIASES,
   toZodRawShape,
   type ClaudeSdkFacade,
 } from '../packages/squad-sdk/src/adapter/providers/claude.js';
@@ -30,9 +32,17 @@ interface FakeQueryCall {
   emit: (msg: unknown) => void;
   end: () => void;
   received: unknown[];
+  /** How many times the adapter called query.interrupt(). */
+  interrupts: number;
 }
 
-function makeFakeSdk() {
+/**
+ * @param opts.withInterrupt  expose `query.interrupt()` (mirrors a current
+ *   agent-SDK build). Set false to model an older build with no control surface.
+ * @param opts.interruptFails make `interrupt()` reject.
+ */
+function makeFakeSdk(opts: { withInterrupt?: boolean; interruptFails?: boolean } = {}) {
+  const { withInterrupt = true, interruptFails = false } = opts;
   const calls: FakeQueryCall[] = [];
   const facade: ClaudeSdkFacade = {
     query({ prompt, options }) {
@@ -44,6 +54,7 @@ function makeFakeSdk() {
       const call: FakeQueryCall = {
         options: options ?? {},
         received: [],
+        interrupts: 0,
         emit(msg) {
           if (resolveNext) {
             const r = resolveNext; resolveNext = null;
@@ -64,7 +75,7 @@ function makeFakeSdk() {
       void (async () => {
         for await (const m of prompt) call.received.push(m);
       })();
-      return {
+      const query = {
         [Symbol.asyncIterator]() {
           return {
             next(): Promise<IteratorResult<unknown>> {
@@ -75,6 +86,24 @@ function makeFakeSdk() {
           };
         },
       } as ReturnType<ClaudeSdkFacade['query']>;
+      if (withInterrupt) {
+        // Real semantics: cancel the in-flight turn (the SDK then emits a
+        // result frame with an aborted terminal_reason) but leave the query —
+        // and therefore the session — alive and able to accept more input.
+        query.interrupt = async () => {
+          call.interrupts += 1;
+          if (interruptFails) throw new Error('control request failed: no active turn');
+          call.emit({
+            type: 'result',
+            subtype: 'error_during_execution',
+            is_error: true,
+            terminal_reason: 'aborted_streaming',
+            usage: {},
+          });
+          return undefined;
+        };
+      }
+      return query;
     },
     tool(name, description, inputSchema, handler) {
       return { name, description, inputSchema, handler };
@@ -105,6 +134,22 @@ describe('toClaudeModelId', () => {
   it('passes through family aliases', () => {
     expect(toClaudeModelId('opus')).toBe('opus');
     expect(toClaudeModelId('sonnet')).toBe('sonnet');
+  });
+
+  // The alias set is a measured contract, not a guess: each entry was verified
+  // against claude 2.1.224 via `claude --model <alias> -p ...` on 2026-08-14.
+  // An alias the CLI does not accept fails SILENTLY (it serves a different
+  // model), so this list must never be extended without re-measuring.
+  it('pins the measured family-alias set, including fable', () => {
+    expect([...CLAUDE_MODEL_ALIASES]).toEqual(['opus', 'sonnet', 'haiku', 'fable']);
+    for (const alias of CLAUDE_MODEL_ALIASES) {
+      expect(toClaudeModelId(alias)).toBe(alias);
+    }
+  });
+
+  it('resolves a claude-ish id with no version to its family alias', () => {
+    expect(toClaudeModelId('claude-fable')).toBe('fable');
+    expect(toClaudeModelId('claude-haiku')).toBe('haiku');
   });
 
   it('returns undefined for non-claude models (CLI default applies)', () => {
@@ -364,5 +409,248 @@ describe('ClaudeSessionAdapter events', () => {
     await flush();
     expect(seen[0]).toBe('session.created');
     expect(seen).toContain('session.deleted');
+  });
+});
+
+// ── D1: getMessages() must be a real transcript, not a lying empty stub ──────
+//
+// A present-but-always-empty getMessages() is worse than a missing one: hosts
+// probe ['getEvents','getMessages'] and *skip* a session that has neither, but
+// a member that exists and returns [] makes the probe succeed and the host
+// conclude the session has no history — dead-session eviction never fires and
+// the uptime map is never populated, with no error anywhere.
+
+describe('ClaudeSessionAdapter.getMessages (transcript)', () => {
+  async function makeSession() {
+    const { facade, calls } = makeFakeSdk();
+    const provider = new ClaudeRuntimeProvider({ sdk: facade });
+    const session = await provider.createSession({ model: 'claude-haiku-4.5' });
+    return { session, call: calls[0], provider };
+  }
+
+  type Entry = {
+    role: string;
+    content: string;
+    timestamp: string;
+    sessionId: string;
+    model?: string;
+    toolUses?: string[];
+    attachments?: unknown[];
+    truncated?: { droppedCount: number; limit: number };
+  };
+
+  it('accumulates the user and assistant turns of the session', async () => {
+    const { session, call } = await makeSession();
+    await session.sendMessage({ prompt: 'first question' });
+    call.emit({ type: 'assistant', message: { model: 'claude-haiku-4-5', content: [{ type: 'text', text: 'first answer' }] } });
+    await flush();
+    await session.sendMessage({ prompt: 'second question' });
+    call.emit({ type: 'assistant', message: { model: 'claude-haiku-4-5', content: [{ type: 'text', text: 'second answer' }] } });
+    await flush();
+
+    const messages = (await session.getMessages!()) as Entry[];
+    expect(messages).toHaveLength(4);
+    expect(messages.map((m) => [m.role, m.content])).toEqual([
+      ['user', 'first question'],
+      ['assistant', 'first answer'],
+      ['user', 'second question'],
+      ['assistant', 'second answer'],
+    ]);
+    expect(messages[1].model).toBe('claude-haiku-4-5');
+    for (const m of messages) {
+      expect(m.sessionId).toBe(session.sessionId);
+      expect(Number.isNaN(Date.parse(m.timestamp))).toBe(false);
+    }
+  });
+
+  it('records tool-only assistant turns with their tool names', async () => {
+    const { session, call } = await makeSession();
+    call.emit({
+      type: 'assistant',
+      message: { model: 'claude-haiku-4-5', content: [{ type: 'tool_use', name: 'squad_route', input: {} }] },
+    });
+    await flush();
+    const messages = (await session.getMessages!()) as Entry[];
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({ role: 'assistant', content: '', toolUses: ['squad_route'] });
+  });
+
+  it('records the attachments carried by a user turn', async () => {
+    const { session } = await makeSession();
+    await session.sendMessage({
+      prompt: 'review this',
+      attachments: [{ type: 'file', path: 'C:/repo/src/index.ts' }],
+    });
+    const messages = (await session.getMessages!()) as Entry[];
+    expect(messages[0].attachments).toEqual([{ type: 'file', path: 'C:/repo/src/index.ts' }]);
+    expect(messages[0].content).toContain('C:/repo/src/index.ts');
+  });
+
+  it('bounds the transcript and makes truncation observable, not silent', async () => {
+    const { session, call } = await makeSession();
+    const overflow = 3;
+    for (let i = 0; i < CLAUDE_TRANSCRIPT_MAX_ENTRIES + overflow; i++) {
+      call.emit({ type: 'assistant', message: { content: [{ type: 'text', text: `turn ${i}` }] } });
+    }
+    await flush();
+
+    expect((session as unknown as ClaudeSessionAdapter).droppedTranscriptEntries).toBe(overflow);
+    const messages = (await session.getMessages!()) as Entry[];
+    // cap + the synthetic truncation notice
+    expect(messages).toHaveLength(CLAUDE_TRANSCRIPT_MAX_ENTRIES + 1);
+    expect(messages[0]).toMatchObject({
+      role: 'system',
+      truncated: { droppedCount: overflow, limit: CLAUDE_TRANSCRIPT_MAX_ENTRIES },
+    });
+    expect(messages[0].content).toMatch(/truncated/i);
+    // Oldest real entries were evicted; newest survive.
+    expect(messages[1].content).toBe(`turn ${overflow}`);
+    expect(messages[messages.length - 1].content).toBe(`turn ${CLAUDE_TRANSCRIPT_MAX_ENTRIES + overflow - 1}`);
+  });
+});
+
+// ── D2: sendMessage() must not silently drop attachments ────────────────────
+
+describe('ClaudeSessionAdapter.sendMessage attachments', () => {
+  async function sendWith(attachments: unknown[], onError?: (e: SquadSessionEvent) => void) {
+    const { facade, calls } = makeFakeSdk();
+    const provider = new ClaudeRuntimeProvider({ sdk: facade });
+    const session = await provider.createSession({});
+    if (onError) session.on('error', onError);
+    await session.sendMessage({ prompt: 'look at these', attachments: attachments as never });
+    await flush();
+    const sent = calls[0].received[0] as { message: { content: Array<{ type: string; text: string }> } };
+    return sent.message.content;
+  }
+
+  it('renders file and directory attachments into the user turn content', async () => {
+    const content = await sendWith([
+      { type: 'file', path: 'C:/repo/src/index.ts', displayName: 'index.ts' },
+      { type: 'directory', path: 'C:/repo/src' },
+    ]);
+    expect(content).toHaveLength(3); // prompt + 2 attachments
+    expect(content[0]).toEqual({ type: 'text', text: 'look at these' });
+    expect(content[1].text).toBe('[attachment:file] C:/repo/src/index.ts (index.ts)');
+    expect(content[2].text).toBe('[attachment:directory] C:/repo/src');
+  });
+
+  it('renders a selection attachment with its 1-based line range and text', async () => {
+    const content = await sendWith([
+      {
+        type: 'selection',
+        filePath: 'C:/repo/src/app.ts',
+        displayName: 'app.ts selection',
+        selection: { start: { line: 9, character: 0 }, end: { line: 11, character: 4 } },
+        text: 'const x = 1;',
+      },
+    ]);
+    expect(content[1].text).toContain('[attachment:selection] C:/repo/src/app.ts#L10-L12 (app.ts selection)');
+    expect(content[1].text).toContain('const x = 1;');
+  });
+
+  it('a selection without range info still delivers the file path', async () => {
+    const content = await sendWith([
+      { type: 'selection', filePath: 'C:/repo/src/app.ts', displayName: 'app.ts' },
+    ]);
+    expect(content[1].text).toBe('[attachment:selection] C:/repo/src/app.ts (app.ts)');
+  });
+
+  it('an unmappable attachment is forwarded as JSON AND raises an error event', async () => {
+    const errors: SquadSessionEvent[] = [];
+    const content = await sendWith(
+      [{ type: 'notebook-cell', uri: 'nb://x' }, { type: 'file', path: '   ' }],
+      (e) => errors.push(e),
+    );
+    expect(content).toHaveLength(3);
+    expect(content[1].text).toContain('[attachment:unmapped]');
+    expect(content[1].text).toContain('notebook-cell');
+    expect(content[2].text).toContain('[attachment:unmapped]');
+    expect(errors).toHaveLength(2);
+    expect(errors[0]['message']).toMatch(/unsupported attachment type "notebook-cell"/);
+    expect(errors[1]['message']).toMatch(/file attachment has no "path"/);
+  });
+});
+
+// ── D3: abort() must cancel the turn, not the session ───────────────────────
+
+describe('ClaudeSessionAdapter.abort', () => {
+  it('uses the SDK query.interrupt() control request', async () => {
+    const { facade, calls } = makeFakeSdk();
+    const provider = new ClaudeRuntimeProvider({ sdk: facade });
+    const session = await provider.createSession({});
+    await session.abort!();
+    expect(calls[0].interrupts).toBe(1);
+  });
+
+  it('leaves the session usable — sendMessage after abort still delivers', async () => {
+    const { facade, calls } = makeFakeSdk();
+    const provider = new ClaudeRuntimeProvider({ sdk: facade });
+    const session = await provider.createSession({});
+    await session.sendMessage({ prompt: 'long running thing' });
+    await flush();
+
+    await session.abort!();
+    await flush();
+
+    // The whole point: the user pressed stop and can keep talking to the agent.
+    await expect(session.sendMessage({ prompt: 'never mind, do this instead' })).resolves.toBeUndefined();
+    await flush();
+    expect(calls[0].received).toHaveLength(2);
+    expect(calls[0].received[1]).toMatchObject({
+      message: { role: 'user', content: [{ type: 'text', text: 'never mind, do this instead' }] },
+    });
+    // The session is still registered, not torn down.
+    expect(await provider.listSessions()).toHaveLength(1);
+  });
+
+  it('closes the interrupted turn with turn_end/idle and no spurious error', async () => {
+    const { facade } = makeFakeSdk();
+    const provider = new ClaudeRuntimeProvider({ sdk: facade });
+    const session = await provider.createSession({});
+    const types: string[] = [];
+    for (const t of ['error', 'turn_end', 'idle'] as const) session.on(t, (e) => types.push(e.type));
+    await session.sendMessage({ prompt: 'go' });
+    await session.abort!();
+    await flush();
+    expect(types).toContain('turn_end');
+    expect(types).toContain('idle');
+    expect(types).not.toContain('error');
+  });
+
+  it('degrades loudly when the SDK build exposes no interrupt()', async () => {
+    const { facade } = makeFakeSdk({ withInterrupt: false });
+    const provider = new ClaudeRuntimeProvider({ sdk: facade });
+    const session = await provider.createSession({});
+    const errors: SquadSessionEvent[] = [];
+    session.on('error', (e) => errors.push(e));
+    await session.abort!();
+    await flush();
+    // Honest about what actually happened: the whole session went down.
+    expect(errors).toHaveLength(1);
+    expect(errors[0]['message']).toMatch(/no query\.interrupt\(\)/);
+    expect(errors[0]['message']).toMatch(/terminated the whole session/);
+    await expect(session.sendMessage({ prompt: 'x' })).rejects.toThrow(/closed/);
+  });
+
+  it('a failing interrupt is reported and rethrown, and does not kill the session', async () => {
+    const { facade, calls } = makeFakeSdk({ interruptFails: true });
+    const provider = new ClaudeRuntimeProvider({ sdk: facade });
+    const session = await provider.createSession({});
+    const errors: SquadSessionEvent[] = [];
+    session.on('error', (e) => errors.push(e));
+    await expect(session.abort!()).rejects.toThrow(/no active turn/);
+    expect(errors[0]['message']).toMatch(/interrupt failed/);
+    await expect(session.sendMessage({ prompt: 'still here' })).resolves.toBeUndefined();
+    await flush();
+    expect(calls[0].received).toHaveLength(1);
+  });
+
+  it('abort() on a closed session is a no-op', async () => {
+    const { facade, calls } = makeFakeSdk();
+    const provider = new ClaudeRuntimeProvider({ sdk: facade });
+    const session = await provider.createSession({});
+    await session.close();
+    await expect(session.abort!()).resolves.toBeUndefined();
+    expect(calls[0].interrupts).toBe(0);
   });
 });
