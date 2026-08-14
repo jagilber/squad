@@ -70,8 +70,9 @@ describe('squad doctor', () => {
 
     const squadDirCheck = checks.find((c: DoctorCheck) => c.name === '.squad/ directory exists');
     expect(squadDirCheck?.status).toBe('fail');
-    // When .squad/ is missing the file checks are skipped — .squad/ + squad.agent.md + Node version + 2 ESM checks + Copilot CLI
-    expect(checks.length).toBe(6);
+    // When .squad/ is missing the file checks are skipped — .squad/ + squad.agent.md
+    // + Node version + 2 ESM checks + Copilot CLI + 3 claude-runtime checks
+    expect(checks.length).toBe(9);
   });
 
   it('detects remote mode from config.json with teamRoot', async () => {
@@ -416,6 +417,156 @@ describe('squad doctor', () => {
     const decisionsCheck = checks.find((c: DoctorCheck) => c.name === 'decisions.md exists');
     expect(decisionsCheck?.status).toBe('pass');
     expect(decisionsCheck?.message).toContain('squad-state');
+  });
+
+  // ── claude runtime section ────────────────────────────────────────
+
+  it('reports the effective runtime as copilot by default and never fails the claude checks', async () => {
+    const prev = process.env.SQUAD_RUNTIME;
+    delete process.env.SQUAD_RUNTIME;
+    try {
+      await scaffold(TEST_ROOT);
+      const checks = await runDoctor(TEST_ROOT);
+
+      const runtime = checks.find((c: DoctorCheck) => c.name === 'squad runtime selected');
+      expect(runtime?.status).toBe('pass');
+      expect(runtime?.message).toContain('copilot');
+      expect(runtime?.message).toContain('SQUAD_RUNTIME not set');
+
+      // Graceful degradation: on a copilot-only machine neither the CLI nor
+      // the credential check may succeed — but neither may fail doctor.
+      const cli = checks.find((c: DoctorCheck) => c.name === 'Claude CLI available');
+      const auth = checks.find((c: DoctorCheck) => c.name === 'Claude runtime auth');
+      expect(cli).toBeDefined();
+      expect(auth).toBeDefined();
+      expect(cli?.status).not.toBe('fail');
+      expect(auth?.status).not.toBe('fail');
+    } finally {
+      if (prev === undefined) delete process.env.SQUAD_RUNTIME;
+      else process.env.SQUAD_RUNTIME = prev;
+    }
+  });
+
+  it('explains that the runtime came from SQUAD_RUNTIME when the env var is set', async () => {
+    const prev = process.env.SQUAD_RUNTIME;
+    process.env.SQUAD_RUNTIME = 'claude';
+    try {
+      await scaffold(TEST_ROOT);
+      const checks = await runDoctor(TEST_ROOT);
+      const runtime = checks.find((c: DoctorCheck) => c.name === 'squad runtime selected');
+      expect(runtime?.status).toBe('pass');
+      expect(runtime?.message).toContain('claude');
+      expect(runtime?.message).toContain('from SQUAD_RUNTIME=claude');
+    } finally {
+      if (prev === undefined) delete process.env.SQUAD_RUNTIME;
+      else process.env.SQUAD_RUNTIME = prev;
+    }
+  });
+
+  it('reports an unknown SQUAD_RUNTIME as a check failure instead of throwing', async () => {
+    const prev = process.env.SQUAD_RUNTIME;
+    process.env.SQUAD_RUNTIME = 'gemini';
+    try {
+      await scaffold(TEST_ROOT);
+      // The whole point: runDoctor must resolve, not reject.
+      const checks = await runDoctor(TEST_ROOT);
+      const runtime = checks.find((c: DoctorCheck) => c.name === 'squad runtime selected');
+      expect(runtime?.status).toBe('fail');
+      expect(runtime?.message).toContain('Unknown squad runtime');
+      expect(runtime?.message).toContain('SQUAD_RUNTIME');
+    } finally {
+      if (prev === undefined) delete process.env.SQUAD_RUNTIME;
+      else process.env.SQUAD_RUNTIME = prev;
+    }
+  });
+
+  // ── runtime precedence: doctor must agree with the client factory ──
+  //
+  // Regression guard for the measured bug: doctor called bare
+  // resolveRuntimeId(), which only sees env → default, so a repo whose
+  // .squad/config.json said "claude" was green-checked as "copilot" while
+  // createSquadClientWithPool() would have constructed Claude.
+
+  /** Write a `runtime` value into the scaffolded `.squad/config.json`. */
+  async function writeRuntimeConfigJson(root: string, runtime: string): Promise<void> {
+    await writeFile(join(root, '.squad', 'config.json'), JSON.stringify({ version: 1, runtime }, null, 2));
+  }
+
+  /** Run body with SQUAD_RUNTIME set (or deleted), always restoring it. */
+  async function withEnvRuntime(value: string | undefined, body: () => Promise<void>): Promise<void> {
+    const prev = process.env.SQUAD_RUNTIME;
+    if (value === undefined) delete process.env.SQUAD_RUNTIME;
+    else process.env.SQUAD_RUNTIME = value;
+    try {
+      await body();
+    } finally {
+      if (prev === undefined) delete process.env.SQUAD_RUNTIME;
+      else process.env.SQUAD_RUNTIME = prev;
+    }
+  }
+
+  it('reads the runtime from .squad/config.json and attributes it to that file', async () => {
+    await withEnvRuntime(undefined, async () => {
+      await scaffold(TEST_ROOT);
+      await writeRuntimeConfigJson(TEST_ROOT, 'claude');
+
+      const checks = await runDoctor(TEST_ROOT);
+      const runtime = checks.find((c: DoctorCheck) => c.name === 'squad runtime selected');
+      expect(runtime?.status).toBe('pass');
+      expect(runtime?.message).toContain('claude');
+      expect(runtime?.message).toContain('config.json');
+      // It must NOT claim the copilot default when the file says otherwise.
+      expect(runtime?.message).not.toContain('SQUAD_RUNTIME not set');
+    });
+  });
+
+  it('agrees with createSquadClientWithPool about the effective runtime', async () => {
+    await withEnvRuntime(undefined, async () => {
+      await scaffold(TEST_ROOT);
+      await writeRuntimeConfigJson(TEST_ROOT, 'claude');
+
+      const { resolveEffectiveRuntime } = await import('@bradygaster/squad-sdk/client');
+      const fromSdk = resolveEffectiveRuntime({ squadDir: join(TEST_ROOT, '.squad') });
+      expect(fromSdk).toMatchObject({ id: 'claude', source: 'config' });
+
+      const checks = await runDoctor(TEST_ROOT);
+      const runtime = checks.find((c: DoctorCheck) => c.name === 'squad runtime selected');
+      expect(runtime?.message).toContain(fromSdk.id);
+    });
+  });
+
+  it('lets SQUAD_RUNTIME override a config.json runtime, matching the factory', async () => {
+    await withEnvRuntime('copilot', async () => {
+      await scaffold(TEST_ROOT);
+      await writeRuntimeConfigJson(TEST_ROOT, 'claude');
+
+      const checks = await runDoctor(TEST_ROOT);
+      const runtime = checks.find((c: DoctorCheck) => c.name === 'squad runtime selected');
+      expect(runtime?.status).toBe('pass');
+      expect(runtime?.message).toContain('copilot');
+      expect(runtime?.message).toContain('from SQUAD_RUNTIME=copilot');
+    });
+  });
+
+  it('reports an unknown runtime in config.json as a check failure, not a throw', async () => {
+    await withEnvRuntime(undefined, async () => {
+      await scaffold(TEST_ROOT);
+      await writeRuntimeConfigJson(TEST_ROOT, 'gemini');
+
+      // runDoctor must resolve (doctor always exits 0), not reject.
+      const checks = await runDoctor(TEST_ROOT);
+      const runtime = checks.find((c: DoctorCheck) => c.name === 'squad runtime selected');
+      expect(runtime?.status).toBe('fail');
+      expect(runtime?.message).toContain('Unknown squad runtime "gemini"');
+      // The remedy must name the file the user has to edit.
+      expect(runtime?.message).toContain('config.json');
+
+      // And the section stays non-fatal for Copilot-only users.
+      const cli = checks.find((c: DoctorCheck) => c.name === 'Claude CLI available');
+      const auth = checks.find((c: DoctorCheck) => c.name === 'Claude runtime auth');
+      expect(cli?.status).not.toBe('fail');
+      expect(auth?.status).not.toBe('fail');
+    });
   });
 
   it('checkGitSyncHooks returns FAIL when hook file lacks squad marker', async () => {

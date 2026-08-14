@@ -13,6 +13,7 @@
 import path from 'node:path';
 import { execFile, execFileSync } from 'node:child_process';
 import { FSStorageProvider, resolveStateBackend, type StateBackendType } from '@bradygaster/squad-sdk';
+import type { SquadRuntimeId } from '@bradygaster/squad-sdk/client';
 import { resolveStateDir } from '../core/effective-squad-dir.js';
 
 const storage = new FSStorageProvider();
@@ -514,6 +515,168 @@ function checkCopilotCli(): Promise<DoctorCheck> {
   });
 }
 
+// ── claude runtime checks ───────────────────────────────────────────
+
+/**
+ * Environment variable that selects the runtime. Duplicated as a literal
+ * (rather than imported) so this section still names the right variable when
+ * the SDK subpath cannot be loaded at all — see {@link checkRuntimeSelection}.
+ */
+const RUNTIME_ENV = 'SQUAD_RUNTIME';
+
+/** Runtime resolution outcome, shared by the three claude-runtime checks. */
+interface RuntimeSelection {
+  /** Effective runtime id, or undefined when resolution failed. */
+  runtime?: SquadRuntimeId;
+  check: DoctorCheck;
+}
+
+function errText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Report which runtime Squad would use right now, and WHY — the question a
+ * user staring at an unexpected runtime is actually asking.
+ *
+ * Delegates to the SDK's `resolveEffectiveRuntime()`, which owns the whole
+ * 4-layer precedence (explicit → `SQUAD_RUNTIME` → `.squad/config.json` →
+ * copilot) AND reports which layer won. Doctor must never re-derive that
+ * ordering: this check previously called bare `resolveRuntimeId()`, which
+ * only sees env → default, so on a repo with `{"runtime":"claude"}` in
+ * `.squad/config.json` it green-checked "copilot" while the client factory
+ * would have built Claude.
+ *
+ * Degrades: the SDK subpath is imported dynamically and the export is
+ * feature-detected, so a squad-cli running against an older SDK (no provider
+ * seam, or a seam predating this helper) reports info instead of throwing.
+ */
+async function checkRuntimeSelection(squadDir: string): Promise<RuntimeSelection> {
+  const name = 'squad runtime selected';
+  type EffectiveRuntime = { id: SquadRuntimeId; source: 'explicit' | 'env' | 'config' | 'default'; value: string };
+  let resolveEffectiveRuntime: (options?: { squadDir?: string }) => EffectiveRuntime;
+  try {
+    const mod = await import('@bradygaster/squad-sdk/client');
+    resolveEffectiveRuntime = (mod as { resolveEffectiveRuntime?: typeof resolveEffectiveRuntime }).resolveEffectiveRuntime!;
+    if (typeof resolveEffectiveRuntime !== 'function') {
+      throw new Error('resolveEffectiveRuntime is not exported by @bradygaster/squad-sdk/client');
+    }
+  } catch (err) {
+    return {
+      check: {
+        name,
+        status: 'warn',
+        severity: 'info',
+        message: `runtime provider seam not available in the installed SDK — copilot is the only runtime (${errText(err)})`,
+      },
+    };
+  }
+
+  try {
+    const { id, source, value } = resolveEffectiveRuntime({ squadDir });
+    const why =
+      source === 'env'
+        ? `from ${RUNTIME_ENV}=${value}`
+        : source === 'config'
+          ? `from ${path.join(squadDir, 'config.json')} runtime key`
+          : source === 'explicit'
+            ? 'explicitly requested'
+            : `default — ${RUNTIME_ENV} not set and no runtime key in .squad/config.json`;
+    return { runtime: id, check: { name, status: 'pass', message: `${id} (${why})` } };
+  } catch (err) {
+    // resolveEffectiveRuntime throws on an unknown value at any layer rather
+    // than silently falling back. Surface it as a check failure, never a crash.
+    return {
+      check: {
+        name,
+        status: 'fail',
+        message:
+          `${errText(err)} Unset ${RUNTIME_ENV} or fix the "runtime" key in ` +
+          `${path.join(squadDir, 'config.json')} to fall back to the copilot default.`,
+      },
+    };
+  }
+}
+
+/**
+ * Check that the Claude Code CLI is reachable (needed by the claude runtime).
+ * Tests `claude --version` with shell:true for Windows compatibility, exactly
+ * like the Copilot CLI check.
+ *
+ * Absent CLI is never a failure: it is a warning when the claude runtime is
+ * selected and pure info otherwise, so Copilot-only users are not nagged.
+ */
+function checkClaudeCli(selected: SquadRuntimeId | undefined): Promise<DoctorCheck> {
+  const name = 'Claude CLI available';
+  return new Promise((resolve) => {
+    execFile('claude', ['--version'], { shell: true, timeout: 5000 }, (err, stdout) => {
+      if (!err) {
+        const version = String(stdout ?? '').trim().split(/\r?\n/)[0] ?? '';
+        resolve({
+          name,
+          status: 'pass',
+          message: version ? `claude CLI reachable (${version})` : 'claude CLI reachable',
+        });
+        return;
+      }
+      if (selected === 'claude') {
+        resolve({
+          name,
+          status: 'warn',
+          message:
+            "'claude --version' failed — the claude runtime is selected but the Claude Code CLI is not on PATH. " +
+            'Install it (npm i -g @anthropic-ai/claude-code) or select the copilot runtime.',
+        });
+        return;
+      }
+      resolve({
+        name,
+        status: 'warn',
+        severity: 'info',
+        message: `not on PATH — only needed for the claude runtime (${RUNTIME_ENV}=claude, or "runtime": "claude" in .squad/config.json); the copilot runtime is unaffected`,
+      });
+    });
+  });
+}
+
+/**
+ * Report the Claude runtime's credential status via the provider's own
+ * `getAuthStatus()`, so doctor and the runtime agree on what "logged in" means.
+ *
+ * Constructing the provider does NOT load the optional
+ * `@anthropic-ai/claude-agent-sdk` peer dependency (that happens in
+ * `connect()`), and the whole call is guarded: a missing seam, a missing
+ * optional dep, or any provider error degrades to an info line.
+ */
+async function checkClaudeAuth(selected: SquadRuntimeId | undefined): Promise<DoctorCheck> {
+  const name = 'Claude runtime auth';
+  try {
+    const { createRuntimeProvider } = await import('@bradygaster/squad-sdk/client');
+    const provider = await createRuntimeProvider({ runtime: 'claude' });
+    const auth = await provider.getAuthStatus();
+    const detail =
+      auth.statusMessage ?? (auth.isAuthenticated ? 'credentials detected' : 'no credentials detected');
+    if (auth.isAuthenticated) {
+      return { name, status: 'pass', message: detail };
+    }
+    return selected === 'claude'
+      ? { name, status: 'warn', message: detail }
+      : {
+          name,
+          status: 'warn',
+          severity: 'info',
+          message: `${detail} (not required — the copilot runtime is selected)`,
+        };
+  } catch (err) {
+    return {
+      name,
+      status: 'warn',
+      severity: 'info',
+      message: `claude runtime provider unavailable — ${errText(err)}`,
+    };
+  }
+}
+
 // ── git sync hooks check ─────────────────────────────────────────────
 
 const SQUAD_SYNC_HOOK_MARKER = '# --- squad-sync-hook ---';
@@ -648,6 +811,18 @@ export async function runDoctor(cwd?: string): Promise<DoctorCheck[]> {
 
   // 13. Copilot CLI availability (needed by watch capabilities)
   checks.push(await checkCopilotCli());
+
+  // 14. Claude runtime — which runtime is effective, plus the CLI/credentials
+  //     the claude runtime would need. All three degrade to info rather than
+  //     failing doctor for users who only ever run the copilot runtime.
+  const selection = await checkRuntimeSelection(squadDir);
+  checks.push(selection.check);
+  const [claudeCli, claudeAuth] = await Promise.all([
+    checkClaudeCli(selection.runtime),
+    checkClaudeAuth(selection.runtime),
+  ]);
+  checks.push(claudeCli);
+  checks.push(claudeAuth);
 
   return checks;
 }
