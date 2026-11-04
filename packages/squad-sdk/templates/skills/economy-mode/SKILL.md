@@ -29,24 +29,25 @@ Use this skill when the user wants to reduce costs across an entire session or p
 | Method | How |
 |--------|-----|
 | Session phrase | "use economy mode", "save costs", "go cheap", "reduce costs" |
-| Persistent config | `"economyMode": true` in `.squad/config.json` |
+| Persistent config | `"economyMode": true` or `"modelProfile": "economy"` in `.squad/config.json` |
 | CLI flag | `squad --economy` |
 
 **Deactivation:** "turn off economy mode", "disable economy mode", or remove `economyMode` from `config.json`.
 
 ## Economy Model Selection Table
 
-When economy mode is **active**, Layer 3 auto-selection uses this table instead of the normal defaults:
+Economy mode is the opt-in `economy` quality profile. The default is `quality-first`. When economy mode is **active**, Layer 3 auto-selection uses this table instead of the normal defaults:
 
-| Task Output | Normal Mode | Economy Mode |
+| Task Output | Normal Mode (`quality-first`) | Economy Mode |
 |-------------|-------------|--------------|
-| Writing code (implementation, refactoring, bug fixes) | `claude-sonnet-4.5` | `gpt-5-mini` |
-| Writing prompts or agent designs | `claude-sonnet-4.5` | `gpt-5-mini` |
-| Docs, planning, triage, changelogs, mechanical ops | `claude-haiku-4.5` | `gpt-5-mini` |
-| Architecture, code review, security audits | `claude-opus-4.6` | `claude-sonnet-4.5` |
-| Scribe / logger / mechanical file ops | `claude-haiku-4.5` | `gpt-5-mini` |
+| Writing code (implementation, refactoring, bug fixes) | `claude-sonnet-5.5` | `gpt-5.6-luna` |
+| Writing prompts or agent designs | `claude-sonnet-5.5` | `gpt-5.6-luna` |
+| Docs, planning, triage, research | `claude-sonnet-5.5` (research: `claude-opus-5.5`) | `gpt-5.6-luna` |
+| Visual/design work requiring image analysis | `claude-opus-5.5` | `claude-sonnet-5.5` |
+| Architecture, code review, verification, security audits | `claude-opus-5.5` | `claude-sonnet-5.5` |
+| Scribe / logger / git / release / mechanical file ops | `claude-haiku-5.5` | `gpt-5.6-luna` |
 
-**Prefer `gpt-5-mini`** for all economy-mode tasks where cost is the priority.
+**Prefer `gpt-5.6-luna`** for all economy-mode tasks where cost is the priority. Cost ceilings (`maxCategory`) still apply. If the live model list does not include a mapped model, selection moves forward through its tier's fallback chain.
 
 ## AGENT WORKFLOW
 
@@ -103,12 +104,12 @@ After updating economy mode state and including the `💰` indicator in spawn ac
 }
 ```
 
-- `economyMode` — when `true`, Layer 3 uses the economy table. Optional; absent = economy mode off.
+- `economyMode` — when `true`, Layer 3 uses the economy table. Optional; absent = economy mode off. An explicit `economyMode: false` option cancels a persisted `modelProfile: "economy"`.
 - Combines with `defaultModel` and `agentModelOverrides` — Layer 0 always wins.
 
 ## Anti-Patterns
 
-- **Don't override Layer 0 in economy mode.** If the user set `defaultModel: "claude-opus-4.6"`, they want quality. Economy mode only affects Layer 3 auto-selection.
+- **Don't override Layer 0 in economy mode.** If the user set `defaultModel: "claude-opus-5.5"`, they want quality. Economy mode only affects Layer 3 auto-selection.
 - **Don't silently apply economy mode.** Always acknowledge when activated or deactivated.
 - **Don't treat economy mode as permanent by default.** Session phrases activate session-only; only "always" or `config.json` persist it.
-- **Don't bump premium tasks down too far.** Architecture and security reviews shift from opus to sonnet in economy mode — they do NOT go to fast/cheap models.
+- **Don't bump premium tasks down too far.** Visual, architecture, and security work shifts from premium to standard in economy mode — it does NOT go to fast/cheap models.

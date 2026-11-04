@@ -59,15 +59,22 @@ Not sure which to use? See [Choose your interface](get-started/choose-your-inter
 npm install -g @bradygaster/squad-cli
 ```
 
+Prefer a package manager or cannot reach npm? Install with Homebrew, WinGet, the
+verified macOS/Linux install script, or a direct release archive. See the
+[installation guide](get-started/installation.md) for every supported method.
+
 **Requirements:**
-- Node.js 20+ (LTS)
-- GitHub Copilot (CLI, VS Code, Visual Studio, or Coding Agent)
+- Git
+- GitHub Copilot CLI (installed separately)
 - A git repository (Squad stores team state in `.squad/`)
 - **`gh` CLI** — required for GitHub Issues, PRs, Ralph, and Project Boards ([install](https://cli.github.com/))
 
+Node.js 22.5+ is required only for npm and SDK installs. Standalone CLI
+methods vendor Node.js.
+
 Running `squad init` creates the `.squad/` directory structure, copies `squad.agent.md` into `.github/agents/`, and installs GitHub Actions workflows into `.github/workflows/`. Your team is created at runtime when you first talk to Squad.
 
-**Note:** When you select Squad from the agent picker, you'll see the version number in the name (e.g., "Squad (v0.8.25)"). This helps you confirm which version is installed.
+**Note:** When you select Squad from the agent picker, you'll see the version number in the name (e.g., "Squad (v1.1.0)"). This helps you confirm which version is installed.
 
 ### GitHub CLI authentication
 
@@ -228,7 +235,7 @@ export default defineSquad({
     defineAgent({
       name: 'edie',
       role: 'TypeScript Engineer',
-      model: 'claude-sonnet-4',
+      model: 'claude-sonnet-5',
       capabilities: [{ name: 'type-system', level: 'expert' }],
     }),
   ],
@@ -445,11 +452,10 @@ Configure cross-project ADO support in `.squad/config.json` — work items can l
 
 ## Upgrading
 
-Already have Squad installed? Update to the latest version:
-
-```bash
-npm install -g @bradygaster/squad-cli@latest
-```
+Already have Squad installed? Use the update command for the method you chose,
+then run `squad upgrade` to refresh Squad-owned project files. See
+[Update Squad](get-started/installation.md#update-squad) for the npm, Homebrew,
+WinGet, install-script, and direct-download commands.
 
 Run `squad doctor` to validate your setup after upgrading:
 
@@ -487,10 +493,10 @@ The coordinator uses 6.6% of its window. A 12-week veteran agent uses 4.5% — b
 
 ## Known limitations
 
-- **Experimental** — file formats and APIs may change between versions.
 - **Silent success bug** — approximately 7–10% of background agent spawns complete all their file writes but return no text response. This is a platform-level issue. Squad detects it by checking the filesystem for work product and reports what it finds. Work is not lost.
 - **Platform latency** — response times depend on the Copilot platform. Complex multi-agent tasks take 40–60 seconds. Simple questions are answered in 2–3 seconds.
-- **Node 20+** — requires a Node.js LTS release (v20.0.0 or later).
+- **Node.js for npm installs only** — the npm package requires Node.js 22.5 or
+  later; standalone bundles vendor Node.js.
 - **GitHub Copilot required** — Squad works across Copilot hosts (CLI, VS Code, Visual Studio, Coding Agent).
 - **First session is the least capable** — agents improve as they accumulate history. Give it a few sessions before judging.
 

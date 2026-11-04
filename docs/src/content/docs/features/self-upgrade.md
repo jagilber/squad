@@ -1,8 +1,5 @@
 # Self Upgrade
 
-> ⚠️ **Experimental** — Squad is alpha software. APIs, commands, and behavior may change between releases.
-
-
 **Try this to upgrade Squad CLI:**
 ```bash
 squad upgrade --self
@@ -51,10 +48,10 @@ squad upgrade --self
    Detected package manager: npm
    Running: npm install -g @bradygaster/squad@latest
 
-✅ Squad CLI upgraded to v0.8.0
+✅ Squad CLI upgraded to v1.1.0
    Running: squad upgrade (to refresh repo templates)
 
-✅ Repo templates upgraded to v0.8.0
+✅ Repo templates upgraded to v1.1.0
 ```
 
 ---
@@ -66,7 +63,7 @@ squad upgrade --self --insider
 ```
 
 **What's different:**
-- Installs latest **prerelease** version (e.g., `v0.9.0-insider.3`)
+- Installs latest **prerelease** version (e.g., `v1.1.0-insider.3`)
 - May include experimental features
 - Used for testing bleeding-edge changes
 
@@ -76,10 +73,10 @@ squad upgrade --self --insider
    Detected package manager: pnpm
    Running: pnpm add -g @bradygaster/squad@insider
 
-✅ Squad CLI upgraded to v0.9.0-insider.3
+✅ Squad CLI upgraded to v1.1.0-insider.3
    Running: squad upgrade (to refresh repo templates)
 
-✅ Repo templates upgraded to v0.9.0-insider.3
+✅ Repo templates upgraded to v1.1.0-insider.3
 ```
 
 ---
@@ -120,6 +117,32 @@ squad upgrade --self --skip-repo-upgrade
 ```
 
 *(This flag may not exist yet — just showing the pattern. For now, self-upgrade always runs repo upgrade.)*
+
+### Your Customizations Are Backed Up
+
+`squad upgrade` overwrites Squad-owned files with the latest templates. Before it overwrites a file you've edited locally, it saves your version alongside it as `<file>.local-backup` and prints a warning.
+
+This covers `.github/agents/squad.agent.md` and the Squad-managed workflow files in `.github/workflows/`.
+
+```text
+⚠  squad.agent.md has local customizations — backed up to squad.agent.md.local-backup
+   To restore: copy squad.agent.md.local-backup → squad.agent.md
+⚠  squad-ci.yml has local customizations — backed up to squad-ci.yml.local-backup
+```
+
+To restore your version, copy the backup back over the refreshed file:
+
+```bash
+cp .github/agents/squad.agent.md.local-backup .github/agents/squad.agent.md
+```
+
+Three things worth knowing:
+
+- **Version stamps don't count as customizations.** The `<!-- squad-cli vX.Y.Z -->` line in `squad.agent.md` changes on every release, so it's stripped before comparing. A file that differs only by its version stamp is refreshed silently, with no backup.
+- **Only the most recent backup is kept.** Backups are written to a fixed path, so re-customizing a file and upgrading again overwrites the previous `.local-backup`. Move anything you want to keep somewhere safe before your next upgrade.
+- **Backups aren't gitignored.** They show up as untracked files in `git status`. Delete them once you've merged back what you need.
+
+`squad upgrade --dry-run` previews the upgrade and will tell you if `squad.agent.md` would be backed up. It stops short of the workflow files, so it won't flag customized workflows — check those yourself before upgrading if you've edited them.
 
 ---
 
@@ -164,7 +187,7 @@ squad --version
 
 **Output:**
 ```
-@bradygaster/squad v0.8.0
+@bradygaster/squad v1.1.0
 ```
 
 Check if a newer version is available:
@@ -176,7 +199,7 @@ npm outdated -g @bradygaster/squad
 **Output:**
 ```
 Package             Current  Wanted  Latest  Location
-@bradygaster/squad  0.7.5    0.8.0   0.8.0   global
+@bradygaster/squad  1.0.1    1.1.0   1.1.0   global
 ```
 
 ---
@@ -191,9 +214,9 @@ Reads the same cache the background startup check maintains and prints it as str
 
 ```json
 {
-  "current": "0.9.6-insider.2",
+  "current": "1.1.0-insider.2",
   "channel": "insider",
-  "latest": "0.9.7-insider.1",
+  "latest": "1.1.0-insider.3",
   "updateAvailable": true,
   "cacheAge": "PT2H15M",
   "checkedAt": "2026-05-26T12:00:00.000Z"
@@ -211,8 +234,8 @@ This gives editor extensions, coordinator instructions, and CI scripts a stable 
 **Default (non-JSON) output:**
 
 ```
-Current: 0.9.6-insider.2 (insider channel)
-Latest:  0.9.7-insider.1
+Current: 1.1.0-insider.2 (insider channel)
+Latest:  1.1.0-insider.3
 Update available. Run `squad upgrade --self` to install.
 ```
 
@@ -224,8 +247,8 @@ Honors `SQUAD_NO_UPDATE_CHECK=1` — exits `0` with no output (or `{}` with `--j
 
 | Channel | Tag | Description |
 |---------|-----|-------------|
-| **Stable** | `@latest` | Production-ready releases (e.g., `v0.8.0`) |
-| **Insider** | `@insider` | Prerelease builds for testing (e.g., `v0.9.0-insider.3`) |
+| **Stable** | `@latest` | Production-ready releases (e.g., `v1.1.0`) |
+| **Insider** | `@insider` | Prerelease builds for testing (e.g., `v1.1.0-insider.3`) |
 
 **When to use insider:**
 - You want to test upcoming features

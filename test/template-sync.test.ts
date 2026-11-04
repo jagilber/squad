@@ -6,33 +6,22 @@
  * Special target:   .github/agents/ (squad.agent.md only)
  *
  * Coverage strategy:
- *   1. Dynamic enumeration — every file in .squad-templates/ must be byte-for-byte
- *      identical across all mirror targets (and .github/agents/ for squad.agent.md).
- *   2. Script execution — `node scripts/sync-templates.mjs` must exit 0.
+ *   1. Dynamic enumeration — every file in .squad-templates/ must be content-equivalent
+ *      across all mirror targets (and .github/agents/ for squad.agent.md).
+ *   2. Script validation — the maintenance command parses without mutating files.
  *   3. Negative guard — .github/agents/ must not contain stray synced files.
  *   4. Semantic checks — universe counts, casting-policy internal consistency.
  */
 
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execSync } from 'node:child_process';
+import { parseAgentProvenanceRegistry } from '@bradygaster/squad-sdk/casting';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
-
-// Re-sync templates before any byte-comparison checks.
-// Other test files (e.g., acceptance tests) may run `squad init` in the
-// repo root, overwriting .github/agents/squad.agent.md from the CLI
-// template and making it diverge from .squad-templates/squad.agent.md.
-beforeAll(() => {
-  execSync('node scripts/sync-templates.mjs', {
-    cwd: ROOT,
-    encoding: 'utf-8',
-    timeout: 60_000,
-  });
-});
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -40,10 +29,6 @@ beforeAll(() => {
 
 function readFile(relPath: string): string {
   return readFileSync(resolve(ROOT, relPath), 'utf-8');
-}
-
-function readFileBytes(relPath: string): Buffer {
-  return readFileSync(resolve(ROOT, relPath));
 }
 
 function fileExists(relPath: string): boolean {
@@ -113,26 +98,18 @@ const CASTING_POLICY_LOCATIONS = [
   'packages/squad-sdk/templates/casting-policy.json',
 ] as const;
 
+const CASTING_REGISTRY_LOCATIONS = [
+  `${SOURCE_DIR}/casting-registry.json`,
+  'templates/casting-registry.json',
+  'packages/squad-cli/templates/casting-registry.json',
+  'packages/squad-sdk/templates/casting-registry.json',
+] as const;
+
 // ---------------------------------------------------------------------------
-// 1. Dynamic enumeration — byte-for-byte parity for ALL synced files
+// 1. Dynamic enumeration — content parity for ALL synced files
 // ---------------------------------------------------------------------------
 
 describe('dynamic template enumeration (all synced files)', () => {
-  // Re-sync immediately before byte comparisons to guard against a race
-  // condition with test/init-scaffolding.test.ts.  That suite runs runInit()
-  // with a subdirectory of the repo root as cwd; in monorepo mode the init
-  // command places squad.agent.md at the real git root (.github/agents/) via
-  // stampVersion(), which races with the file-level beforeAll sync.  A
-  // describe-scoped beforeAll runs synchronously, right before any test in
-  // this suite, minimising the window to near-zero.
-  beforeAll(() => {
-    execSync('node scripts/sync-templates.mjs', {
-      cwd: ROOT,
-      encoding: 'utf-8',
-      timeout: 60_000,
-    });
-  });
-
   const sourceFiles = collectFiles(SOURCE_DIR);
 
   it('.squad-templates/ contains files to sync', () => {
@@ -148,11 +125,11 @@ describe('dynamic template enumeration (all synced files)', () => {
       const destName = relFile === AGENT_MD_FILE ? `${AGENT_MD_FILE}.template` : relFile;
       const targetPath = `${target}/${destName}`;
 
-      it(`${targetPath} is byte-for-byte identical to ${canonicalPath}`, () => {
+      it(`${targetPath} is content-equivalent to ${canonicalPath}`, () => {
         expect(fileExists(targetPath), `${targetPath} should exist`).toBe(true);
-        const src = readFileBytes(canonicalPath);
-        const dst = readFileBytes(targetPath);
-        expect(Buffer.compare(src, dst), `${targetPath} content mismatch`).toBe(0);
+        const src = readFile(canonicalPath).replace(/\r\n/g, '\n');
+        const dst = readFile(targetPath).replace(/\r\n/g, '\n');
+        expect(dst, `${targetPath} content mismatch`).toBe(src);
       });
     }
 
@@ -160,29 +137,75 @@ describe('dynamic template enumeration (all synced files)', () => {
     if (relFile === AGENT_MD_FILE) {
       const agentPath = `${AGENT_MD_EXTRA_TARGET}/${AGENT_MD_FILE}`;
 
-      it(`${agentPath} is byte-for-byte identical to ${canonicalPath}`, () => {
+      it(`${agentPath} is content-equivalent to ${canonicalPath}`, () => {
         expect(fileExists(agentPath), `${agentPath} should exist`).toBe(true);
-        const src = readFileBytes(canonicalPath);
-        const dst = readFileBytes(agentPath);
-        expect(Buffer.compare(src, dst), `${agentPath} content mismatch`).toBe(0);
+        const src = readFile(canonicalPath).replace(/\r\n/g, '\n');
+        const dst = readFile(agentPath).replace(/\r\n/g, '\n');
+        expect(dst, `${agentPath} content mismatch`).toBe(src);
       });
     }
   }
 });
 
 // ---------------------------------------------------------------------------
-// 2. Script execution — sync-templates.mjs must exit cleanly
+// 2. Script validation — sync-templates.mjs must be explicit and parse cleanly
 // ---------------------------------------------------------------------------
 
-describe('sync-templates.mjs script execution', () => {
-  it('exits with code 0 (no syntax errors, no crashes)', () => {
-    // execSync throws on non-zero exit codes
+describe('built-in audit evidence instructions (#2084)', () => {
+  it.each([
+    ['rai', 'rai-charter.md'],
+    ['fact-checker', 'fact-checker-charter.md'],
+  ])('%s charters require append-only evidence in canonical and shipped copies', (agent, template) => {
+    const locations = [
+      `${SOURCE_DIR}/${template}`,
+      ...MIRROR_TARGETS.map(target => `${target}/${template}`),
+    ];
+    for (const location of locations) {
+      const content = readFile(location);
+      expect(content).toContain(`.squad/${agent}/audit-trail.md`);
+      expect(content).toContain('squad_state_append');
+      expect(content).toMatch(/Never overwrite or delete prior\s+entries/);
+      expect(content).not.toMatch(/does not create audit logs|do not create histories, audit trails/i);
+    }
+
+    const installedCharter = `.squad/agents/${agent}/charter.md`;
+    const installedPolicy = `.squad/${agent}/policy.md`;
+    if (fileExists(installedCharter) || fileExists(installedPolicy)) {
+      expect(fileExists(installedCharter), `${installedCharter} should exist`).toBe(true);
+      expect(fileExists(installedPolicy), `${installedPolicy} should exist`).toBe(true);
+
+      const charter = readFile(installedCharter);
+      expect(charter).toContain(`.squad/${agent}/audit-trail.md`);
+      expect(charter).toContain('squad_state_append');
+      expect(charter).toMatch(/Never overwrite or delete prior\s+entries/);
+      expect(charter).not.toMatch(/does not create audit logs|do not create histories, audit trails/i);
+
+      const policy = readFile(installedPolicy);
+      expect(policy).toContain(`.squad/${agent}/audit-trail.md`);
+      expect(policy).toContain('squad_state_append');
+      expect(policy).toContain('Never overwrite');
+      expect(policy).not.toMatch(/do not create audit trails|do not create histories, audit trails/i);
+    }
+  });
+});
+
+describe('sync-templates.mjs maintenance command', () => {
+  it('parses without mutating repository files', () => {
+    execSync('node --check scripts/sync-templates.mjs', {
+      cwd: ROOT,
+      encoding: 'utf-8',
+      timeout: 60_000,
+    });
+  });
+
+  it('requires explicit opt-in before synchronization', () => {
     const output = execSync('node scripts/sync-templates.mjs', {
       cwd: ROOT,
       encoding: 'utf-8',
       timeout: 60_000,
     });
-    expect(output).toContain('Synced');
+    expect(output).toContain('requires explicit invocation');
+    expect(output).not.toContain('Synced');
   });
 });
 
@@ -275,6 +298,24 @@ describe('casting-policy.json content parity', () => {
   });
 });
 
+describe('casting-registry.json producer contract', () => {
+  for (const loc of CASTING_REGISTRY_LOCATIONS) {
+    it(`${loc} is a complete parseable squad-agent-provenance/v1 registry`, () => {
+      const parsed = parseAgentProvenanceRegistry(JSON.parse(readFile(loc)));
+      expect(parsed).toMatchObject({
+        completeness: 'complete',
+        diagnostics: [],
+        registry: {
+          schema: 'squad-agent-provenance/v1',
+          schema_version: 1,
+          revision: 1,
+          agents: {},
+        },
+      });
+    });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // 5. Squad-spawning routing guard (regression for the "spawn a squad" hole)
 // ---------------------------------------------------------------------------
@@ -355,7 +396,7 @@ describe('squad.agent.md squad-spawning guidance', () => {
 // ---------------------------------------------------------------------------
 
 const CROSS_SQUAD_SKILL_LOCATIONS = [
-  '.squad/skills/cross-squad/SKILL.md',
+  '.squad-templates/skills/cross-squad/SKILL.md',
   'packages/squad-cli/templates/skills/cross-squad/SKILL.md',
   'packages/squad-sdk/templates/skills/cross-squad/SKILL.md',
 ] as const;

@@ -1,8 +1,5 @@
 # CLI Reference
 
-> ⚠️ **Experimental** — Squad is alpha software. APIs, commands, and behavior may change between releases.
-
-
 Everything you need to run Squad from the command line — commands, shell interactions, configuration files, and environment variables.
 
 ---
@@ -10,15 +7,19 @@ Everything you need to run Squad from the command line — commands, shell inter
 ## Installation
 
 ```bash
-# Global install (recommended)
+# npm (requires Node.js 22.5+)
 npm install -g @bradygaster/squad-cli
 
-# One-off with npx
-npx @bradygaster/squad-cli init
+# macOS
+brew install --cask bradygaster/squad/squad
 
-# Latest from GitHub (bleeding edge)
-squad init
+# Windows
+winget install --id bradygaster.Squad --exact
 ```
+
+The verified install script and direct archives provide npm-free options for
+macOS and Linux too. See [Installation](../get-started/installation.md) for
+prerequisites, all supported methods, and update commands.
 
 ---
 
@@ -39,7 +40,7 @@ squad init
 | `squad start [--tunnel] [--port N] [--command cmd]` | Start Copilot with remote phone access via PTY and WebSocket | No |
 | `squad status` | Show which squad is active and why | Yes |
 | `squad doctor` | Validate squad setup integrity and diagnose issues (alias: `heartbeat`) | Yes |
-| `squad upgrade` | Upgrade Squad-owned files to latest version | Yes |
+| `squad upgrade` | Upgrade Squad-owned files to latest version; locally customized files are saved as `<file>.local-backup` | Yes |
 | `squad upgrade --state-backend <type>` | Migrate state backend (`orphan`, `two-layer`); installs git hooks automatically | Yes |
 | `squad upgrade --migrate-directory` | Rename legacy `.ai-team/` directory to `.squad/` | Yes |
 | `squad triage` | Auto-triage issues and assign to team (primary name; `watch` is an alias) | Yes |
@@ -95,7 +96,7 @@ Start Copilot with optional remote access via phone. Spawns Copilot in a PTY and
 - `--tunnel` — Create a devtunnel for remote access (shows QR code for phone scanning). Requires `devtunnel` CLI installed and authenticated (`devtunnel user login`).
 - `--port <N>` — Specific WebSocket port (default: random). Example: `--port 3456`
 - `--command <cmd>` — Run a custom command instead of copilot. Example: `--command powershell`
-- All copilot flags pass through. Example: `squad start --tunnel --yolo` or `squad start --tunnel --model gpt-4`
+- All copilot flags pass through. Example: `squad start --tunnel --yolo` or `squad start --tunnel --model gpt-5.6-luna`
 
 **Examples:**
 
@@ -115,7 +116,7 @@ squad start --tunnel --command powershell
 
 # Copilot flags pass through
 squad start --tunnel --yolo
-squad start --tunnel --model gpt-4 --no-config
+squad start --tunnel --model gpt-5.6-luna --no-config
 ```
 
 For details on architecture, security, mobile keyboard, and troubleshooting, see [Remote Control Guide](../features/squad-rc.md).
@@ -141,7 +142,7 @@ squad loop --file scripts/monitor.md     # Run a custom loop file
 - `--interval <N>` — Override loop interval in minutes (default: from frontmatter)
 - `--timeout <N>` — Override cycle timeout in minutes (default: from frontmatter)
 - `--copilot-flags "..."` — Pass extra flags to Copilot CLI
-- `--agent-cmd <cmd>` — Custom agent command (advanced)
+- `--agent-cmd <cmd>` — Custom agent command; use one standalone `{prompt}` token to place the prompt (advanced)
 - `--monitor-email` — Scan email for alerts each cycle (requires WorkIQ MCP)
 - `--monitor-teams` — Scan Teams for action items each cycle (requires WorkIQ MCP)
 - `--self-pull` — Run `git fetch && git pull` before each cycle
@@ -176,7 +177,7 @@ squad loop --monitor-email --monitor-teams
 squad loop --file scripts/ci-monitor.md
 
 # Run with custom Copilot model
-squad loop --copilot-flags "--model gpt-4"
+squad loop --copilot-flags "--model gpt-5.6-luna"
 ```
 
 **Example loop.md:**
@@ -353,6 +354,7 @@ First match wins.
 |----------|---------|--------|
 | `SQUAD_CLIENT` | Detected client platform | `cli`, `vscode` |
 | `COPILOT_TOKEN` | Copilot auth token (SDK usage) | Token string |
+| `SQUAD_CONTEXT_WARNING_THRESHOLD` | Interactive-shell context utilization warning threshold | Fraction greater than `0` and at most `1` (default: `0.8`) |
 
 ---
 

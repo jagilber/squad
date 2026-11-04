@@ -4,16 +4,17 @@
 
 **为任何项目打造的 AI 智能体团队。** 一行命令，拥有一个随代码同步成长的开发团队。
 
-[![状态](https://img.shields.io/badge/status-alpha-blueviolet)](#status)
 [![平台](https://img.shields.io/badge/platform-GitHub%20Copilot-blue)](#what-is-squad)
 
-> ⚠️ **Alpha 预览版** — Squad 仍处于实验阶段。API 和命令行工具可能在版本更迭中发生变化。我们会在 [CHANGELOG.md](CHANGELOG.md) 中记录重大变更。
+重大变更会记录在 [CHANGELOG.md](CHANGELOG.md) 中。
 
 ---
 
 ## 什么是 Squad?
 
 Squad 通过 GitHub Copilot 为你提供一支 AI 开发团队。只需描述你正在构建的内容，即可获得一支由专家组成的小队 —— 前端、后端、测试、组长 —— 它们以文件形式存在于你的仓库中。它们能够跨会话持久存在，学习你的代码库，共享决策，并且用得越多就越聪明。
+
+Squad 是面向人类的生产力工具，而不是工程师、审阅者或决策者的替代品。人们仍需对优先级、审批和最终变更负责；Squad 帮助实现协调、重复性工作和并行执行。
 
 这不仅仅是一个"戴着不同帽子"的聊天机器人。团队中的每个成员都在独立的上下文中运行，只读取属于自己的知识库，并将学到的内容写回。
 
@@ -32,10 +33,29 @@ git init
 
 ### 2. 安装 Squad
 
+根据你的平台选择一种安装方式：
+
+| 安装方式 | 命令 |
+|----------|------|
+| npm（所有平台，需要 Node.js 22.5+） | `npm install -g @bradygaster/squad-cli` |
+| Homebrew（macOS） | `brew install --cask bradygaster/squad/squad` |
+| WinGet（Windows） | `winget install --id bradygaster.Squad --exact` |
+| 安装脚本（macOS/Linux，无需 npm） | 查看[独立安装指南](https://bradygaster.github.io/squad/docs/features/standalone-install/) |
+
+预览版和 Insider 版也可通过 Homebrew 的 `squad-preview`、
+`squad-insider` cask，或 WinGet 的 `bradygaster.Squad.Preview`、
+`bradygaster.Squad.Insider` 软件包安装。
+
+你也可以从 [GitHub Releases](https://github.com/bradygaster/squad/releases/latest)
+直接下载 macOS、Linux 或 Windows 压缩包。
+
 ```bash
-npm install -g @bradygaster/squad-cli
 squad init
 ```
+
+所有方式安装的都是同一个 CLI。独立安装包自带 Node.js，无需安装
+Node.js，也无需访问 npm registry。完整要求和平台说明请参阅
+[安装指南](https://bradygaster.github.io/squad/docs/get-started/installation/)。
 
 **✓ 验证：** 检查项目中是否创建了 `.squad/team.md`。
 
@@ -76,9 +96,15 @@ Squad 会提议一个团队 — 每个成员的名字都来自一个持久化的
 
 **第一步：更新 CLI 二进制文件**
 
-```bash
-npm install -g @bradygaster/squad-cli@latest
-```
+使用与你安装时相同的渠道：
+
+| 安装方式 | 更新命令 |
+|----------|----------|
+| npm | `npm install -g @bradygaster/squad-cli@latest` |
+| Homebrew | `brew upgrade --cask squad` |
+| WinGet | `winget upgrade --id bradygaster.Squad --exact` |
+| 安装脚本 | 重新运行[安装脚本](https://bradygaster.github.io/squad/docs/features/standalone-install/#macos-and-linux) |
+| 直接下载 | 从 [GitHub Releases](https://github.com/bradygaster/squad/releases/latest) 下载新版本 |
 
 **第二步：更新项目中 Squad 管理的文件**
 
@@ -250,7 +276,7 @@ import { defineSquad, defineTeam, defineAgent } from '@bradygaster/squad-sdk';
 export default defineSquad({
   team: defineTeam({ name: 'Platform Squad', members: ['@edie', '@mcmanus'] }),
   agents: [
-    defineAgent({ name: 'edie', role: 'TypeScript Engineer', model: 'claude-sonnet-4' }),
+    defineAgent({ name: 'edie', role: 'TypeScript Engineer', model: 'claude-sonnet-5' }),
     defineAgent({ name: 'mcmanus', role: 'DevRel', model: 'claude-haiku-4.5' }),
   ],
 });

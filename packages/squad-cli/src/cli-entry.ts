@@ -233,6 +233,8 @@ async function main(): Promise<void> {
     console.log(`             Diagnostics: --log-level info|debug or --verbose`);
     console.log(`  ${BOLD}state-mcp${RESET}  MCP bridge exposing Squad runtime state tools`);
     console.log(`  ${BOLD}doctor${RESET}     Validate squad setup (check files, config, health)`);
+    console.log(`  ${BOLD}health${RESET}     Validate team state for CI (team, registry, routing, backend, env)`);
+    console.log(`             Flags: --json (structured output for CI)`);
     console.log(`  ${BOLD}consult${RESET}    Enter consult mode with your personal squad`);
     console.log(`             Flags: --status, --check`);
     console.log(`  ${BOLD}extract${RESET}    Extract learnings from consult mode session`);
@@ -796,24 +798,31 @@ async function main(): Promise<void> {
 
   if (cmd === 'cast' || cmd === 'hire') {
     const nameIdx = args.indexOf('--name');
-    const name = (nameIdx !== -1 && args[nameIdx + 1]) ? args[nameIdx + 1] : undefined;
     const roleIdx = args.indexOf('--role');
-    const role = (roleIdx !== -1 && args[roleIdx + 1]) ? args[roleIdx + 1] : undefined;
+    const hasNameFlag = nameIdx !== -1;
+    const hasRoleFlag = roleIdx !== -1;
+    const force = args.includes('--force');
 
-    // `squad cast` with no wizard flags shows the roster; `squad hire` always runs the wizard
-    if (cmd === 'cast' && !name && !role) {
-      const { runCast } = await import('./cli/commands/cast.js');
-      await runCast(getSquadStartDir());
+    const readFlagValue = (idx: number): string | undefined => {
+      if (idx === -1) return undefined;
+      const val = args[idx + 1];
+      return val && !val.startsWith('-') ? val : undefined;
+    };
+
+    if (cmd === 'hire' || hasNameFlag || hasRoleFlag) {
+      const name = readFlagValue(nameIdx);
+      const role = readFlagValue(roleIdx);
+      if (!name || !role) {
+        fatal('Usage: squad cast --name <name> --role <role> (or: squad hire --name <name> --role <role>)');
+      }
+      const { runCastAdd } = await import('./cli/commands/cast.js');
+      await runCastAdd(getSquadStartDir(), { name, role, force });
       return;
     }
 
-    console.log('🎬 Squad cast — team creation wizard starting... (full implementation pending)');
-    if (name) {
-      console.log(`   Name: ${name}`);
-    }
-    if (role) {
-      console.log(`   Role: ${role}`);
-    }
+    // `squad cast` with no wizard flags shows the roster
+    const { runCast } = await import('./cli/commands/cast.js');
+    await runCast(getSquadStartDir());
     return;
   }
 
@@ -982,6 +991,13 @@ async function main(): Promise<void> {
   if (cmd === 'doctor') {
     const { doctorCommand } = await import('./cli/commands/doctor.js');
     await doctorCommand();
+    return;
+  }
+
+  if (cmd === 'health') {
+    const { runHealthCommand } = await import('./cli/commands/health.js');
+    const exitCode = await runHealthCommand(getSquadStartDir(), args.slice(1));
+    process.exitCode = exitCode;
     return;
   }
 
@@ -1163,6 +1179,4 @@ main().catch(err => {
   }
   process.exit(1);
 });
-
-
 

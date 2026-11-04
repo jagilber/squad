@@ -1,8 +1,5 @@
 # Recipes & Advanced Scenarios
 
-> ⚠️ **Experimental** — Squad is alpha software. APIs, commands, and behavior may change between releases.
-
-
 A compact cookbook of prompts, patterns, and power moves. Each recipe is a prompt you can paste straight into Squad.
 
 ---
@@ -68,7 +65,10 @@ Export often — at the end of each project or after a major milestone. Your squ
 
 > "We're ready to ship v1.2.0 — run the release process: changelog, tags, and publish"
 
-Squad uses a three-branch model: dev → preview → main. The guard workflow blocks `.squad/` from reaching production. Tag from main only. Full lifecycle: prepare on dev, validate on preview, merge to main, tag, release.
+Squad uses `dev` for integration and `main` for stable releases. Dispatching
+`squad-release.yml` from `dev` creates an npm/GitHub preview; dispatching
+`squad-promote.yml` performs a validated, sanitized `dev`-to-`main` merge and
+explicitly starts the stable release after pushing `main`.
 
 ### Open Source Maintainer
 
@@ -88,9 +88,9 @@ Squad runs entirely in your Copilot session. Nothing leaves your machine beyond 
 
 ### Switching Models
 
-> "Switch everyone to Haiku — I'm trying to save costs this sprint"
+> "Switch everyone to Luna — I'm trying to save costs this sprint"
 
-Squad supports 17 models across three tiers. Budget mode: `claude-haiku-4.5` for everything. Quality mode: `claude-opus-4.6` for the Lead, `claude-sonnet-4.5` for everyone else. Fallback chains handle unavailability automatically.
+Squad supports 17 models across three tiers. Budget mode: `gpt-5.6-luna` for everything. Quality mode: `gpt-5.6-sol` for the Lead, `gpt-5.6-terra` for everyone else. Fallback chains handle unavailability automatically.
 
 ### Client Compatibility
 

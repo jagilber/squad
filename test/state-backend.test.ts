@@ -1,10 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { execSync, execFileSync } from 'node:child_process';
+import { execSync, execFileSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { tmpdir } from 'node:os';
-import { WorktreeBackend, GitNotesBackend, OrphanBranchBackend, TwoLayerBackend, CircuitBreaker, GitExecError, resolveStateBackend, validateStateKey, StateBackendStorageAdapter, verifyStateBackend, _resetGitNotesMigrationWarnForTesting, _resetExternalStubMigrationWarnForTesting } from '../packages/squad-sdk/src/state-backend.js';
+import { WorktreeBackend, GitNotesBackend, OrphanBranchBackend, TwoLayerBackend, CircuitBreaker, GitExecError, resolveStateBackend, validateStateKey, StateBackendStorageAdapter, verifyStateBackend, _resetGitNotesMigrationWarnForTesting, _resetExternalStubMigrationWarnForTesting, _setCasInjectorForTesting } from '../packages/squad-sdk/src/state-backend.js';
 import type { StateBackend, StateBackendType } from '../packages/squad-sdk/src/state-backend.js';
 import { resolveSquadState, clearResolveSquadCache } from '../packages/squad-sdk/src/resolution.js';
 import { ToolRegistry } from '../packages/squad-sdk/src/tools/index.js';
@@ -460,6 +460,51 @@ describe('resolveSquadState()', () => {
     expect(ctx).not.toBeNull();
     expect(ctx!.storage.constructor.name).toBe('StateBackendStorageAdapter');
   });
+
+  describe('#1555 regression: rootDir wiring + teamRoot=. sentinel', () => {
+    it('teamDir stays inside .squad/ when config.teamRoot is the "." sentinel externalize.ts writes', () => {
+      writeFileSync(join(squadDir(), 'config.json'), JSON.stringify({ version: 1, teamRoot: '.', projectKey: 'some-key', stateLocation: 'external' }));
+      const ctx = resolveSquadState(TMP);
+      expect(ctx).not.toBeNull();
+      // Before the fix this resolved one level too high (path.resolve(projectRoot, '.') === projectRoot,
+      // the parent of .squad/) because the truthy check on config.teamRoot didn't special-case '.'.
+      expect(ctx!.paths.mode).toBe('local');
+      expect(ctx!.paths.teamDir).toBe(squadDir());
+    });
+
+    it('local-backend storage rootDir is wired to teamDir, not left unset', () => {
+      writeFileSync(join(squadDir(), 'config.json'), JSON.stringify({ version: 1, teamRoot: '.' }));
+      const ctx = resolveSquadState(TMP);
+      expect(ctx).not.toBeNull();
+
+      // A key that escapes teamDir must now be rejected instead of the traversal
+      // guard silently no-op'ing on an unset rootDir.
+      expect(() => ctx!.storage.readSync(join(ctx!.paths.teamDir, '..', 'outside.md')))
+        .toThrow(/Path traversal blocked/);
+
+      // A key inside teamDir still round-trips normally.
+      ctx!.storage.writeSync(join(ctx!.paths.teamDir, 'agents', 'data', 'history.md'), '# Data\n');
+      expect(existsSync(join(squadDir(), 'agents', 'data', 'history.md'))).toBe(true);
+    });
+
+    it('squad_decide via ToolRegistry writes into .squad/decisions/inbox/, matching what state-mcp.ts wires up', async () => {
+      writeFileSync(join(squadDir(), 'config.json'), JSON.stringify({ version: 1, teamRoot: '.', projectKey: 'some-key', stateLocation: 'external' }));
+      const ctx = resolveSquadState(TMP);
+      expect(ctx).not.toBeNull();
+
+      // Same construction as createStateMcpToolRegistry() in state-mcp.ts.
+      const registry = new ToolRegistry(ctx!.paths.teamSquadDir, undefined, ctx!.storage);
+      const decide = registry.getTool('squad_decide')!;
+      const result = await decide.handler({ author: 'test-agent', summary: 'Use FSStorageProvider rootDir', body: 'Confine local-backend writes to teamDir.' });
+
+      expect(result.resultType).toBe('success');
+      const inboxDir = join(squadDir(), 'decisions', 'inbox');
+      expect(existsSync(inboxDir)).toBe(true);
+      expect(readdirSync(inboxDir).length).toBeGreaterThan(0);
+      // Must not have landed one level up, in the repo root.
+      expect(existsSync(join(TMP, 'decisions'))).toBe(false);
+    });
+  });
 });
 
 // ============================================================================
@@ -710,6 +755,36 @@ describe('ToolRegistry state tools with git-native backend', () => {
     expect(backend.read('.scratch/notes.md')).toBe('ok\n');
     expect(backend.read('agents/data/history.md')).toBe('Learned via state tools.\n');
     expect(backend.read('sessions/session-1/state.md')).toBeUndefined();
+  });
+
+  it('allows casting policy but rejects individual registry/history mutations', { timeout: 30_000 }, async () => {
+    const backend = new OrphanBranchBackend(TMP);
+    const adapter = new StateBackendStorageAdapter(backend, squadDir());
+    const registry = new ToolRegistry(squadDir(), undefined, adapter);
+    const write = registry.getTool('squad_state_write')!;
+    const append = registry.getTool('squad_state_append')!;
+    const del = registry.getTool('squad_state_delete')!;
+
+    await expect(write.handler({ key: 'casting/policy.json', content: '{}\n' }))
+      .resolves.toMatchObject({ resultType: 'success' });
+    expect(backend.read('casting/policy.json')).toBe('{}\n');
+
+    for (const key of ['casting/registry.json', 'casting/history.json']) {
+      await expect(write.handler({ key, content: '{}\n' }))
+        .resolves.toMatchObject({ resultType: 'failure' });
+      await expect(append.handler({ key, content: '{}\n' }))
+        .resolves.toMatchObject({ resultType: 'failure' });
+      await expect(del.handler({ key }))
+        .resolves.toMatchObject({ resultType: 'failure' });
+      expect(backend.read(key)).toBeUndefined();
+      expect(existsSync(join(squadDir(), key))).toBe(false);
+    }
+
+    await expect(write.handler({ key: 'casting/agents.json', content: '{}\n' })).resolves.toMatchObject({ resultType: 'failure' });
+    await expect(write.handler({ key: 'casting/archive/history.json', content: '{}\n' })).resolves.toMatchObject({ resultType: 'failure' });
+    expect(backend.read('casting/agents.json')).toBeUndefined();
+    expect(backend.read('casting/archive/history.json')).toBeUndefined();
+    expect(git('status --porcelain')).toBe('');
   });
 
   it('routes existing squad_decide writes through configured backend storage', { timeout: 20_000 }, async () => {
@@ -1484,6 +1559,98 @@ describe('OrphanBranchBackend CAS retry semantics', () => {
     let caught: unknown;
     try { b.delete('seed.md'); } catch (e) { caught = e; }
     expect(caught).toBeInstanceOf(StateBackendConcurrencyError);
+  });
+});
+
+describe('cross-process append regression', () => {
+  it.skipIf(process.env.SQUAD_APPEND_WORKER !== '1')('cross-process append worker', { timeout: 30_000 }, () => {
+    const repoRoot = process.env.SQUAD_APPEND_REPO;
+    const gateDir = process.env.SQUAD_APPEND_GATE;
+    const workerId = process.env.SQUAD_APPEND_WORKER_ID;
+    const backendType = process.env.SQUAD_APPEND_BACKEND;
+    if (!repoRoot || !gateDir || !workerId || !backendType) {
+      throw new Error('cross-process append worker configuration is incomplete');
+    }
+
+    let firstCas = true;
+    _setCasInjectorForTesting(() => {
+      if (!firstCas) return null;
+      firstCas = false;
+      writeFileSync(join(gateDir, `${workerId}.ready`), 'ready');
+      const deadline = Date.now() + 15_000;
+      const bothReady = () => existsSync(join(gateDir, 'first.ready')) && existsSync(join(gateDir, 'second.ready'));
+      while (!bothReady()) {
+        if (Date.now() >= deadline) throw new Error('timed out waiting for both append workers at the snapshot barrier');
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+      }
+      return null;
+    });
+
+    try {
+      const backend = backendType === 'two-layer'
+        ? new TwoLayerBackend(repoRoot)
+        : new OrphanBranchBackend(repoRoot);
+      backend.append('audit.log', `${workerId}\n`);
+    } finally {
+      _setCasInjectorForTesting(null);
+    }
+  });
+
+  it('preserves concurrent appends from separate processes for orphan and two-layer backends', { timeout: 60_000 }, async () => {
+    const vitestCli = join(process.cwd(), 'node_modules', 'vitest', 'vitest.mjs');
+    for (const backendType of ['orphan', 'two-layer'] as const) {
+      if (existsSync(TMP)) rmSync(TMP, { recursive: true, force: true });
+      initRepo();
+      const twoLayerBackend = backendType === 'two-layer' ? new TwoLayerBackend(TMP) : null;
+      const backend = twoLayerBackend ?? new OrphanBranchBackend(TMP);
+      backend.append('audit.log', 'seed\n');
+
+      const gateDir = join(tmpdir(), `squad-append-barrier-${randomBytes(8).toString('hex')}`);
+      mkdirSync(gateDir, { recursive: true });
+      const runWorker = (workerId: 'first' | 'second') => new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+        const child = spawn(process.execPath, [
+          vitestCli,
+          'run',
+          '--config',
+          'vitest.config.ts',
+          '--testNamePattern',
+          'cross-process append worker',
+          'test/state-backend.test.ts',
+        ], {
+          cwd: process.cwd(),
+          env: {
+            ...process.env,
+            SQUAD_APPEND_WORKER: '1',
+            SQUAD_APPEND_REPO: TMP,
+            SQUAD_APPEND_GATE: gateDir,
+            SQUAD_APPEND_WORKER_ID: workerId,
+            SQUAD_APPEND_BACKEND: backendType,
+          },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let output = '';
+        child.stdout?.on('data', (chunk: Buffer) => { output += chunk.toString(); });
+        child.stderr?.on('data', (chunk: Buffer) => { output += chunk.toString(); });
+        child.on('error', reject);
+        child.on('close', (code) => resolve({ code, output }));
+      });
+
+      try {
+        const results = await Promise.all([runWorker('first'), runWorker('second')]);
+        for (const result of results) expect(result.code, result.output).toBe(0);
+
+        const expectedLines = new Set(['seed', 'first', 'second']);
+        const orphanLines = new Set((backend.read('audit.log') ?? '').trim().split('\n'));
+        expect(orphanLines).toEqual(expectedLines);
+        if (twoLayerBackend) {
+          const notesLines = new Set((twoLayerBackend.notes.read('audit.log') ?? '').trim().split('\n'));
+          expect(notesLines).toEqual(expectedLines);
+        }
+      } finally {
+        rmSync(gateDir, { recursive: true, force: true });
+        if (existsSync(TMP)) rmSync(TMP, { recursive: true, force: true });
+      }
+    }
   });
 });
 

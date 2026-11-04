@@ -235,7 +235,7 @@ describe('Compat v0.4.1: Config Path Equivalence', () => {
 
   it('DEFAULT_CONFIG has expected shape', () => {
     expect(DEFAULT_CONFIG.version).toBe('1.0.0');
-    expect(DEFAULT_CONFIG.models.defaultModel).toBe('claude-sonnet-4.6');
+    expect(DEFAULT_CONFIG.models.defaultModel).toBe('gpt-5.6-terra');
     expect(DEFAULT_CONFIG.models.defaultTier).toBe('standard');
     expect(DEFAULT_CONFIG.routing.rules.length).toBeGreaterThanOrEqual(1);
     expect(DEFAULT_CONFIG.casting?.allowlistUniverses).toBeDefined();
@@ -256,7 +256,7 @@ describe('Compat v0.4.1: Tool Registration', () => {
   it('ToolRegistry registers all built-in tools', () => {
     const registry = new ToolRegistry();
     const tools = registry.getTools();
-    expect(tools.length).toBe(17);
+    expect(tools.length).toBe(18);
     const names = tools.map((t) => t.name);
     expect(names).toEqual(
       expect.arrayContaining([
@@ -266,6 +266,7 @@ describe('Compat v0.4.1: Tool Registration', () => {
         'squad_state_read',
         'squad_state_write',
         'squad_state_append',
+        'squad_state_create_if_absent',
         'squad_state_delete',
         'squad_state_list',
         'squad_state_health',
@@ -304,7 +305,7 @@ describe('Compat v0.4.1: Tool Registration', () => {
   it('getToolsForAgent returns all when no filter', () => {
     const registry = new ToolRegistry();
     const all = registry.getToolsForAgent(undefined);
-    expect(all.length).toBe(17);
+    expect(all.length).toBe(18);
   });
 });
 
@@ -466,13 +467,14 @@ describe('Compat v0.4.1: Event Bus Shape', () => {
 
 describe('Compat v0.4.1: Model Catalog', () => {
   it('catalog contains expected premium models', () => {
-    expect(isModelAvailable('claude-opus-4.6')).toBe(true);
+    expect(isModelAvailable('claude-opus-5')).toBe(true);
+    expect(isModelAvailable('claude-opus-5.5')).toBe(true);
     expect(isModelAvailable('claude-opus-4.8')).toBe(true);
   });
 
   it('catalog contains expected standard models', () => {
-    expect(isModelAvailable('claude-sonnet-4.5')).toBe(true);
-    expect(isModelAvailable('claude-sonnet-4.6')).toBe(true);
+    expect(isModelAvailable('claude-sonnet-5')).toBe(true);
+    expect(isModelAvailable('claude-sonnet-5.5')).toBe(true);
     expect(isModelAvailable('gpt-5.4')).toBe(true);
   });
 
@@ -482,22 +484,21 @@ describe('Compat v0.4.1: Model Catalog', () => {
     expect(isModelAvailable('gpt-5-mini')).toBe(true);
   });
 
-  it('premium fallback chain starts with opus', () => {
-    expect(DEFAULT_FALLBACK_CHAINS.premium[0]).toBe('claude-opus-4.8');
+  it('premium fallback chain starts with Claude Opus 5.5', () => {
+    expect(DEFAULT_FALLBACK_CHAINS.premium[0]).toBe('claude-opus-5.5');
   });
 
-  it('standard fallback chain starts with sonnet', () => {
-    // Reordered to prefer newest Sonnet series first (PR #1444 follow-up, tamirdresher request).
-    expect(DEFAULT_FALLBACK_CHAINS.standard[0]).toBe('claude-sonnet-5');
+  it('standard fallback chain starts with Claude Sonnet 5.5', () => {
+    expect(DEFAULT_FALLBACK_CHAINS.standard[0]).toBe('claude-sonnet-5.5');
   });
 
-  it('fast fallback chain starts with haiku', () => {
-    expect(DEFAULT_FALLBACK_CHAINS.fast[0]).toBe('claude-haiku-4.5');
+  it('fast fallback chain starts with Claude Haiku 5.5', () => {
+    expect(DEFAULT_FALLBACK_CHAINS.fast[0]).toBe('claude-haiku-5.5');
   });
 
   it('getModelInfo returns correct tier for known models', () => {
-    expect(getModelInfo('claude-opus-4.6')!.tier).toBe('premium');
-    expect(getModelInfo('claude-sonnet-4.5')!.tier).toBe('standard');
+    expect(getModelInfo('claude-opus-5.5')!.tier).toBe('premium');
+    expect(getModelInfo('claude-sonnet-5.5')!.tier).toBe('standard');
     expect(getModelInfo('claude-haiku-4.5')!.tier).toBe('fast');
   });
 });

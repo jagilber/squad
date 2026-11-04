@@ -4,6 +4,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { resolveSquadState } from '@bradygaster/squad-sdk';
 import { ToolRegistry } from '@bradygaster/squad-sdk/tools';
+import { getPackageVersion } from '../core/version.js';
 
 export type JsonRpcRequest = {
   jsonrpc?: string;
@@ -21,7 +22,7 @@ type JsonRpcResponse = {
 
 const SERVER_INFO = {
   name: 'squad-state',
-  version: '0.1.0',
+  version: getPackageVersion(),
 };
 
 const MCP_TOOL_ALIASES: Record<string, string> = {
@@ -31,6 +32,7 @@ const MCP_TOOL_ALIASES: Record<string, string> = {
   squad_state_append: 'squad_state_append',
   squad_state_delete: 'squad_state_delete',
   squad_state_list: 'squad_state_list',
+  squad_state_create_if_absent: 'squad_state_create_if_absent',
   squad_state_health: 'squad_state_health',
   'memory.classify': 'memory.classify',
   'memory.write': 'memory.write',
@@ -69,7 +71,7 @@ export function createStateMcpToolRegistry(startDir: string): ToolRegistry {
   if (!context) {
     throw new Error(`No .squad directory found from ${startDir}`);
   }
-  return new ToolRegistry(context.paths.teamDir, undefined, context.storage);
+  return new ToolRegistry(context.paths.teamSquadDir, undefined, context.storage);
 }
 
 function normalizeToolResult(result: unknown): { content: Array<{ type: 'text'; text: string }>; isError?: boolean } {

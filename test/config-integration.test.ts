@@ -462,15 +462,12 @@ describe('Integration: Charter compilation with config overrides', () => {
     expect(result.prompt).toContain('ADR-001: Use TypeScript.');
   });
 
-  it('handles empty charter content gracefully', () => {
-    const result = compileCharter({
+  it('rejects explicitly empty charter content', () => {
+    expect(() => compileCharter({
       agentName: 'empty',
       charterPath: '/fake/path',
       charterContent: '',
-    });
-
-    expect(result.name).toBe('empty');
-    expect(result.prompt).toContain('empty Charter');
+    })).toThrow(/SQC001/);
   });
 
   it('compileCharterFull returns parsed charter', () => {
@@ -726,17 +723,30 @@ describe('Integration: Config validation error paths', () => {
     expect(result.warnings?.some(w => w.includes('Duplicate'))).toBe(true);
   });
 
+  it('validateConfigDetailed accepts a current defaultModel', () => {
+    const result = validateConfigDetailed({
+      ...RUNTIME_DEFAULT,
+      models: {
+        ...RUNTIME_DEFAULT.models,
+        defaultModel: 'gpt-5.6-luna',
+      },
+    });
+    expect(result.valid).toBe(true);
+    expect(result.errors.length).toBe(0);
+    expect(result.warnings?.some(w => w.includes('gpt-5.6-luna') && w.includes('not in the current model catalog'))).toBe(false);
+  });
+
   it('validateConfigDetailed warns when defaultModel is not in MODEL_CATALOG', () => {
     const result = validateConfigDetailed({
       ...RUNTIME_DEFAULT,
       models: {
         ...RUNTIME_DEFAULT.models,
-        defaultModel: 'gpt-4.1',
+        defaultModel: 'unsupported-model',
       },
     });
     expect(result.valid).toBe(true);
     expect(result.errors.length).toBe(0);
-    expect(result.warnings?.some(w => w.includes('gpt-4.1') && w.includes('not in the current model catalog'))).toBe(true);
+    expect(result.warnings?.some(w => w.includes('unsupported-model') && w.includes('not in the current model catalog'))).toBe(true);
   });
 
   it('schema validateConfig rejects non-object', () => {
@@ -882,8 +892,7 @@ describe('Integration: Full pipeline — discover → compile → resolve → fi
 
     expect(agent).toBeNull();
 
-    // Compilation with empty charter content is still valid
-    const compiled = compileCharter({
+    expect(() => compileCharter({
       agentName: 'phantom',
       charterPath: join(base, '.squad', 'agents', 'phantom', 'charter.md'),
       charterContent: '',
@@ -891,15 +900,12 @@ describe('Integration: Full pipeline — discover → compile → resolve → fi
         role: 'Ghost Agent',
         model: 'claude-haiku-4.5',
       },
-    });
-
-    expect(compiled.name).toBe('phantom');
-    expect(compiled.displayName).toContain('Ghost Agent');
+    })).toThrow(/SQC001/);
   });
 
   it('ModelRegistry validates models from compiled config', () => {
     const registry = new ModelRegistry();
-    expect(registry.isModelAvailable('claude-sonnet-4.5')).toBe(true);
+    expect(registry.isModelAvailable('claude-sonnet-5.5')).toBe(true);
     expect(registry.isModelAvailable('nonexistent-model')).toBe(false);
 
     const chain = registry.getFallbackChain('standard');
@@ -950,7 +956,7 @@ describe('Integration: Full pipeline — discover → compile → resolve → fi
 
     expect(config.team.name).toBe('Integration Squad');
     expect(config.agents.length).toBe(1);
-    expect(config.models.default).toBe('claude-sonnet-4.6');
+    expect(config.models.default).toBe('gpt-5.6-terra');
   });
 });
 

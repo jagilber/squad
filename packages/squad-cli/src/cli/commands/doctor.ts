@@ -14,7 +14,10 @@ import path from 'node:path';
 import { execFile, execFileSync } from 'node:child_process';
 import { FSStorageProvider, resolveStateBackend, type StateBackendType } from '@bradygaster/squad-sdk';
 import type { SquadRuntimeId } from '@bradygaster/squad-sdk/client';
-import { resolveStateDir } from '../core/effective-squad-dir.js';
+import { readCastingRegistryPair } from '@bradygaster/squad-sdk/casting';
+import { resolveSquadPaths, clearResolveSquadCache } from '@bradygaster/squad-sdk/resolution';
+import { isMutableStateKey, MUTABLE_STATE_PATHS } from '@bradygaster/squad-sdk/tools';
+import { effectiveSquadDir } from '../core/effective-squad-dir.js';
 
 const storage = new FSStorageProvider();
 
@@ -158,6 +161,77 @@ function checkTeamRootResolves(squadDir: string, teamRoot: string): DoctorCheck 
   };
 }
 
+/** Squad writes state as .md and .json; other files in a code dir named log/ etc. are not ours. */
+const STRAY_STATE_FILE = /\.(md|json)$/;
+const STRAY_STATE_MAX_DEPTH = 4;
+const STRAY_STATE_LIST_LIMIT = 10;
+
+/** Push `/`-separated keys of files under `base/rel`. Skips dirs it cannot list. */
+function collectFileKeys(base: string, rel: string, depth: number, out: string[]): void {
+  let entries: string[];
+  try {
+    entries = storage.listSync(path.join(base, rel));
+  } catch {
+    return;
+  }
+  for (const name of entries) {
+    const key = `${rel}/${name}`;
+    const full = path.join(base, key);
+    if (isDirectory(full)) {
+      if (depth > 1) collectFileKeys(base, key, depth - 1, out);
+    } else {
+      out.push(key);
+    }
+  }
+}
+
+function formatKeyList(keys: string[]): string {
+  const shown = keys.slice(0, STRAY_STATE_LIST_LIMIT).join(', ');
+  return keys.length > STRAY_STATE_LIST_LIMIT ? `${shown}, and ${keys.length - STRAY_STATE_LIST_LIMIT} more` : shown;
+}
+
+/**
+ * Before #2107, a `squad link` project (teamRoot = the team repo) made the
+ * state MCP server write team state to `<teamRoot>/<key>` instead of
+ * `<teamRoot>/.squad/<key>`. Squad no longer reads those files. Report every
+ * state-tool path (MUTABLE_STATE_PATHS) found there, split into files to move
+ * and files to merge by hand because a newer copy exists. Read-only.
+ */
+function checkStrandedLinkedTeamState(squadDir: string): DoctorCheck | undefined {
+  // Doctor must see the current disk, not a walk cached by an earlier call.
+  clearResolveSquadCache();
+  const paths = resolveSquadPaths(path.dirname(squadDir));
+  if (!paths || paths.mode !== 'remote' || paths.projectDir !== path.resolve(squadDir)) return undefined;
+  if (paths.teamSquadDir === paths.teamDir) return undefined;
+
+  const candidates: string[] = [];
+  for (const { root, kind } of MUTABLE_STATE_PATHS) {
+    const full = path.join(paths.teamDir, root);
+    if (kind === 'file') {
+      if (fileExists(full) && !isDirectory(full)) candidates.push(root);
+    } else if (isDirectory(full)) {
+      collectFileKeys(paths.teamDir, root, STRAY_STATE_MAX_DEPTH, candidates);
+    }
+  }
+  // Match only what the state tools could write, so an unrelated code dir
+  // named agents/ or log/ does not trigger advice to move it.
+  const stray = candidates.filter(key => isMutableStateKey(key) && STRAY_STATE_FILE.test(key));
+  if (stray.length === 0) return undefined;
+
+  const toMerge = stray.filter(key => fileExists(path.join(paths.teamSquadDir, key)));
+  const toMove = stray.filter(key => !toMerge.includes(key));
+  const parts = [
+    `found ${stray.length} team state file(s) in ${paths.teamDir}, outside the team's squad dir. Squad now reads team state from ${paths.teamSquadDir}.`,
+  ];
+  // teamSquadDir normally has its own agents/ and decisions/, so tell the user
+  // to move files, not to move (and replace) the directories.
+  if (toMove.length > 0) parts.push(`Move each file to the same relative path under it: ${formatKeyList(toMove)}.`);
+  if (toMerge.length > 0) parts.push(`A file already exists at the same relative path for these; merge by hand and do not overwrite the newer state: ${formatKeyList(toMerge)}.`);
+  parts.push('Do not replace the existing directories there.');
+
+  return { name: 'linked team state location', status: 'warn', message: parts.join(' ') };
+}
+
 function checkTeamMd(squadDir: string): DoctorCheck {
   const teamPath = path.join(squadDir, 'team.md');
   if (!fileExists(teamPath)) {
@@ -202,11 +276,16 @@ function checkCastingRegistry(squadDir: string): DoctorCheck {
   if (!fileExists(registryPath)) {
     return { name: 'casting/registry.json exists', status: 'fail', message: 'file not found' };
   }
-  const data = tryReadJson(registryPath);
-  if (data === undefined) {
-    return { name: 'casting/registry.json exists', status: 'fail', message: 'file exists but is not valid JSON' };
+  try {
+    readCastingRegistryPair(path.join(squadDir, 'casting'));
+  } catch (error) {
+    return {
+      name: 'casting/registry.json exists',
+      status: 'fail',
+      message: `registry/history pair is invalid: ${error instanceof Error ? error.message : String(error)}`,
+    };
   }
-  return { name: 'casting/registry.json exists', status: 'pass', message: 'file present, valid JSON' };
+  return { name: 'casting/registry.json exists', status: 'pass', message: 'registry/history pair is consistent' };
 }
 
 function configuredStateBackend(squadDir: string): StateBackendType | undefined {
@@ -755,6 +834,100 @@ export function checkGitSyncHooks(cwd: string, squadDir: string): DoctorCheck | 
   };
 }
 
+// ── working-tree EOL check ───────────────────────────────────────────
+
+/** Repair command surfaced to the developer when the check fails. */
+const CRLF_FIX_COMMAND = 'npm run fix:crlf';
+
+/**
+ * Parse one `git ls-files --eol -z` record.
+ *
+ * Shape is `i/<eol>` `w/<eol>` `attr/<value>` TAB `<path>`. The first three
+ * fields are space-padded to fixed columns and the attr value itself contains
+ * a space ("text eol=lf"), so the path is everything after the first TAB and
+ * the field block is split on whitespace runs rather than by column.
+ */
+function parseEolRecord(record: string): { worktree: string; attr: string; file: string } | undefined {
+  const tab = record.indexOf('\t');
+  if (tab === -1) return undefined;
+  const match = /^i\/(\S*)\s+w\/(\S*)\s+attr\/(.*)$/.exec(record.slice(0, tab));
+  if (!match) return undefined;
+  return { worktree: match[2] ?? '', attr: (match[3] ?? '').trim(), file: record.slice(tab + 1) };
+}
+
+/**
+ * Check that every LF-pinned file is actually LF *on disk*.
+ *
+ * `.gitattributes` governs checkout, not files already on disk: git only
+ * re-smudges a working file when the pull also changes that file's index
+ * content. So adding an `eol=lf` rule leaves every already-LF-in-index path
+ * still CRLF on disk in existing Windows checkouts, indefinitely (#1793).
+ * The symptom is not an error — a CRLF shebang survives Vite's shebang
+ * stripping as a bare `#`, the module fails to parse, and the vitest suite
+ * importing it reports "no tests". A green-looking zero (#1788).
+ *
+ * DELIBERATELY A SEPARATE IMPLEMENTATION FROM scripts/check-shebang-eol.mjs,
+ * which owns the same invariant family for repo tooling. That script is a repo
+ * script and is not published inside this package, so `dist/` cannot import it
+ * without breaking every installed copy of the CLI. Do not "deduplicate" these
+ * by adding an import across that boundary. What they must keep in sync is the
+ * record-parsing shape above, which is pinned by tests on both sides.
+ *
+ * Returns undefined when the check does not apply (not a git repo, git absent,
+ * or no LF-pinned files at all), matching the other conditional checks.
+ */
+export function checkWorktreeEol(cwd: string): DoctorCheck | undefined {
+  let records: string[];
+  try {
+    records = execFileSync('git', ['ls-files', '--eol', '-z'], {
+      cwd,
+      encoding: 'utf-8',
+      maxBuffer: 1 << 28,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+      .split('\0')
+      .filter(Boolean);
+  } catch {
+    return undefined; // not a git repo, or git unavailable — not applicable
+  }
+
+  const stale: string[] = [];
+  let pinned = 0;
+  for (const record of records) {
+    const parsed = parseEolRecord(record);
+    if (!parsed) continue;
+    if (!/(^|\s)eol=lf(\s|$)/.test(parsed.attr)) continue;
+    pinned += 1;
+    // `mixed` is the same defect partially applied: under an eol=lf pin any CR
+    // in the working file is wrong.
+    if (parsed.worktree === 'crlf' || parsed.worktree === 'mixed') stale.push(parsed.file);
+  }
+
+  if (pinned === 0) return undefined; // no eol=lf rules — nothing to assert
+
+  if (stale.length > 0) {
+    const sample = stale.slice(0, 5).join(', ');
+    const more = stale.length > 5 ? `, +${stale.length - 5} more` : '';
+    return {
+      name: 'working tree line endings',
+      status: 'fail',
+      message:
+        `${stale.length} of ${pinned} LF-pinned file(s) still have CRLF on disk (${sample}${more}). ` +
+        `A .gitattributes eol=lf rule does not rewrite files that were already checked out, so pulling the ` +
+        `fix does not repair an existing checkout. A CRLF shebang makes a vitest suite silently load zero ` +
+        `tests. Run '${CRLF_FIX_COMMAND}' to repair, then re-run 'squad doctor' to confirm. To inspect ` +
+        `the raw state: 'git ls-files --eol' — every entry whose attr includes eol=lf should read w/lf ` +
+        `(the pin is not limited to *.mjs, and neither is this check).`,
+    };
+  }
+
+  return {
+    name: 'working tree line endings',
+    status: 'pass',
+    message: `${pinned} LF-pinned file(s) all LF on disk`,
+  };
+}
+
 // ── public API ──────────────────────────────────────────────────────
 
 /**
@@ -780,12 +953,17 @@ export async function runDoctor(cwd?: string): Promise<DoctorCheck[]> {
   // 4. Remote team root resolution
   if (mode === 'remote' && teamRoot) {
     checks.push(checkTeamRootResolves(squadDir, teamRoot));
+    const strayState = checkStrandedLinkedTeamState(squadDir);
+    if (strayState) checks.push(strayState);
   }
 
   // 5–9 standard files (only if .squad/ exists)
   if (isDirectory(squadDir)) {
-    // Resolve effective state dir for externalized files
-    const stateDir = resolveStateDir(squadDir);
+    // Resolve effective state dir for externalized files and remote team
+    // roots — mirrors the dual-root resolver used by `squad cast`/`squad status`
+    // so linked (remote-mode) projects are validated against the team root's
+    // .squad/ instead of the local stub that only holds config.json (#2056).
+    const { stateDir } = effectiveSquadDir(resolvedCwd);
     checks.push(checkTeamMd(stateDir));
     checks.push(checkRoutingMd(stateDir));
     checks.push(checkAgentsDir(stateDir));
@@ -823,6 +1001,11 @@ export async function runDoctor(cwd?: string): Promise<DoctorCheck[]> {
   ]);
   checks.push(claudeCli);
   checks.push(claudeAuth);
+
+  // 15. Working-tree line endings (#1793) — an eol=lf rule does not repair a
+  //     checkout that predates it, and the failure mode is a silent zero-test run.
+  const worktreeEol = checkWorktreeEol(resolvedCwd);
+  if (worktreeEol) checks.push(worktreeEol);
 
   return checks;
 }

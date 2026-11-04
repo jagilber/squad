@@ -1,0 +1,417 @@
+/**
+ * Team Capability Advertisement — lifecycle wiring (#1608)
+ *
+ * The generator itself is unit-tested in `team-capabilities.test.ts`. This file
+ * proves the *plumbing*: that a cast-composition change actually rewrites
+ * `.github/agents/squad.agent.md`, and that the file is legitimately
+ * Squad-owned (fully generated) rather than user-authored.
+ */
+
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { describe, it, expect, beforeEach } from 'vitest';
+import { InMemoryStorageProvider } from '../packages/squad-sdk/src/storage/in-memory-storage-provider.js';
+import {
+  syncTeamCapabilities,
+  TEAM_CAPABILITIES_BEGIN,
+  TEAM_CAPABILITIES_END,
+} from '../packages/squad-sdk/src/config/team-capabilities.js';
+import { TEMPLATE_MANIFEST } from '../packages/squad-cli/src/cli/core/templates.js';
+
+const SQUAD_DIR = '/repo/.squad';
+const AGENT_FILE = '/repo/.github/agents/squad.agent.md';
+
+const AGENT_DOC = [
+  '<!-- SQUAD_COORDINATOR_CANARY_HEAD_b7d2 -->',
+  '',
+  '# Squad (Coordinator)',
+  '',
+  'Some coordinator prose.',
+  '',
+  '## Init Mode',
+  '',
+  'Init body.',
+  '',
+  '<!-- SQUAD_COORDINATOR_CANARY_a8f3 -->',
+  '',
+].join('\n');
+
+function teamMd(rows: string): string {
+  return `# Team\n\n## Members\n\n| Name | Role | Charter | Status |\n|---|---|---|---|\n${rows}\n`;
+}
+
+function routingMd(rows: string): string {
+  return `# Routing\n\n## Work Type → Agent\n\n| Work Type | Agent |\n|---|---|\n${rows}\n`;
+}
+
+let storage: InMemoryStorageProvider;
+
+function seed(team: string, routing: string): void {
+  storage.writeSync(`${SQUAD_DIR}/team.md`, team);
+  storage.writeSync(`${SQUAD_DIR}/routing.md`, routing);
+  storage.writeSync(AGENT_FILE, AGENT_DOC);
+  storage.writeSync(`${SQUAD_DIR}/casting/registry.json`, JSON.stringify({
+    schema: 'squad-agent-provenance/v1',
+    schema_version: 1,
+    revision: 1,
+    generated_at: '2026-09-21T00:00:00.000Z',
+    agents: {},
+  }));
+  storage.writeSync(`${SQUAD_DIR}/casting/history.json`, JSON.stringify({
+    assignment_cast_snapshots: {},
+    universe_usage_history: [],
+  }));
+}
+
+beforeEach(() => {
+  storage = new InMemoryStorageProvider();
+});
+
+describe('#1608 — cast lifecycle regenerates the agent file', () => {
+  it.each([
+    {
+      name: 'missing pair',
+      mutate: () => {
+        storage.deleteSync(`${SQUAD_DIR}/casting/registry.json`);
+        storage.deleteSync(`${SQUAD_DIR}/casting/history.json`);
+      },
+      expected: /both files are required/,
+    },
+    {
+      name: 'one-sided pair',
+      mutate: () => storage.deleteSync(`${SQUAD_DIR}/casting/history.json`),
+      expected: /both files are required/,
+    },
+    {
+      name: 'mixed generation pair',
+      mutate: () => {
+        const registry = JSON.parse(storage.readSync(`${SQUAD_DIR}/casting/registry.json`)!);
+        registry.transaction_id = 'registry-generation';
+        storage.writeSync(`${SQUAD_DIR}/casting/registry.json`, JSON.stringify(registry));
+        storage.writeSync(`${SQUAD_DIR}/casting/history.json`, JSON.stringify({
+          assignment_cast_snapshots: {},
+          universe_usage_history: [],
+          transaction_id: 'history-generation',
+          registry_revision: 1,
+        }));
+      },
+      expected: /transaction metadata exists without a commit manifest/,
+    },
+    {
+      name: 'malformed history',
+      mutate: () => storage.writeSync(`${SQUAD_DIR}/casting/history.json`, JSON.stringify({
+        assignment_cast_snapshots: [],
+        universe_usage_history: [],
+      })),
+      expected: /history shape is invalid/,
+    },
+  ])('fails closed for non-filesystem storage with a $name', ({ mutate, expected }) => {
+    seed(teamMd('| Nori | Data Engineer |'), routingMd('| Pipelines | Nori |'));
+    storage.deleteSync(AGENT_FILE);
+    mutate();
+    expect(() => syncTeamCapabilities({
+      squadDir: SQUAD_DIR,
+      agentFile: AGENT_FILE,
+      storage,
+    })).toThrow(expected);
+  });
+
+  it('injects the block on first sync and reports the profile it used', () => {
+    seed(
+      teamMd('| Nori | Data Engineer | .squad/agents/nori/charter.md | ✅ Active |'),
+      routingMd('| Pipelines | Nori |'),
+    );
+
+    const result = syncTeamCapabilities({ squadDir: SQUAD_DIR, agentFile: AGENT_FILE, storage });
+
+    expect(result.updated).toBe(true);
+    expect(result.profile.specialists.map((s) => s.name)).toEqual(['Nori']);
+
+    const doc = storage.readSync(AGENT_FILE);
+    expect(doc).toContain(TEAM_CAPABILITIES_BEGIN);
+    expect(doc).toContain(TEAM_CAPABILITIES_END);
+    expect(doc).toContain('| Nori | Data Engineer |');
+    expect(doc).toContain('| Pipelines | Nori |');
+  });
+
+  it('preserves CRLF around and inside refreshed capability blocks and leaves repeat sync unchanged', () => {
+    seed(teamMd('| Nori | Data Engineer |'), routingMd('| Pipelines | Nori |'));
+    storage.writeSync(AGENT_FILE, AGENT_DOC.replace(/\n/g, '\r\n'));
+    expect(syncTeamCapabilities({ squadDir: SQUAD_DIR, agentFile: AGENT_FILE, storage }).updated).toBe(true);
+    const first = storage.readSync(AGENT_FILE)!;
+    expect(first).toContain('\r\n');
+    expect(first).not.toMatch(/(?<!\r)\n/);
+    expect(syncTeamCapabilities({ squadDir: SQUAD_DIR, agentFile: AGENT_FILE, storage }).updated).toBe(false);
+    expect(storage.readSync(AGENT_FILE)).toBe(first);
+    storage.writeSync(`${SQUAD_DIR}/team.md`, teamMd('| Nori | Data Engineer |\n| Saffron | Security |'));
+    expect(syncTeamCapabilities({ squadDir: SQUAD_DIR, agentFile: AGENT_FILE, storage }).updated).toBe(true);
+    expect(storage.readSync(AGENT_FILE)).toContain('Saffron');
+    expect(storage.readSync(AGENT_FILE)).not.toMatch(/(?<!\r)\n/);
+  });
+
+  it('rewrites the block when a member is added to the cast', () => {
+    seed(teamMd('| Nori | Data Engineer |'), routingMd('| Pipelines | Nori |'));
+    syncTeamCapabilities({ squadDir: SQUAD_DIR, agentFile: AGENT_FILE, storage });
+
+    storage.writeSync(
+      `${SQUAD_DIR}/team.md`,
+      teamMd('| Nori | Data Engineer |\n| Saffron | Security |'),
+    );
+    storage.writeSync(
+      `${SQUAD_DIR}/routing.md`,
+      routingMd('| Pipelines | Nori |\n| Security | Saffron |'),
+    );
+
+    const result = syncTeamCapabilities({ squadDir: SQUAD_DIR, agentFile: AGENT_FILE, storage });
+
+    expect(result.updated).toBe(true);
+    const doc = storage.readSync(AGENT_FILE);
+    expect(doc).toContain('Saffron');
+    expect(doc).toContain('| Security | Saffron |');
+  });
+
+  it('erases a recast squad’s previous names entirely', () => {
+    seed(
+      teamMd('| Keaton | Lead |\n| Verbal | Dev |\n| Fenster | Tester |'),
+      routingMd('| Architecture | Keaton |\n| Implementation | Verbal |\n| Testing | Fenster |'),
+    );
+    syncTeamCapabilities({ squadDir: SQUAD_DIR, agentFile: AGENT_FILE, storage });
+    expect(storage.readSync(AGENT_FILE)).toContain('Keaton');
+
+    // Recast to a completely different universe.
+    storage.writeSync(
+      `${SQUAD_DIR}/team.md`,
+      teamMd('| Flight | Lead |\n| EECOM | Dev |\n| FIDO | Tester |'),
+    );
+    storage.writeSync(
+      `${SQUAD_DIR}/routing.md`,
+      routingMd('| Architecture | Flight |\n| Implementation | EECOM |\n| Testing | FIDO |'),
+    );
+    syncTeamCapabilities({ squadDir: SQUAD_DIR, agentFile: AGENT_FILE, storage });
+
+    const doc = storage.readSync(AGENT_FILE);
+    for (const stale of ['Keaton', 'Verbal', 'Fenster']) {
+      expect(doc).not.toContain(stale);
+    }
+    expect(doc).toContain('Flight');
+  });
+
+  it('drops a retired agent on the next sync', () => {
+    seed(
+      teamMd('| Nori | Data Engineer |\n| Saffron | Security |'),
+      routingMd('| Pipelines | Nori |\n| Security | Saffron |'),
+    );
+    storage.writeSync(
+      `${SQUAD_DIR}/casting/registry.json`,
+      JSON.stringify({
+        schema: 'squad-agent-provenance/v1',
+        schema_version: 1,
+        revision: 1,
+        generated_at: '2026-09-21T00:00:00.000Z',
+        agents: {
+          nori: {
+            display_name: 'Nori',
+            persistent_name: 'Nori',
+            role: 'Data Engineer',
+            universe: 'descriptive',
+            status: 'active',
+            created_at: '2026-09-21T00:00:00.000Z',
+            updated_at: '2026-09-21T00:00:00.000Z',
+          },
+          saffron: {
+            display_name: 'Saffron',
+            persistent_name: 'Saffron',
+            role: 'Security',
+            universe: 'descriptive',
+            status: 'active',
+            created_at: '2026-09-21T00:00:00.000Z',
+            updated_at: '2026-09-21T00:00:00.000Z',
+          },
+        },
+      }),
+    );
+    storage.writeSync(
+      `${SQUAD_DIR}/casting/history.json`,
+      JSON.stringify({
+        assignment_cast_snapshots: {
+          'repl-cast-r1-2026-09-21T00:00:00.000Z': {
+            created_at: '2026-09-21T00:00:00.000Z',
+            agents: ['nori', 'saffron'],
+            universe: 'descriptive',
+          },
+        },
+        universe_usage_history: [
+          { universe: 'descriptive', used_at: '2026-09-21T00:00:00.000Z' },
+        ],
+      }),
+    );
+    syncTeamCapabilities({ squadDir: SQUAD_DIR, agentFile: AGENT_FILE, storage });
+    expect(storage.readSync(AGENT_FILE)).toContain('Saffron');
+
+    storage.writeSync(
+      `${SQUAD_DIR}/casting/registry.json`,
+      JSON.stringify({
+        schema: 'squad-agent-provenance/v1',
+        schema_version: 1,
+        revision: 2,
+        generated_at: '2026-09-21T00:01:00.000Z',
+        agents: {
+          nori: {
+            display_name: 'Nori',
+            persistent_name: 'Nori',
+            role: 'Data Engineer',
+            universe: 'descriptive',
+            status: 'active',
+            created_at: '2026-09-21T00:00:00.000Z',
+            updated_at: '2026-09-21T00:01:00.000Z',
+          },
+          saffron: {
+            display_name: 'Saffron',
+            persistent_name: 'Saffron',
+            role: 'Security',
+            universe: 'descriptive',
+            status: 'retired',
+            created_at: '2026-09-21T00:00:00.000Z',
+            updated_at: '2026-09-21T00:01:00.000Z',
+            retired_at: '2026-09-21T00:01:00.000Z',
+          },
+        },
+      }),
+    );
+    storage.writeSync(
+      `${SQUAD_DIR}/casting/history.json`,
+      JSON.stringify({
+        assignment_cast_snapshots: {
+          'repl-cast-r1-2026-09-21T00:00:00.000Z': {
+            created_at: '2026-09-21T00:00:00.000Z',
+            agents: ['nori', 'saffron'],
+            universe: 'descriptive',
+          },
+          'repl-cast-r2-2026-09-21T00:01:00.000Z': {
+            created_at: '2026-09-21T00:01:00.000Z',
+            agents: ['nori'],
+            universe: 'descriptive',
+          },
+        },
+        universe_usage_history: [
+          { universe: 'descriptive', used_at: '2026-09-21T00:00:00.000Z' },
+          { universe: 'descriptive', used_at: '2026-09-21T00:01:00.000Z' },
+        ],
+      }),
+    );
+    syncTeamCapabilities({ squadDir: SQUAD_DIR, agentFile: AGENT_FILE, storage });
+
+    const doc = storage.readSync(AGENT_FILE);
+    expect(doc).not.toContain('Saffron');
+    expect(doc).toContain('Nori');
+  });
+
+  it('reads charters off disk to ground the focus column', () => {
+    seed(teamMd('| Nori | Data Engineer |'), routingMd('| Pipelines | Nori |'));
+    storage.writeSync(
+      `${SQUAD_DIR}/agents/nori/charter.md`,
+      `# Nori\n\n## Identity\n- **Name:** Nori\n- **Role:** Data Engineer\n- **Expertise:** ingestion pipelines, schema evolution\n\n## Boundaries\n**I handle:** implementation of data pipelines\n`,
+    );
+
+    const result = syncTeamCapabilities({ squadDir: SQUAD_DIR, agentFile: AGENT_FILE, storage });
+
+    expect(result.profile.specialists[0]!.focus).toBe('ingestion pipelines, schema evolution');
+    expect(result.profile.specialists[0]!.authority).toContain('edit');
+  });
+
+  it('ignores alumni and dotfile entries under .squad/agents', () => {
+    seed(teamMd('| Nori | Data Engineer |'), routingMd('| Pipelines | Nori |'));
+    storage.writeSync(`${SQUAD_DIR}/agents/_alumni/verbal/charter.md`, '# Verbal\n');
+    storage.writeSync(`${SQUAD_DIR}/agents/.cache/charter.md`, '# cache\n');
+
+    const result = syncTeamCapabilities({ squadDir: SQUAD_DIR, agentFile: AGENT_FILE, storage });
+
+    expect(result.profile.specialists.map((s) => s.name)).toEqual(['Nori']);
+    expect(storage.readSync(AGENT_FILE)).not.toContain('Verbal');
+  });
+
+  it('is a no-op when nothing about the cast changed', () => {
+    seed(teamMd('| Nori | Data Engineer |'), routingMd('| Pipelines | Nori |'));
+    syncTeamCapabilities({ squadDir: SQUAD_DIR, agentFile: AGENT_FILE, storage });
+    const first = storage.readSync(AGENT_FILE);
+
+    const second = syncTeamCapabilities({ squadDir: SQUAD_DIR, agentFile: AGENT_FILE, storage });
+
+    expect(second.updated).toBe(false);
+    expect(storage.readSync(AGENT_FILE)).toBe(first);
+  });
+
+  it('keeps the EOF canary as the last non-empty line', () => {
+    seed(teamMd('| Nori | Data Engineer |'), routingMd('| Pipelines | Nori |'));
+    syncTeamCapabilities({ squadDir: SQUAD_DIR, agentFile: AGENT_FILE, storage });
+
+    const lines = storage.readSync(AGENT_FILE).split('\n').filter((l) => l.trim().length > 0);
+    expect(lines.at(-1)).toBe('<!-- SQUAD_COORDINATOR_CANARY_a8f3 -->');
+    expect(lines[0]).toBe('<!-- SQUAD_COORDINATOR_CANARY_HEAD_b7d2 -->');
+  });
+
+  it('preserves coordinator prose outside the markers', () => {
+    seed(teamMd('| Nori | Data Engineer |'), routingMd('| Pipelines | Nori |'));
+    syncTeamCapabilities({ squadDir: SQUAD_DIR, agentFile: AGENT_FILE, storage });
+
+    const doc = storage.readSync(AGENT_FILE);
+    expect(doc).toContain('Some coordinator prose.');
+    expect(doc).toContain('## Init Mode');
+    expect(doc).toContain('Init body.');
+  });
+
+  it('skips silently when there is no agent file to update', () => {
+    seed(teamMd('| Nori | Dev |'), routingMd('| Runtime | Nori |'));
+    storage.deleteSync(AGENT_FILE);
+
+    const result = syncTeamCapabilities({ squadDir: SQUAD_DIR, agentFile: AGENT_FILE, storage });
+
+    expect(result.updated).toBe(false);
+    expect(result.skipped).toBe('missing-agent-file');
+  });
+
+  it('still renders an honest empty block for an uncast squad', () => {
+    storage.writeSync(AGENT_FILE, AGENT_DOC);
+    storage.writeSync(`${SQUAD_DIR}/casting/registry.json`, JSON.stringify({
+      schema: 'squad-agent-provenance/v1',
+      schema_version: 1,
+      revision: 1,
+      generated_at: '2026-09-21T00:00:00.000Z',
+      agents: {},
+    }));
+    storage.writeSync(`${SQUAD_DIR}/casting/history.json`, JSON.stringify({
+      assignment_cast_snapshots: {},
+      universe_usage_history: [],
+    }));
+
+    const result = syncTeamCapabilities({ squadDir: SQUAD_DIR, agentFile: AGENT_FILE, storage });
+
+    expect(result.updated).toBe(true);
+    expect(result.profile.empty).toBe(true);
+    expect(storage.readSync(AGENT_FILE)).toContain('has not been cast yet');
+  });
+});
+
+describe('#1608 — squad.agent.md is fully generated, not user-authored', () => {
+  it('is declared overwrite-on-upgrade in the template manifest', () => {
+    const entry = TEMPLATE_MANIFEST.find((t) => t.destination.endsWith('squad.agent.md'));
+    expect(entry).toBeDefined();
+    expect(entry!.overwriteOnUpgrade).toBe(true);
+  });
+});
+
+describe('#1608 — coordinator cast-composition procedures regenerate capabilities', () => {
+  const template = readFileSync(resolve(__dirname, '../.squad-templates/squad.agent.md'), 'utf8');
+
+  it('regenerates after adding a member', () => {
+    const section = template.split('### Adding Team Members')[1]?.split('### Removing Team Members')[0];
+    expect(section).toContain('squad upgrade');
+    expect(section).toContain('regenerate Team Capabilities');
+  });
+
+  it('regenerates after retiring a member', () => {
+    const section = template.split('### Removing Team Members')[1]?.split('### Plugin Marketplace')[0];
+    expect(section).toContain('squad upgrade');
+    expect(section).toContain('remove stale references');
+  });
+});

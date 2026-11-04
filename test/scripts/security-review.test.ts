@@ -1,0 +1,148 @@
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const repoRoot = resolve(__dirname, '..', '..');
+const scriptPath = join(repoRoot, 'scripts', 'security-review.mjs');
+const testRoot = join(repoRoot, `.test-security-review-${process.pid}-${randomBytes(4).toString('hex')}`);
+
+function git(cwd: string, args: string[]) {
+  return execFileSync('git', args, { cwd, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+}
+
+function runSecurityReview(filePath: string, content: string) {
+  const workdir = join(testRoot, randomBytes(4).toString('hex'));
+  mkdirSync(workdir, { recursive: true });
+
+  git(workdir, ['init']);
+  git(workdir, ['config', 'user.email', 'booster@example.test']);
+  git(workdir, ['config', 'user.name', 'Booster Test']);
+  writeFileSync(join(workdir, 'README.md'), '# base\n');
+  git(workdir, ['add', 'README.md']);
+  git(workdir, ['commit', '-m', 'base']);
+
+  const absolutePath = join(workdir, ...filePath.split('/'));
+  mkdirSync(dirname(absolutePath), { recursive: true });
+  writeFileSync(absolutePath, content);
+  git(workdir, ['add', filePath]);
+  git(workdir, ['commit', '-m', 'change']);
+
+  const output = execFileSync(process.execPath, [scriptPath, 'HEAD~1', 'HEAD'], {
+    cwd: workdir,
+    encoding: 'utf-8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const [jsonText] = output.split(/\r?\n\r?\n/);
+  return JSON.parse(jsonText ?? output) as {
+    findings: Array<{ category: string; file: string }>;
+  };
+}
+
+beforeEach(() => {
+  rmSync(testRoot, { recursive: true, force: true });
+  mkdirSync(testRoot, { recursive: true });
+});
+
+afterEach(() => {
+  rmSync(testRoot, { recursive: true, force: true });
+});
+
+describe('security review unsafe git exclusions', () => {
+  // Assemble this so the scanner does not flag the fixture source; the resulting
+  // value must still match real unsafe-git prose and exercise detection.
+  const unsafeGitPhrase = [
+    'Agent history records mention git push ',
+    '--',
+    'force-with-lease as a past event.\n',
+  ].join('');
+
+  it('does not report unsafe git prose in rotated agent history archives', () => {
+    const result = runSecurityReview(
+      '.squad/agents/eecom/history-archive-2026-08-19T13-11-34.130-07-00.md',
+      unsafeGitPhrase,
+    );
+
+    expect(result.findings.some((finding) => finding.category === 'unsafe-git')).toBe(false);
+  });
+
+  it('still reports unsafe git prose in agent charters', () => {
+    const result = runSecurityReview('.squad/agents/eecom/charter.md', unsafeGitPhrase);
+
+    expect(
+      result.findings.some(
+        (finding) => finding.category === 'unsafe-git' && finding.file === '.squad/agents/eecom/charter.md',
+      ),
+    ).toBe(true);
+  });
+
+  it('does not treat path-scoped staging as git add dot', () => {
+    const result = runSecurityReview(
+      '.github/agents/example.agent.md',
+      'git add .squad/cross-machine/tasks/\n',
+    );
+
+    expect(result.findings.some((finding) => finding.category === 'unsafe-git')).toBe(false);
+  });
+
+  it('does not report explicit prohibitions as unsafe instructions', () => {
+    const command = ['git add ', '-A'].join('');
+    const result = runSecurityReview('.github/agents/example.agent.md', [
+      `Never use \`${command}\`; stage explicit paths instead.`,
+      `Do not run ${command}; stage explicit paths instead.`,
+      `Avoid ${command}; stage explicit paths instead.`,
+      `Never \`git add .\`, ${command}, or \`git commit -a\`.`,
+      `- ❌ Blanket staging (${command}) is forbidden.`,
+    ].join('\n'));
+
+    expect(result.findings.some((finding) => finding.category === 'unsafe-git')).toBe(false);
+  });
+
+  it.each([
+    ['blanket staging', ['git add ', '-A\n'].join('')],
+    ['inline Markdown', ['Run `git add ', '.` before committing.\n'].join('')],
+    ['dot slash staging', ['git add ', './\n'].join('')],
+    ['combined commit flags', ['git commit ', '-am update\n'].join('')],
+    ['do not forget instruction', ['Do not forget to run git add ', '-A\n'].join('')],
+    ['avoid-loss instruction', ['Avoid losing changes; run git add ', '-A\n'].join('')],
+    ['mixed prohibition and instruction', [
+      'Never use git add ',
+      '-A; instead run git add ',
+      '-A\n',
+    ].join('')],
+    ['sentence-separated prohibition and instruction', [
+      'Never use git add ',
+      '-A. Instead run git add ',
+      '.\n',
+    ].join('')],
+    ['comma-separated prohibition and instruction', [
+      'Do not run git add ',
+      '-A, instead run git add ',
+      '.\n',
+    ].join('')],
+  ])('reports executable unsafe git commands in %s', (_name, command) => {
+    const result = runSecurityReview('.github/agents/example.agent.md', command);
+
+    expect(result.findings.some((finding) => finding.category === 'unsafe-git')).toBe(true);
+  });
+
+  it('recognizes descriptive avoid prohibitions', () => {
+    const command = ['Avoid blanket staging with git add ', '-A\n'].join('');
+    const result = runSecurityReview('.github/agents/example.agent.md', command);
+
+    expect(result.findings.some((finding) => finding.category === 'unsafe-git')).toBe(false);
+  });
+
+  it('does not let a trailing comment suppress an unsafe command', () => {
+    const command = ['git add ', '-A # avoid orphaned files\n'].join('');
+    const result = runSecurityReview(
+      '.github/agents/example.agent.md',
+      command,
+    );
+
+    expect(result.findings.some((finding) => finding.category === 'unsafe-git')).toBe(true);
+  });
+});

@@ -5,8 +5,6 @@ description: Write MCP server configuration directly into the Squad agent file's
 
 # MCP Frontmatter — `squad init --mcp-frontmatter`
 
-> ⚠️ **Experimental** — Squad is alpha software. APIs, commands, and behavior may change between releases.
-
 **Try this when your agent harness reads frontmatter-level MCP config:**
 ```bash
 squad init --mcp-frontmatter
@@ -41,7 +39,7 @@ Without `--mcp-frontmatter` (default), the agent file frontmatter is:
 ---
 name: squad
 description: Squad coordinator
-model: claude-opus-4.5
+model: claude-opus-5
 tools: ["*"]
 ---
 ```
@@ -66,7 +64,7 @@ With `--mcp-frontmatter`, the MCP server moves into the frontmatter:
 ---
 name: squad
 description: Squad coordinator
-model: claude-opus-4.5
+model: claude-opus-5
 tools: ["*"]
 mcpServers:
   squad_state:

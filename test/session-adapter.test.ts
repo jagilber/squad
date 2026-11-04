@@ -120,6 +120,15 @@ describe('CopilotSessionAdapter (via SquadClient)', () => {
     expect(mockSession.on).toHaveBeenCalledWith('assistant.usage', expect.any(Function));
   });
 
+  it('on() maps context_usage → session.usage_info', async () => {
+    const { session, mockSession } = await createAdaptedSession();
+
+    const handler = vi.fn();
+    session.on('context_usage', handler);
+
+    expect(mockSession.on).toHaveBeenCalledWith('session.usage_info', expect.any(Function));
+  });
+
   // --- Event data normalization ---
 
   it('normalizes SDK event data: flattens event.data and maps type back', async () => {
@@ -160,7 +169,7 @@ describe('CopilotSessionAdapter (via SquadClient)', () => {
       parentId: null,
       ephemeral: true,
       type: 'assistant.usage',
-      data: { model: 'gpt-4', inputTokens: 100, outputTokens: 50 },
+      data: { model: 'gpt-5.6-luna', inputTokens: 100, outputTokens: 50 },
     };
     mockSession._emit('assistant.usage', sdkEvent);
 
@@ -169,6 +178,29 @@ describe('CopilotSessionAdapter (via SquadClient)', () => {
     expect(received.type).toBe('usage');
     expect(received.inputTokens).toBe(100);
     expect(received.outputTokens).toBe(50);
+  });
+
+  it('normalizes session.usage_info events with exact context counts', async () => {
+    const { session, mockSession } = await createAdaptedSession();
+
+    const handler = vi.fn();
+    session.on('context_usage', handler);
+
+    mockSession._emit('session.usage_info', {
+      id: 'evt-3',
+      timestamp: '2026-02-22T10:00:02Z',
+      parentId: null,
+      ephemeral: true,
+      type: 'session.usage_info',
+      data: { currentTokens: 1_200, tokenLimit: 2_000, messagesLength: 8 },
+    });
+
+    expect(handler).toHaveBeenCalledOnce();
+    const received = handler.mock.calls[0][0];
+    expect(received.type).toBe('context_usage');
+    expect(received.currentTokens).toBe(1_200);
+    expect(received.tokenLimit).toBe(2_000);
+    expect(received.messagesLength).toBe(8);
   });
 
   // --- off() / unsubscribe ---
@@ -271,7 +303,7 @@ describe('CopilotSessionAdapter (via SquadClient)', () => {
     mockSession._emit('assistant.usage', {
       id: 'e2', timestamp: 'ts', parentId: null, ephemeral: true,
       type: 'assistant.usage',
-      data: { model: 'gpt-4', inputTokens: 200, outputTokens: 80 },
+      data: { model: 'gpt-5.6-luna', inputTokens: 200, outputTokens: 80 },
     });
 
     expect(captured).not.toBeNull();

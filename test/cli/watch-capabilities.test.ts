@@ -8,7 +8,7 @@
  * Prioritized by risk: execute > cleanup > decision-hygiene > self-pull > board.
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { WatchContext } from '../../packages/squad-cli/src/cli/commands/watch/types.js';
 
 // ── Shared mock state (hoisted alongside vi.mock) ───────────────────
@@ -18,7 +18,13 @@ const {
   mockExecFile,
   mockExecFileSync,
   mockFsExistsSync,
+  mockFsMkdirSync,
+  mockFsReadFileSync,
+  mockFsUnlinkSync,
+  mockFsWriteFileSync,
   mockRmSync,
+  mockListModels,
+  mockDisconnect,
 } = vi.hoisted(() => ({
   mockStorage: {
     existsSync: vi.fn(() => true),
@@ -33,13 +39,28 @@ const {
   }),
   mockExecFileSync: vi.fn((): string => ''),
   mockFsExistsSync: vi.fn((): boolean => false),
+  mockFsMkdirSync: vi.fn(),
+  mockFsReadFileSync: vi.fn((): string => ''),
+  mockFsUnlinkSync: vi.fn(),
+  mockFsWriteFileSync: vi.fn(),
   mockRmSync: vi.fn(),
+  mockListModels: vi.fn().mockResolvedValue([]),
+  mockDisconnect: vi.fn().mockResolvedValue(undefined),
 }));
 
 // ── Module mocks ────────────────────────────────────────────────────
 
 vi.mock('@bradygaster/squad-sdk', () => ({
   FSStorageProvider: vi.fn(function () { return mockStorage; }),
+}));
+
+vi.mock('@bradygaster/squad-sdk/client', () => ({
+  SquadClient: vi.fn(function () {
+    return {
+      listModels: mockListModels,
+      disconnect: mockDisconnect,
+    };
+  }),
 }));
 
 vi.mock('node:child_process', () => ({
@@ -49,6 +70,10 @@ vi.mock('node:child_process', () => ({
 
 vi.mock('node:fs', () => ({
   existsSync: mockFsExistsSync,
+  mkdirSync: mockFsMkdirSync,
+  readFileSync: mockFsReadFileSync,
+  unlinkSync: mockFsUnlinkSync,
+  writeFileSync: mockFsWriteFileSync,
   rmSync: mockRmSync,
 }));
 
@@ -62,6 +87,7 @@ import {
 import type { ExecutableWorkItem } from '../../packages/squad-cli/src/cli/commands/watch/capabilities/execute.js';
 import { CleanupCapability } from '../../packages/squad-cli/src/cli/commands/watch/capabilities/cleanup.js';
 import { DecisionHygieneCapability } from '../../packages/squad-cli/src/cli/commands/watch/capabilities/decision-hygiene.js';
+import { RetroCapability } from '../../packages/squad-cli/src/cli/commands/watch/capabilities/retro.js';
 import { BoardCapability } from '../../packages/squad-cli/src/cli/commands/watch/capabilities/board.js';
 import { SelfPullCapability } from '../../packages/squad-cli/src/cli/commands/watch/capabilities/self-pull.js';
 
@@ -70,6 +96,7 @@ import { SelfPullCapability } from '../../packages/squad-cli/src/cli/commands/wa
 function makeContext(overrides: Partial<WatchContext> = {}): WatchContext {
   return {
     teamRoot: '/fake/team',
+    stateRoot: '/fake/team/.squad',
     adapter: {
       listWorkItems: vi.fn().mockResolvedValue([]),
     } as unknown as WatchContext['adapter'],
@@ -100,7 +127,11 @@ describe('Watch Capabilities', () => {
     mockStorage.existsSync.mockReturnValue(true);
     mockStorage.listSync.mockReturnValue([]);
     mockFsExistsSync.mockReturnValue(false);
+    mockFsMkdirSync.mockReturnValue(undefined);
+    mockFsReadFileSync.mockReturnValue('');
     mockRmSync.mockReturnValue(undefined);
+    mockListModels.mockResolvedValue([]);
+    mockDisconnect.mockResolvedValue(undefined);
     mockExecFile.mockImplementation((...args: unknown[]) => {
       const cb = findCallback(args);
       if (cb) cb(null, '', '');
@@ -199,18 +230,37 @@ describe('Watch Capabilities', () => {
         // TEMPLATE_MANIFEST destination ('ralph-instructions.md' under .squad/)
         // matches the lookup in execute.ts.
         mockFsExistsSync.mockImplementation((p: unknown) => {
-          return typeof p === 'string' && p.endsWith('.squad/ralph-instructions.md');
+          return typeof p === 'string' && p.replace(/\\/g, '/').endsWith('.squad/ralph-instructions.md');
         });
         const issues: ExecutableWorkItem[] = [
           { number: 1, title: 'Task', labels: [{ name: 'squad' }], assignees: [] },
         ];
         const prompt = buildAgentPrompt(issues, '/some/repo');
         expect(mockFsExistsSync).toHaveBeenCalledWith(
-          expect.stringContaining('.squad/ralph-instructions.md'),
+          expect.stringMatching(/\.squad[\\/]ralph-instructions\.md$/),
         );
         // Path must be constructed from teamRoot, not a global path
         const [calledPath] = mockFsExistsSync.mock.calls[0] as [string];
-        expect(calledPath).toContain('/some/repo');
+        expect(calledPath.replace(/\\/g, '/')).toContain('/some/repo');
+        expect(prompt).toContain('Ralph, Go!');
+      });
+
+      // Regression (#1490): a 2-arg call still derives the check from
+      // teamRoot + '.squad' (unchanged, backward compatible), but the
+      // real caller (ExecuteCapability.executeAll) now passes
+      // context.stateRoot as the 3rd arg, which must win when given —
+      // that's what lets ralph-instructions.md be found after externalize.
+      it('checks ralph-instructions.md under the passed stateDir when given, not teamRoot/.squad', () => {
+        mockFsExistsSync.mockImplementation((p: unknown) => {
+          return typeof p === 'string' && p.endsWith('ralph-instructions.md');
+        });
+        const issues: ExecutableWorkItem[] = [
+          { number: 1, title: 'Task', labels: [{ name: 'squad' }], assignees: [] },
+        ];
+        const prompt = buildAgentPrompt(issues, '/local/repo', '/external/state');
+        const [calledPath] = mockFsExistsSync.mock.calls[0] as [string];
+        expect(calledPath.replace(/\\/g, '/')).toBe('/external/state/ralph-instructions.md');
+        expect(calledPath.replace(/\\/g, '/')).not.toContain('/local/repo');
         expect(prompt).toContain('Ralph, Go!');
       });
 
@@ -323,6 +373,76 @@ describe('Watch Capabilities', () => {
         expect(result.success).toBe(true);
         expect(result.summary).toContain('agent dispatched');
         expect(result.data?.dispatched).toBe(1);
+        expect(result.data?.executed).toBe(1);
+      });
+
+      it('reports estimated context utilization from Copilot usage output', async () => {
+        mockFsExistsSync.mockReturnValue(true);
+        mockFsReadFileSync.mockReturnValue(JSON.stringify({
+          currentModel: 'gpt-5.4',
+          lastCallInputTokens: 80_000,
+          lastCallOutputTokens: 20_000,
+        }));
+        mockListModels.mockResolvedValue([{
+          id: 'gpt-5.4',
+          name: 'GPT-5.4',
+          capabilities: { limits: { max_context_window_tokens: 200_000 } },
+        }]);
+        const cap = new ExecuteCapability();
+        const ctx = makeContext({
+          adapter: mockAdapter([{ id: 1, title: 'Fix bug', tags: ['squad:eecom'] }]),
+        });
+
+        const result = await cap.execute(ctx);
+
+        expect(result.success).toBe(true);
+        expect(result.summary).toContain('context 50.0% (estimated)');
+        expect(result.data?.contextUtilization).toEqual({
+          model: 'gpt-5.4',
+          occupiedTokens: 100_000,
+          contextWindowTokens: 200_000,
+          utilization: 0.5,
+          source: 'estimated',
+        });
+        expect(mockFsUnlinkSync).toHaveBeenCalledWith(
+          expect.stringMatching(/context-usage-.*\.json$/),
+        );
+        expect(mockDisconnect).toHaveBeenCalledOnce();
+      });
+
+      it('does not add Copilot usage flags to a custom agent command', async () => {
+        const cap = new ExecuteCapability();
+        const ctx = makeContext({
+          agentCmd: 'my-agent --flag',
+          adapter: mockAdapter([{ id: 1, title: 'Fix bug', tags: ['squad'] }]),
+        });
+
+        await cap.execute(ctx);
+
+        const args = mockExecFile.mock.calls.at(-1)?.[1] as string[];
+        expect(args).not.toContain('--usage-output-file');
+        expect(mockFsMkdirSync).not.toHaveBeenCalledWith(
+          expect.stringMatching(/[\\/]log$/),
+          expect.anything(),
+        );
+      });
+
+      it('still dispatches when usage capture cannot be initialized', async () => {
+        mockFsMkdirSync.mockImplementation(() => {
+          throw new Error('read-only state');
+        });
+        const cap = new ExecuteCapability();
+        const ctx = makeContext({
+          adapter: mockAdapter([{ id: 1, title: 'Fix bug', tags: ['squad'] }]),
+        });
+
+        const result = await cap.execute(ctx);
+
+        expect(result.success).toBe(true);
+        expect(result.summary).toContain('context telemetry unavailable');
+        expect(result.data?.contextTelemetryError).toContain('read-only state');
+        const args = mockExecFile.mock.calls.at(-1)?.[1] as string[];
+        expect(args).not.toContain('--usage-output-file');
       });
 
       it('handles adapter errors gracefully', async () => {
@@ -523,6 +643,40 @@ describe('Watch Capabilities', () => {
         expect(result.summary).toContain('nothing to do');
       });
     });
+
+    // Regression (#1490): before the fix, every path here was built from
+    // teamRoot + '.squad', so after `squad externalize` the local .squad/
+    // is a marker-only stub and every check silently sees an empty
+    // directory. Give teamRoot and stateRoot different fake roots and
+    // confirm the capability only ever looks under stateRoot.
+    describe('externalized state (#1490)', () => {
+      it('preflight checks stateRoot, not teamRoot/.squad', async () => {
+        mockStorage.existsSync.mockImplementation((dir: string) => dir === '/external/state');
+        const cap = new CleanupCapability();
+        const result = await cap.preflight(
+          makeContext({ teamRoot: '/local/repo', stateRoot: '/external/state' }),
+        );
+        expect(result.ok).toBe(true);
+        expect(mockStorage.existsSync).toHaveBeenCalledWith('/external/state');
+      });
+
+      it('execute lists scratch/orchestration-log/log/inbox under stateRoot, not teamRoot', async () => {
+        const seenDirs: string[] = [];
+        mockStorage.listSync.mockImplementation((dir: string) => {
+          seenDirs.push(dir);
+          return [];
+        });
+        const cap = new CleanupCapability();
+        await cap.execute(makeContext({ teamRoot: '/local/repo', stateRoot: '/external/state', round: 1 }));
+
+        expect(seenDirs.length).toBeGreaterThan(0);
+        for (const dir of seenDirs) {
+          const normalized = dir.replace(/\\/g, '/');
+          expect(normalized.startsWith('/external/state')).toBe(true);
+          expect(normalized.includes('/local/repo')).toBe(false);
+        }
+      });
+    });
   });
 
   // ────────────────────────────────────────────────────────────────
@@ -604,6 +758,90 @@ describe('Watch Capabilities', () => {
         const result = await cap.execute(makeContext());
         expect(result.success).toBe(true);
         expect(result.summary).toContain('no decision inbox');
+      });
+    });
+
+    // Regression (#1490): preflight/execute both built the inbox path from
+    // teamRoot + '.squad' — after externalize the inbox lives at stateRoot
+    // instead, and the old code silently never found it.
+    describe('externalized state (#1490)', () => {
+      it('preflight/execute both check the inbox under stateRoot, not teamRoot', async () => {
+        mockStorage.existsSync.mockImplementation((dir: string) => dir.replace(/\\/g, '/').startsWith('/external/state'));
+        const seenDirs: string[] = [];
+        mockStorage.listSync.mockImplementation((dir: string) => {
+          seenDirs.push(dir);
+          return ['a.md', 'b.md', 'c.md', 'd.md', 'e.md', 'f.md'];
+        });
+        const cap = new DecisionHygieneCapability();
+        const ctx = makeContext({ teamRoot: '/local/repo', stateRoot: '/external/state' });
+
+        const preflight = await cap.preflight(ctx);
+        expect(preflight.ok).toBe(true);
+
+        const result = await cap.execute(ctx);
+        expect(result.success).toBe(true);
+        expect(result.summary).toContain('merged');
+        expect(seenDirs.length).toBeGreaterThan(0);
+        for (const dir of seenDirs) {
+          expect(dir.replace(/\\/g, '/').startsWith('/external/state')).toBe(true);
+        }
+      });
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────
+  // RetroCapability — retrospective staleness check + write
+  // ────────────────────────────────────────────────────────────────
+
+  describe('RetroCapability', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-08-27T12:00:00Z'));
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    describe('execute', () => {
+      it('reports not due when a recent retrospective log exists', async () => {
+        const today = new Date().toISOString().slice(0, 10);
+        mockStorage.listSync.mockReturnValue([`${today}-retrospective.md`]);
+        const cap = new RetroCapability();
+        const result = await cap.execute(makeContext());
+        expect(result.success).toBe(true);
+        expect(result.summary).toBe('retro not due');
+      });
+
+      // Regression (#1490): the staleness check listed teamRoot + '.squad/log'
+      // — after externalize that's the local marker dir (empty), so the
+      // capability always saw "no retro found" and fired on every round
+      // regardless of an existing, externalized retrospective log.
+      it('checks log/ under stateRoot, not teamRoot, for existing retrospectives', async () => {
+        const today = new Date().toISOString().slice(0, 10);
+        const seenDirs: string[] = [];
+        mockStorage.listSync.mockImplementation((dir: string) => {
+          seenDirs.push(dir);
+          return dir.replace(/\\/g, '/') === '/external/state/log' ? [`${today}-retrospective.md`] : [];
+        });
+        const cap = new RetroCapability();
+        const result = await cap.execute(
+          makeContext({ teamRoot: '/local/repo', stateRoot: '/external/state' }),
+        );
+        expect(seenDirs.map(d => d.replace(/\\/g, '/'))).toContain('/external/state/log');
+        expect(result.summary).toBe('retro not due');
+      });
+
+      it('runs a retrospective on Friday afternoon even when one exists today', async () => {
+        vi.setSystemTime(new Date('2026-08-28T15:00:00Z'));
+        mockStorage.listSync.mockReturnValue(['2026-08-28-retrospective.md']);
+
+        const cap = new RetroCapability();
+        const result = await cap.execute(makeContext());
+
+        expect(result.success).toBe(true);
+        expect(result.summary).toBe('retrospective completed');
+        expect(mockExecFile).toHaveBeenCalledOnce();
       });
     });
   });
