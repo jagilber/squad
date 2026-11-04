@@ -1,5 +1,6 @@
 {
   "version": 1,
   "defaultModel": "claude-sonnet-4.6",
-  "dispatchEnforcement": "warn"
+  "dispatchEnforcement": "warn",
+  "fallbackAgent": "flight"
 }
