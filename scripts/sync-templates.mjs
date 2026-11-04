@@ -12,11 +12,12 @@
  *                                      squad.agent.md with translated front
  *                                      matter; see toClaudeSubagentDoc below)
  *
- * Only copies files that exist in .squad-templates/. Target directories
- * that don't exist are skipped with a warning.
+ * The managed skills subtree is replaced as an exact set so removed canonical
+ * skills cannot survive indefinitely in package artifacts. Other template
+ * paths are copied additively for backward compatibility.
  */
 
-import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, rmSync, statSync } from 'node:fs';
 import { join, dirname, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -30,8 +31,7 @@ const ROOT = join(__dirname, '..');
 // ---------------------------------------------------------------------------
 const explicitFlag = process.argv.includes('--sync');
 const envFlag = process.env.SQUAD_SYNC_TEMPLATES === '1';
-const directInvocation = process.argv.length <= 2;
-if (!directInvocation && !explicitFlag && !envFlag) {
+if (!explicitFlag && !envFlag) {
   console.log('⛔ sync-templates requires explicit invocation.');
   console.log('   Use: node scripts/sync-templates.mjs --sync');
   console.log('   Or:  SQUAD_SYNC_TEMPLATES=1 node scripts/sync-templates.mjs');
@@ -151,6 +151,13 @@ if (!existsSync(SOURCE)) {
 const sourceFiles = collectFiles(SOURCE);
 let totalCopied = 0;
 
+for (const targetDir of MIRROR_TARGETS) {
+  if (!existsSync(targetDir)) continue;
+  const managedSkillsDir = join(targetDir, 'skills');
+  rmSync(managedSkillsDir, { recursive: true, force: true });
+  mkdirSync(managedSkillsDir, { recursive: true });
+}
+
 for (const relFile of sourceFiles) {
   const srcPath = join(SOURCE, relFile);
   const targets = [];
@@ -170,6 +177,10 @@ for (const relFile of sourceFiles) {
   // Special case: squad.agent.md also goes to .github/agents/
   if (relFile === AGENT_MD_FILE && existsSync(AGENT_MD_TARGET)) {
     targets.push(join(AGENT_MD_TARGET, AGENT_MD_FILE));
+  }
+
+  if (relFile === 'skills/gh-aw-enlistment/SKILL.md') {
+    targets.push(join(ROOT, 'workflows', relFile));
   }
 
   if (targets.length === 0) continue;

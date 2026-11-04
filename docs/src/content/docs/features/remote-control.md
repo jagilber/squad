@@ -1,8 +1,5 @@
 # Squad Remote Control
 
-> ⚠️ **Experimental** — Squad is alpha software. APIs, commands, and behavior may change between releases.
-
-
 Control Copilot CLI from your phone via a secure WebSocket tunnel. Perfect for demos, pairing on mobile, or monitoring runs from anywhere.
 
 ```bash
@@ -24,7 +21,7 @@ squad start --tunnel
 Architecture diagram:
 
 ```
-[Copilot CLI in PTY] 
+[Copilot CLI in PTY]
     ↓ (terminal output/input)
 [WebSocket Server]
     ↓ (bidirectional)
@@ -88,7 +85,7 @@ squad start --tunnel
 #         Session ID: abc123xyz
 #         QR Code: [████████████████]
 #         URL: https://abc123xyz-dev.devtunnels.ms
-#         
+#
 #         Tap or scan QR on your phone → terminal appears
 ```
 
@@ -120,7 +117,7 @@ All flags after `--tunnel` pass to copilot:
 
 ```bash
 squad start --tunnel --yolo
-squad start --tunnel --model gpt-4
+squad start --tunnel --model gpt-5.6-luna
 squad start --tunnel --no-config
 ```
 

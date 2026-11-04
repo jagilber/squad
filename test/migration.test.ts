@@ -309,6 +309,52 @@ describe('MarkdownMigration', () => {
       expect(warnings).toHaveLength(0);
     });
 
+    it('should parse the legacy Team Roster table heading', () => {
+      const md = `
+## Team Roster
+
+| Name | Role |
+|------|------|
+| Alpha | Developer |
+`;
+      const { agents } = parseTeamMarkdown(md);
+
+      expect(agents).toEqual([
+        expect.objectContaining({ name: 'alpha', role: 'Developer' }),
+      ]);
+    });
+
+    it('should ignore tables outside supported roster sections', () => {
+      const md = `
+## Members
+
+| Name | Role | Skills |
+|------|------|--------|
+| Alpha | Developer | TypeScript |
+
+## Human Members
+
+| Name | Role | Skills |
+|------|------|--------|
+| Casey | Product Owner | Planning |
+
+## Existing Project Agents Reused
+
+| Name | Role | Skills |
+|------|------|--------|
+| Existing | Engineer | Reuse |
+
+## Project Notes
+
+| Description | Owner | Status |
+|-------------|-------|--------|
+| A project note | Alpha | Current |
+`;
+      const { agents } = parseTeamMarkdown(md);
+
+      expect(agents.map((agent) => agent.name)).toEqual(['alpha']);
+    });
+
     it('should parse section format', () => {
       const md = `
 ## Team Members
@@ -381,6 +427,53 @@ describe('MarkdownMigration', () => {
     it('should warn when no rules found', () => {
       const { warnings } = parseRoutingRulesMarkdown('## Routing Table\nEmpty');
       expect(warnings.length).toBeGreaterThan(0);
+    });
+
+    it("should parse ## Work Type \u2192 Agent heading (this project's routing.md format)", () => {
+      const md = `
+## Work Type \u2192 Agent
+
+| Work Type | Agent | Examples |
+|-----------|-------|---------|
+| Core runtime | EECOM | adapter, session pool |
+| Tests | FIDO | unit tests, coverage |
+`;
+      const { rules, warnings } = parseRoutingRulesMarkdown(md);
+      expect(rules).toHaveLength(2);
+      expect(rules[0]!.workType).toBe('Core runtime');
+      expect(rules[0]!.agents).toEqual(['EECOM']);
+      expect(rules[1]!.workType).toBe('Tests');
+      expect(warnings).toHaveLength(0);
+    });
+
+    it('should expose agent references from module ownership', () => {
+      const md = `## Routing Table
+
+| Work Type | Route To |
+|-----------|----------|
+| feature | Lead |
+
+## Module Ownership
+
+| Module | Primary | Secondary |
+|--------|---------|-----------|
+| src/cli | EECOM | CONTROL |
+| src/docs | PAO | — |
+`;
+      const { agentReferences } = parseRoutingRulesMarkdown(md);
+      expect(agentReferences).toEqual(['Lead', 'EECOM', 'CONTROL', 'PAO']);
+    });
+
+    it('should parse primary and secondary routing agents', () => {
+      const md = `## Routing Table
+
+| Work Type | Primary | Secondary |
+|-----------|---------|-----------|
+| feature | EECOM | CONTROL, FIDO |
+`;
+      const { rules, agentReferences } = parseRoutingRulesMarkdown(md);
+      expect(rules[0]!.agents).toEqual(['EECOM', 'CONTROL', 'FIDO']);
+      expect(agentReferences).toEqual(['EECOM', 'CONTROL', 'FIDO']);
     });
   });
 

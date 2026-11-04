@@ -7,7 +7,8 @@
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { FSStorageProvider, toClaudeSubagentDoc } from '@bradygaster/squad-sdk';
+import { FSStorageProvider, stripTeamCapabilitiesBlock, syncTeamCapabilities, toClaudeSubagentDoc } from '@bradygaster/squad-sdk';
+import { ensureCastingRegistryPair, preflightCastingRegistryPair } from '@bradygaster/squad-sdk/casting';
 import { success, warn, info, dim, bold } from './output.js';
 import { fatal } from './errors.js';
 import { detectSquadDir } from './detect-squad-dir.js';
@@ -15,7 +16,8 @@ import { TEMPLATE_MANIFEST, getTemplatesDir } from './templates.js';
 import { runMigrations } from './migrations.js';
 import { scrubEmails } from './email-scrub.js';
 import { getPackageVersion, stampVersion, readInstalledVersion } from './version.js';
-import { resolveSquadStateMcpSpec, type SquadStateMcpSpec } from './mcp-spec.js';
+import { projectSquadStateMcpSpec, resolveSquadStateMcpSpec, type SquadStateMcpSpec } from './mcp-spec.js';
+import { copyManagedFile, syncCopilotInstructionsFile, writeManagedText } from './managed-file.js';
 export { resolveSquadStateMcpSpec } from './mcp-spec.js';
 import { ensureSquadStateMcpInRoot, tombstoneStaleSquadStateInProjectMcp } from './mcp-root.js';
 
@@ -140,7 +142,7 @@ function copyDirRecursive(src: string, dest: string, force = true): void {
     if (storage.isDirectorySync(srcEntry)) {
       copyDirRecursive(srcEntry, destEntry, force);
     } else if (force || !storage.existsSync(destEntry)) {
-      storage.copySync(srcEntry, destEntry);
+      copyManagedFile(srcEntry, destEntry);
     }
   }
 }
@@ -238,7 +240,7 @@ function detectIsGitHubForMcp(dest: string, config: Record<string, unknown>): bo
   return true;
 }
 
-function writeAgentTemplate(agentSrc: string, agentDest: string, cliVersion: string, mcpConfigMode: McpConfigMode, isGitHub: boolean, options?: { dryRun?: boolean }): void {
+function writeAgentTemplate(agentSrc: string, agentDest: string, cliVersion: string, mcpConfigMode: McpConfigMode, isGitHub: boolean, options?: { dryRun?: boolean; squadDir?: string }): void {
   let agentContent = storage.readSync(agentSrc) ?? '';
   if (mcpConfigMode === 'agent-frontmatter') {
     agentContent = injectMcpFrontmatter(agentContent, isGitHub, cliVersion);
@@ -246,11 +248,14 @@ function writeAgentTemplate(agentSrc: string, agentDest: string, cliVersion: str
 
   // Back up locally-customized squad.agent.md before overwriting (#1052)
   if (storage.existsSync(agentDest)) {
-    const existing = (storage.readSync(agentDest) ?? '').replace(/\r\n/g, '\n');
+    const existing = storage.readSync(agentDest) ?? '';
     // Strip the version stamp before comparing (version line changes every upgrade)
     const stripVersion = (s: string) => s.replace(/<!-- squad-cli v[\d.]+[-\w.]* -->\n?/g, '');
-    const normalizedExisting = stripVersion(existing);
-    const normalizedTemplate = stripVersion(agentContent.replace(/\r\n/g, '\n'));
+    // Strip the generated Team Capabilities block too (#1608) — it is machine
+    // written on every cast change and must not read as a user customization.
+    const normalize = (s: string) => stripTeamCapabilitiesBlock(stripVersion(s));
+    const normalizedExisting = normalize(existing.replace(/\r\n/g, '\n'));
+    const normalizedTemplate = normalize(agentContent.replace(/\r\n/g, '\n'));
 
     if (normalizedExisting !== normalizedTemplate && normalizedExisting.trim().length > 0) {
       const backupPath = agentDest + '.local-backup';
@@ -270,8 +275,22 @@ function writeAgentTemplate(agentSrc: string, agentDest: string, cliVersion: str
     return;
   }
 
-  storage.writeSync(agentDest, agentContent);
+  writeManagedText(agentDest, agentContent);
   stampVersion(agentDest, cliVersion);
+
+  // Re-advertise the current cast to outer coordinators (#1608). An upgrade
+  // still succeeds if rendering fails, but the stale-data risk is surfaced.
+  if (options?.squadDir) {
+    try {
+      syncTeamCapabilities({ squadDir: options.squadDir, agentFile: agentDest, storage });
+    } catch (error) {
+      warn(
+        `Could not refresh squad.agent.md team capabilities: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
 }
 
 /**
@@ -304,7 +323,7 @@ function writeClaudeAgentTemplate(
   agentSrc: string,
   claudeDest: string | null,
   cliVersion: string,
-  options?: { dryRun?: boolean },
+  options?: { dryRun?: boolean; squadDir?: string },
 ): boolean {
   if (!claudeDest) return false;
   if (!storage.existsSync(agentSrc)) return false;
@@ -320,6 +339,20 @@ function writeClaudeAgentTemplate(
   storage.mkdirSync(path.dirname(claudeDest), { recursive: true });
   storage.writeSync(claudeDest, content);
   stampVersion(claudeDest, cliVersion);
+
+  // Keep the body identical to squad.agent.md, which carries the generated
+  // Team Capabilities block (#1608).
+  if (options?.squadDir) {
+    try {
+      syncTeamCapabilities({ squadDir: options.squadDir, agentFile: claudeDest, storage });
+    } catch (error) {
+      warn(
+        `Could not refresh .claude/agents/squad.md team capabilities: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
   return true;
 }
 
@@ -510,14 +543,30 @@ function generateProjectWorkflowStub(workflowFile: string, projectType: string):
  * Write workflow file: verbatim copy for npm, stub for others
  */
 function writeWorkflowFile(file: string, srcPath: string, destPath: string, projectType: string): void {
+  const backupIfCustomized = (nextContent: string): void => {
+    if (!storage.existsSync(destPath)) return;
+
+    const existing = storage.readSync(destPath) ?? '';
+    const normalizedExisting = existing.replace(/\r\n/g, '\n');
+    const normalizedNext = nextContent.replace(/\r\n/g, '\n');
+
+    if (normalizedExisting !== normalizedNext && normalizedExisting.trim().length > 0) {
+      const backupPath = destPath + '.local-backup';
+      storage.writeSync(backupPath, existing);
+      warn(`${file} has local customizations — backed up to ${path.basename(backupPath)}`);
+    }
+  };
+
   if (projectType !== 'npm' && PROJECT_TYPE_SENSITIVE_WORKFLOWS.has(file)) {
     const stub = generateProjectWorkflowStub(file, projectType);
     if (stub) {
-      storage.writeSync(destPath, stub);
+      backupIfCustomized(stub);
+      writeManagedText(destPath, stub);
       return;
     }
   }
-  storage.copySync(srcPath, destPath);
+  backupIfCustomized(storage.readSync(srcPath) ?? '');
+  copyManagedFile(srcPath, destPath);
 }
 
 /* ── Infrastructure ensure functions ────────────────────────────── */
@@ -567,7 +616,7 @@ export function ensureGitattributes(dest: string): string[] {
   if (added.length > 0) {
     const suffix = content.length > 0 && !content.endsWith('\n') ? '\n' : '';
     try {
-      storage.writeSync(filePath, content + suffix + added.join('\n') + '\n');
+      writeManagedText(filePath, content + suffix + added.join('\n') + '\n');
     } catch (err: unknown) {
       if (err instanceof Error && 'code' in err && ['EPERM', 'EACCES'].includes((err as NodeJS.ErrnoException).code ?? '')) {
         warn('Could not update .gitattributes (read-only). Add merge=union entries manually.');
@@ -614,7 +663,7 @@ export function ensureGitignore(dest: string): string[] {
   }
   if (added.length > 0) {
     const suffix = content.length > 0 && !content.endsWith('\n') ? '\n' : '';
-    storage.writeSync(filePath, content + suffix + added.join('\n') + '\n');
+    writeManagedText(filePath, content + suffix + added.join('\n') + '\n');
   }
   return added;
 }
@@ -642,13 +691,6 @@ export function ensureDirectories(dest: string): string[] {
 export function ensureCastingDefaults(dest: string, templatesDir?: string): string[] {
   const castingDir = path.join(dest, '.squad', 'casting');
 
-  // Map destination file → template file name
-  const templateMap: Array<{ name: string; templateName: string; fallback: string }> = [
-    { name: 'registry.json', templateName: 'casting-registry.json', fallback: JSON.stringify({ agents: {} }, null, 2) + '\n' },
-    { name: 'policy.json', templateName: 'casting-policy.json', fallback: JSON.stringify({ casting_policy_version: '1.1', allowlist_universes: [], universe_capacity: {} }, null, 2) + '\n' },
-    { name: 'history.json', templateName: 'casting-history.json', fallback: JSON.stringify({ universe_usage_history: [], assignment_cast_snapshots: {} }, null, 2) + '\n' },
-  ];
-
   // Use caller-provided templatesDir when available; resolve once otherwise
   let tDir = templatesDir;
   if (!tDir) {
@@ -659,31 +701,50 @@ export function ensureCastingDefaults(dest: string, templatesDir?: string): stri
     }
   }
 
+  const templateContent = (templateName: string, fallback: string): string => {
+    if (!tDir) return fallback;
+    const templatePath = path.join(tDir, templateName);
+    return storage.existsSync(templatePath)
+      ? (storage.readSync(templatePath) ?? fallback)
+      : fallback;
+  };
+
   const created: string[] = [];
-  for (const file of templateMap) {
-    const filePath = path.join(castingDir, file.name);
-    if (!storage.existsSync(filePath)) {
-      // Prefer shipped template content; fall back to inline JSON
-      let content = file.fallback;
-      if (tDir) {
-        const tplPath = path.join(tDir, file.templateName);
-        if (storage.existsSync(tplPath)) {
-          const tplContent = storage.readSync(tplPath);
-          if (tplContent) content = tplContent;
-        }
-      }
-      try {
-        storage.mkdirSync(castingDir, { recursive: true });
-        storage.writeSync(filePath, content);
-        created.push(`.squad/casting/${file.name}`);
-      } catch (err: unknown) {
-        if (err instanceof Error && 'code' in err && ['EPERM', 'EACCES'].includes((err as NodeJS.ErrnoException).code ?? '')) {
-          warn(`Could not write ${file.name} to .squad/casting/ (read-only). Create it manually.`);
-          return created;
-        }
-        throw err;
-      }
+  try {
+    storage.mkdirSync(castingDir, { recursive: true });
+    const pair = ensureCastingRegistryPair(
+      castingDir,
+      templateContent(
+        'casting-registry.json',
+        JSON.stringify({ schema: 'squad-agent-provenance/v1', schema_version: 1, revision: 1, generated_at: '1970-01-01T00:00:00.000Z', agents: {} }, null, 2) + '\n',
+      ),
+      templateContent(
+        'casting-history.json',
+        JSON.stringify({ universe_usage_history: [], assignment_cast_snapshots: {} }, null, 2) + '\n',
+      ),
+      'CLI upgrade',
+    );
+    if (pair.created) {
+      created.push('.squad/casting/registry.json', '.squad/casting/history.json');
     }
+
+    const policyPath = path.join(castingDir, 'policy.json');
+    if (!storage.existsSync(policyPath)) {
+      storage.writeSync(
+        policyPath,
+        templateContent(
+          'casting-policy.json',
+          JSON.stringify({ casting_policy_version: '1.1', allowlist_universes: [], universe_capacity: {} }, null, 2) + '\n',
+        ),
+      );
+      created.push('.squad/casting/policy.json');
+    }
+  } catch (err: unknown) {
+    if (err instanceof Error && 'code' in err && ['EPERM', 'EACCES'].includes((err as NodeJS.ErrnoException).code ?? '')) {
+      warn('Could not write casting defaults to .squad/casting/ (read-only). Create them manually.');
+      return created;
+    }
+    throw err;
   }
   return created;
 }
@@ -792,7 +853,7 @@ function syncAllSkills(dest: string, templatesDir: string): number {
 
     warnIfSkillCustomized(srcPath, destPath, entry.source);
     storage.mkdirSync(path.dirname(destPath), { recursive: true });
-    storage.copySync(srcPath, destPath);
+    copyManagedFile(srcPath, destPath);
     synced++;
   }
   return synced;
@@ -813,7 +874,7 @@ function refreshSquadTemplatesDir(dest: string, templatesDir: string): void {
     if (storage.isDirectorySync(srcPath)) {
       copyDirRecursive(srcPath, destPath);
     } else {
-      storage.copySync(srcPath, destPath);
+      copyManagedFile(srcPath, destPath);
     }
   }
 }
@@ -895,6 +956,15 @@ async function runEnsureChecks(dest: string, templatesDir: string, filesUpdated:
     filesUpdated.push(...memoryFiles);
   }
 
+  const raiMigration = migrateLegacyRaiAgent(dest);
+  if (raiMigration.migrated.length > 0) {
+    success('migrated .squad/agents/Rai/ → .squad/agents/rai/');
+    filesUpdated.push(...raiMigration.migrated);
+  }
+  if (raiMigration.tombstoned.length > 0) {
+    success('removed stale .squad/agents/Rai/ (superseded by .squad/agents/rai/)');
+  }
+
   const builtinAgents = ensureBuiltinAgents(dest, templatesDir);
   if (builtinAgents.length > 0) {
     const uniqueAgentNames = Array.from(new Set(builtinAgents.map(p => path.basename(path.dirname(p)))));
@@ -932,7 +1002,7 @@ async function runEnsureChecks(dest: string, templatesDir: string, filesUpdated:
   // git root looking for .mcp.json) and tombstone any stale project-level
   // entry left by older Squad versions in `.copilot/mcp-config.json`.
   // No HOME modifications.
-  const pinnedSpec = await resolveSquadStateMcpSpec(getPackageVersion());
+  const pinnedSpec = projectSquadStateMcpSpec(await resolveSquadStateMcpSpec(getPackageVersion()));
   try {
     const rootResult = ensureSquadStateMcpInRoot(dest, getPackageVersion(), pinnedSpec);
     if (rootResult.written) {
@@ -1014,6 +1084,66 @@ export function ensureMemoryGovernanceUpgradeDefaults(dest: string): string[] {
 }
 
 /**
+ * Migrate the legacy case-sensitive `.squad/agents/Rai/` directory — produced
+ * by prior releases that scaffolded the built-in with a capitalized directory
+ * name — to the canonical lowercase `.squad/agents/rai/`, preserving any
+ * existing charter/history content.
+ *
+ * Detection uses `storage.listSync` (on-disk entry names) rather than
+ * `storage.existsSync('.squad/agents/rai')`, because `existsSync` can report
+ * a false positive for `rai` on case-insensitive filesystems (macOS, Windows)
+ * even when only the legacy `Rai` entry physically exists — that false
+ * positive would make the migration silently no-op on those platforms and
+ * leave the case-sensitive `.squad/agents/Rai/` behind on Linux checkouts of
+ * the same repo.
+ *
+ * Idempotent and duplicate-safe:
+ *  - Only `Rai/` exists → rename it in place to `rai/` (single `renameSync`,
+ *    same convention as `migrateDirectory`'s `.ai-team/` → `.squad/` rename).
+ *  - Both `Rai/` and `rai/` exist (possible on a case-sensitive filesystem
+ *    after a partial upgrade) → canonical `rai/` wins; the legacy `Rai/` is
+ *    removed without overwriting `rai/`, so no in-place customization at the
+ *    canonical location is ever clobbered.
+ *  - Neither exists, or only `rai/` exists → no-op.
+ *
+ * @param dest Root directory containing .squad/
+ * @returns Paths (relative to dest) affected by the migration
+ */
+export function migrateLegacyRaiAgent(dest: string): { migrated: string[]; tombstoned: string[] } {
+  const agentsDir = path.join(dest, '.squad', 'agents');
+  if (!storage.existsSync(agentsDir)) return { migrated: [], tombstoned: [] };
+
+  const entries = storage.listSync(agentsDir);
+  const legacyDir = path.join(agentsDir, 'Rai');
+  if (!entries.includes('Rai') || !storage.isDirectorySync(legacyDir)) {
+    return { migrated: [], tombstoned: [] };
+  }
+
+  const canonicalDir = path.join(agentsDir, 'rai');
+  const migrated: string[] = [];
+  const tombstoned: string[] = [];
+
+  if (entries.includes('rai')) {
+    // Both exist — canonical `rai/` wins, drop the legacy copy as-is.
+    try {
+      storage.deleteDirSync(legacyDir);
+      tombstoned.push(path.posix.join('.squad/agents', 'Rai'));
+    } catch {
+      // best-effort; leave the legacy dir if we can't remove it
+    }
+    return { migrated, tombstoned };
+  }
+
+  try {
+    storage.renameSync(legacyDir, canonicalDir);
+    migrated.push(path.posix.join('.squad/agents', 'rai'));
+  } catch {
+    // best-effort; leave the legacy dir if the rename fails (e.g. read-only fs)
+  }
+  return { migrated, tombstoned };
+}
+
+/**
  * Scaffold always-on built-in agent charters (Rai, Fact Checker) that ship
  * as templates but may be missing from older squads. Idempotent — only writes
  * when the agent directory is absent. Never overwrites existing charters or
@@ -1024,6 +1154,11 @@ export function ensureMemoryGovernanceUpgradeDefaults(dest: string): string[] {
  * exist in any squad that ran a prior init, and their charters are inlined in
  * cast.ts (no shipped template file). Adding them here would risk overwriting
  * customized versions on legacy squads.
+ *
+ * Callers should run `migrateLegacyRaiAgent(dest)` before this function so a
+ * pre-existing legacy `.squad/agents/Rai/` is renamed to `rai/` first — this
+ * function's idempotency check (`storage.existsSync(agentDir)`) would
+ * otherwise miss it on case-sensitive filesystems and scaffold a duplicate.
  *
  * @param dest Root directory containing .squad/
  * @param templatesDir Directory containing shipped charter templates
@@ -1039,8 +1174,14 @@ export function ensureBuiltinAgents(dest: string, templatesDir: string): string[
   //   - dirName: case-preserving directory name under .squad/agents/
   //   - templateFile: filename under templatesDir (charter template)
   //   - displayName: shown in history.md header
+  //
+  // dirName/templateFile use the authoritative lowercase kebab-case built-in
+  // ID (`rai`, not `Rai`) so this matches the canonical `.squad-templates/`
+  // charter filenames and the directory IDs every other built-in scaffolder
+  // (cast.ts's `memberId()`) now produces. Canonical built-in contract:
+  // scribe, ralph, rai, fact-checker.
   const builtins: Array<{ dirName: string; templateFile: string; displayName: string }> = [
-    { dirName: 'Rai', templateFile: 'Rai-charter.md', displayName: 'Rai' },
+    { dirName: 'rai', templateFile: 'rai-charter.md', displayName: 'Rai' },
     { dirName: 'fact-checker', templateFile: 'fact-checker-charter.md', displayName: 'Fact Checker' },
   ];
 
@@ -1111,7 +1252,7 @@ export function ensureUserOwnedTemplates(dest: string, templatesDir: string): st
     if (storage.existsSync(destPath)) continue;
 
     storage.mkdirSync(path.dirname(destPath), { recursive: true });
-    storage.copySync(srcPath, destPath);
+    copyManagedFile(srcPath, destPath);
     created.push(entry.destination);
   }
   return created;
@@ -1153,13 +1294,23 @@ export async function runUpgrade(dest: string, options: UpgradeOptions = {}): Pr
 
   const projectType = detectProjectType(dest);
 
+  const castingMigrated = preflightCastingRegistryPair(
+    path.join(squadDirInfo.path, 'casting'),
+    options.dryRun ?? false,
+  );
+  if (castingMigrated) {
+    info(options.dryRun
+      ? 'Would migrate legacy casting state to a managed registry/history pair.'
+      : 'Migrated legacy casting state to a managed registry/history pair.');
+  }
+
   // --dry-run: preview what upgrade would do without writing (#1052)
   if (options.dryRun) {
     info(`\n${bold('Dry run')} — previewing upgrade from ${oldVersion || 'unknown'} → ${cliVersion}\n`);
     const templatesDir = getTemplatesDir();
     const agentSrc = path.join(templatesDir, 'squad.agent.md.template');
     if (storage.existsSync(agentSrc)) {
-      writeAgentTemplate(agentSrc, agentDest, cliVersion, mcpConfigMode, isGitHubForMcp, { dryRun: true });
+      writeAgentTemplate(agentSrc, agentDest, cliVersion, mcpConfigMode, isGitHubForMcp, { dryRun: true, squadDir: squadDirInfo.path });
       writeClaudeAgentTemplate(agentSrc, claudeAgentDest, cliVersion, { dryRun: true });
     }
     const filesToUpgrade = TEMPLATE_MANIFEST.filter(f => f.overwriteOnUpgrade && f.source !== 'squad.agent.md.template');
@@ -1201,10 +1352,10 @@ export async function runUpgrade(dest: string, options: UpgradeOptions = {}): Pr
     const agentSrc = path.join(templatesDir, 'squad.agent.md.template');
     if (storage.existsSync(agentSrc)) {
       storage.mkdirSync(path.dirname(agentDest), { recursive: true });
-      writeAgentTemplate(agentSrc, agentDest, cliVersion, mcpConfigMode, isGitHubForMcp);
+      writeAgentTemplate(agentSrc, agentDest, cliVersion, mcpConfigMode, isGitHubForMcp, { squadDir: squadDirInfo.path });
       success('upgraded squad.agent.md');
       filesUpdated.push('squad.agent.md');
-      if (writeClaudeAgentTemplate(agentSrc, claudeAgentDest, cliVersion)) {
+      if (writeClaudeAgentTemplate(agentSrc, claudeAgentDest, cliVersion, { squadDir: squadDirInfo.path })) {
         success('upgraded .claude/agents/squad.md');
         filesUpdated.push('.claude/agents/squad.md');
       }
@@ -1232,13 +1383,13 @@ export async function runUpgrade(dest: string, options: UpgradeOptions = {}): Pr
   }
 
   storage.mkdirSync(path.dirname(agentDest), { recursive: true });
-  writeAgentTemplate(agentSrc, agentDest, cliVersion, mcpConfigMode, isGitHubForMcp);
+  writeAgentTemplate(agentSrc, agentDest, cliVersion, mcpConfigMode, isGitHubForMcp, { squadDir: squadDirInfo.path });
 
   const fromLabel = oldVersion === '0.0.0' || !oldVersion ? 'unknown' : oldVersion;
   success(`upgraded coordinator from ${fromLabel} to ${cliVersion}`);
   filesUpdated.push('squad.agent.md');
 
-  if (writeClaudeAgentTemplate(agentSrc, claudeAgentDest, cliVersion)) {
+  if (writeClaudeAgentTemplate(agentSrc, claudeAgentDest, cliVersion, { squadDir: squadDirInfo.path })) {
     success('upgraded .claude/agents/squad.md (Claude Code coordinator)');
     filesUpdated.push('.claude/agents/squad.md');
   }
@@ -1257,7 +1408,7 @@ export async function runUpgrade(dest: string, options: UpgradeOptions = {}): Pr
       warnIfSkillCustomized(srcPath, destPath, file.source);
     }
     storage.mkdirSync(path.dirname(destPath), { recursive: true });
-    storage.copySync(srcPath, destPath);
+    copyManagedFile(srcPath, destPath);
 
     filesUpdated.push(file.destination);
   }
@@ -1296,7 +1447,7 @@ export async function runUpgrade(dest: string, options: UpgradeOptions = {}): Pr
 
     if (copilotEnabled && storage.existsSync(copilotInstructionsSrc)) {
       storage.mkdirSync(path.dirname(copilotInstructionsDest), { recursive: true });
-      storage.copySync(copilotInstructionsSrc, copilotInstructionsDest);
+      syncCopilotInstructionsFile(copilotInstructionsSrc, copilotInstructionsDest);
       success('upgraded .github/copilot-instructions.md');
       filesUpdated.push('copilot-instructions.md');
     }

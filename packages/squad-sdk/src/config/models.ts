@@ -1,9 +1,9 @@
 /**
  * Model Configuration & Registry
- * 
+ *
  * Defines the full model catalog and provides model lookup, fallback chains,
  * and availability checking. Implements the model tier system from squad.agent.md.
- * 
+ *
  * @module config/models
  */
 
@@ -12,6 +12,7 @@ import type { StorageProvider } from '../storage/index.js';
 import { FSStorageProvider } from '../storage/index.js';
 import type { ModelId, ModelTier } from '../runtime/config.js';
 import type { SquadReasoningEffort, SquadContextTier } from '../adapter/types.js';
+import { resolveModel as resolveCentralModel, persistentConfigModel } from '../agents/model-selector.js';
 
 /**
  * Per-token pricing in USD.
@@ -99,46 +100,58 @@ export interface CostPolicyOutcome {
 export interface ModelInfo {
   /** Model identifier */
   id: ModelId;
-  
+
   /** Model tier (quality axis) */
   tier: ModelTier;
-  
-  /** Provider (anthropic, openai, google) */
-  provider: 'anthropic' | 'openai' | 'google';
-  
+
+  /** Provider */
+  provider: 'anthropic' | 'openai' | 'google' | 'xai' | 'microsoft' | 'github';
+
   /** Model family */
-  family: 'claude' | 'gpt' | 'gemini';
+  family: 'claude' | 'gpt' | 'gemini' | 'grok' | 'mai' | 'hydrafusion';
 
   /**
    * GitHub Copilot billing cost-ceiling category (cost axis).
    * Separate from {@link tier}; optional so out-of-catalog IDs still pass through.
    */
   githubCategory?: GitHubModelCategory;
-  
+
   /** Supports vision/multimodal input */
   vision?: boolean;
-  
+
   /** Typical use cases */
   useCases?: string[];
-  
-  /** Relative cost (1-10 scale, 10 = most expensive) */
+
+  /** Relative cost heuristic (1-10 scale, 10 = most expensive; not USD) */
   cost?: number;
-  
+
   /** Relative speed (1-10 scale, 10 = fastest) */
   speed?: number;
 
-  /** Per-token pricing in USD (if known) */
+  /** Uncached input/output token pricing in USD (if known) */
   pricing?: ModelPricing;
+
+  /**
+   * Research-preview, opt-in only (#2014). Preview entries are known to the
+   * resolver (tier, cost category) but never appear in a default fallback
+   * chain, a GA profile, or an example, and are never chosen implicitly.
+   * They may be unavailable, for example in corporate environments.
+   */
+  preview?: boolean;
 }
 
 /**
  * Full model catalog.
  *
- * Restricted to model IDs verified reachable from the GitHub Copilot CLI
- * surface (the `copilot-cli` integration subset, 13 enabled models, verified
- * 2026-07-04). Each entry carries an optional {@link ModelInfo.githubCategory}
- * (cost axis) sourced from the models API `model_picker_category`, kept
- * separate from {@link ModelInfo.tier} (quality axis).
+ * Restricted to public, generally available (GA) GitHub Copilot model IDs.
+ * Availability source: https://docs.github.com/en/copilot/reference/ai-models/supported-models
+ * (all entries listed as GA, verified 2026-10-14). Preview and internal IDs
+ * (for example `gpt-5.6-sol-fast`) are never recommended here; opt-in IDs
+ * such as `hydrafusion` still pass through when supplied explicitly.
+ *
+ * Each entry carries a {@link ModelInfo.githubCategory} (cost axis) taken
+ * from the GitHub Copilot models API `model_picker_category` (verified
+ * 2026-10-14), kept separate from {@link ModelInfo.tier} (quality axis).
  *
  * Notes:
  * - No hardcoded per-token pricing is added for models whose pricing is not
@@ -146,11 +159,51 @@ export interface ModelInfo {
  *   on newer entries rather than guessed.
  * - Out-of-catalog IDs still pass through the selector (0-cost estimate +
  *   default chain); this catalog drives routing quality/cost, not correctness.
+ * - A runtime-supplied live model list (`availableModels`) is authoritative
+ *   for availability; this catalog only orders recommendations.
  *
- * Refs: #1080, #1183.
+ * Refs: #1080, #1183, #1598.
  */
 export const MODEL_CATALOG: ModelInfo[] = [
   // Premium tier (quality) — powerful category (cost)
+  {
+    id: 'claude-opus-5.5',
+    tier: 'premium',
+    provider: 'anthropic',
+    family: 'claude',
+    githubCategory: 'powerful',
+    vision: true,
+    useCases: ['architecture proposals', 'security audits', 'complex design', 'research', 'verification'],
+  },
+  {
+    id: 'gpt-6.1-sol',
+    tier: 'premium',
+    provider: 'openai',
+    family: 'gpt',
+    githubCategory: 'powerful',
+    vision: true,
+    useCases: ['architecture proposals', 'security audits', 'complex design', 'research', 'verification'],
+  },
+  {
+    id: 'claude-opus-5',
+    tier: 'premium',
+    provider: 'anthropic',
+    family: 'claude',
+    githubCategory: 'powerful',
+    vision: true,
+    useCases: ['architecture proposals', 'security audits', 'complex design'],
+    cost: 10,
+    speed: 3,
+  },
+  {
+    id: 'gpt-6-sol',
+    tier: 'premium',
+    provider: 'openai',
+    family: 'gpt',
+    githubCategory: 'powerful',
+    vision: true,
+    useCases: ['architecture proposals', 'security audits', 'complex design', 'research', 'verification'],
+  },
   {
     id: 'claude-opus-4.8',
     tier: 'premium',
@@ -161,32 +214,52 @@ export const MODEL_CATALOG: ModelInfo[] = [
     useCases: ['architecture proposals', 'security audits', 'complex design'],
     cost: 10,
     speed: 3,
+    pricing: { inputPerToken: 0.000005, outputPerToken: 0.000025 },
   },
   {
-    id: 'claude-opus-4.7',
+    id: 'gpt-5.6-sol',
     tier: 'premium',
-    provider: 'anthropic',
-    family: 'claude',
+    provider: 'openai',
+    family: 'gpt',
     githubCategory: 'powerful',
     vision: true,
-    useCases: ['architecture proposals', 'security audits', 'complex design'],
-    cost: 10,
-    speed: 3,
+    useCases: ['general purpose', 'code generation', 'analysis'],
+    cost: 6,
+    speed: 7,
+    pricing: { inputPerToken: 0.000005, outputPerToken: 0.00003 },
   },
   {
-    id: 'claude-opus-4.6',
+    id: 'gemini-4-argon',
     tier: 'premium',
-    provider: 'anthropic',
-    family: 'claude',
+    provider: 'google',
+    family: 'gemini',
     githubCategory: 'powerful',
     vision: true,
-    useCases: ['architecture proposals', 'security audits', 'complex design'],
-    cost: 10,
-    speed: 3,
-    pricing: { inputPerToken: 0.000015, outputPerToken: 0.000075 },
+    useCases: ['code reviews', 'second opinion', 'diversity'],
   },
 
   // Standard tier (quality) — versatile/powerful category (cost)
+  {
+    id: 'claude-sonnet-5.5',
+    tier: 'standard',
+    provider: 'anthropic',
+    family: 'claude',
+    githubCategory: 'versatile',
+    vision: true,
+    useCases: ['code generation', 'prompt engineering', 'writing', 'refactoring'],
+  },
+  {
+    id: 'gpt-5.6-terra',
+    tier: 'standard',
+    provider: 'openai',
+    family: 'gpt',
+    githubCategory: 'versatile',
+    vision: true,
+    useCases: ['general purpose', 'code generation', 'analysis'],
+    cost: 5,
+    speed: 8,
+    pricing: { inputPerToken: 0.000002, outputPerToken: 0.000012 },
+  },
   {
     id: 'claude-sonnet-5',
     tier: 'standard',
@@ -197,30 +270,7 @@ export const MODEL_CATALOG: ModelInfo[] = [
     useCases: ['code generation', 'test writing', 'refactoring'],
     cost: 5,
     speed: 7,
-  },
-  {
-    id: 'claude-sonnet-4.6',
-    tier: 'standard',
-    provider: 'anthropic',
-    family: 'claude',
-    githubCategory: 'versatile',
-    vision: true,
-    useCases: ['code generation', 'test writing', 'refactoring', 'prompt engineering'],
-    cost: 5,
-    speed: 7,
-    pricing: { inputPerToken: 0.000003, outputPerToken: 0.000015 },
-  },
-  {
-    id: 'claude-sonnet-4.5',
-    tier: 'standard',
-    provider: 'anthropic',
-    family: 'claude',
-    githubCategory: 'versatile',
-    vision: true,
-    useCases: ['code generation', 'test writing', 'refactoring'],
-    cost: 5,
-    speed: 7,
-    pricing: { inputPerToken: 0.000003, outputPerToken: 0.000015 },
+    pricing: { inputPerToken: 0.000002, outputPerToken: 0.00001 },
   },
   {
     id: 'gpt-5.5',
@@ -228,42 +278,11 @@ export const MODEL_CATALOG: ModelInfo[] = [
     provider: 'openai',
     family: 'gpt',
     githubCategory: 'powerful',
+    vision: true,
     useCases: ['general purpose', 'code generation', 'analysis'],
     cost: 6,
     speed: 7,
-  },
-  // gpt-5.6 family — CLI-observed Standard-tier reachable models (2026-07-13).
-  // Tier: standard (quality axis). githubCategory per live Copilot API (canonical billing axis):
-  //   sol=powerful, terra=versatile, luna=lightweight.
-  {
-    id: 'gpt-5.6-sol',
-    tier: 'standard',
-    provider: 'openai',
-    family: 'gpt',
-    githubCategory: 'powerful',
-    useCases: ['general purpose', 'code generation', 'analysis'],
-    cost: 6,
-    speed: 7,
-  },
-  {
-    id: 'gpt-5.6-terra',
-    tier: 'standard',
-    provider: 'openai',
-    family: 'gpt',
-    githubCategory: 'versatile',
-    useCases: ['general purpose', 'code generation', 'analysis'],
-    cost: 5,
-    speed: 8,
-  },
-  {
-    id: 'gpt-5.6-luna',
-    tier: 'standard',
-    provider: 'openai',
-    family: 'gpt',
-    githubCategory: 'lightweight',
-    useCases: ['general purpose', 'code generation', 'analysis'],
-    cost: 3,
-    speed: 9,
+    pricing: { inputPerToken: 0.000005, outputPerToken: 0.00003 },
   },
   {
     id: 'gpt-5.4',
@@ -271,10 +290,11 @@ export const MODEL_CATALOG: ModelInfo[] = [
     provider: 'openai',
     family: 'gpt',
     githubCategory: 'powerful',
+    vision: true,
     useCases: ['general purpose', 'code generation', 'analysis'],
     cost: 6,
     speed: 7,
-    pricing: { inputPerToken: 0.000005, outputPerToken: 0.000015 },
+    pricing: { inputPerToken: 0.0000025, outputPerToken: 0.000015 },
   },
   {
     id: 'gpt-5.3-codex',
@@ -282,34 +302,82 @@ export const MODEL_CATALOG: ModelInfo[] = [
     provider: 'openai',
     family: 'gpt',
     githubCategory: 'powerful',
+    vision: true,
     useCases: ['heavy code generation', 'multi-file refactors'],
     cost: 5,
     speed: 6,
-    pricing: { inputPerToken: 0.0000025, outputPerToken: 0.00001 },
+    pricing: { inputPerToken: 0.00000175, outputPerToken: 0.000014 },
   },
   {
-    id: 'gemini-2.5-pro',
+    id: 'grok-4.7',
     tier: 'standard',
-    provider: 'google',
-    family: 'gemini',
-    githubCategory: 'powerful',
+    provider: 'xai',
+    family: 'grok',
+    githubCategory: 'versatile',
     vision: true,
-    useCases: ['code reviews', 'second opinion', 'diversity'],
-    cost: 5,
-    speed: 7,
+    useCases: ['second opinion', 'diversity'],
+  },
+  {
+    id: 'grok-4.6',
+    tier: 'standard',
+    provider: 'xai',
+    family: 'grok',
+    githubCategory: 'versatile',
+    vision: true,
+    useCases: ['second opinion', 'diversity'],
   },
 
-  // Fast tier (quality) — lightweight category (cost)
+  // Fast tier (quality) — lightweight category (cost), except gemini-3.8-flash (versatile)
+  {
+    id: 'claude-haiku-5.5',
+    tier: 'fast',
+    provider: 'anthropic',
+    family: 'claude',
+    githubCategory: 'lightweight',
+    vision: true,
+    useCases: ['boilerplate', 'changelogs', 'simple fixes'],
+  },
+  {
+    id: 'gpt-6-luna',
+    tier: 'fast',
+    provider: 'openai',
+    family: 'gpt',
+    githubCategory: 'lightweight',
+    vision: true,
+    useCases: ['scaffolding', 'simple tasks'],
+  },
+  {
+    id: 'gpt-5.6-luna',
+    tier: 'fast',
+    provider: 'openai',
+    family: 'gpt',
+    githubCategory: 'lightweight',
+    vision: true,
+    useCases: ['general purpose', 'code generation', 'analysis'],
+    cost: 3,
+    speed: 9,
+    pricing: { inputPerToken: 0.0000002, outputPerToken: 0.0000012 },
+  },
+  {
+    id: 'gemini-3.8-flash',
+    tier: 'fast',
+    provider: 'google',
+    family: 'gemini',
+    githubCategory: 'versatile',
+    vision: true,
+    useCases: ['fast drafts', 'simple tasks', 'diversity'],
+  },
   {
     id: 'claude-haiku-4.5',
     tier: 'fast',
     provider: 'anthropic',
     family: 'claude',
     githubCategory: 'lightweight',
+    vision: true,
     useCases: ['boilerplate', 'changelogs', 'simple fixes'],
     cost: 2,
     speed: 9,
-    pricing: { inputPerToken: 0.0000008, outputPerToken: 0.000004 },
+    pricing: { inputPerToken: 0.000001, outputPerToken: 0.000005 },
   },
   {
     id: 'gpt-5.4-mini',
@@ -317,9 +385,11 @@ export const MODEL_CATALOG: ModelInfo[] = [
     provider: 'openai',
     family: 'gpt',
     githubCategory: 'lightweight',
+    vision: true,
     useCases: ['scaffolding', 'test boilerplate', 'simple tasks'],
     cost: 1,
     speed: 10,
+    pricing: { inputPerToken: 0.00000075, outputPerToken: 0.0000045 },
   },
   {
     id: 'gpt-5-mini',
@@ -327,21 +397,64 @@ export const MODEL_CATALOG: ModelInfo[] = [
     provider: 'openai',
     family: 'gpt',
     githubCategory: 'lightweight',
+    vision: true,
     useCases: ['typo fixes', 'renames', 'simple tasks'],
     cost: 1,
     speed: 10,
-    pricing: { inputPerToken: 0.00000015, outputPerToken: 0.0000006 },
+    pricing: { inputPerToken: 0.00000025, outputPerToken: 0.000002 },
+  },
+  {
+    id: 'mai-code-1.1-flash',
+    tier: 'fast',
+    provider: 'microsoft',
+    family: 'mai',
+    githubCategory: 'lightweight',
+    vision: true,
+    useCases: ['fast code edits', 'code diversity'],
+  },
+
+  // Research preview — opt-in only (#2014). Multi-model orchestration ids;
+  // the runtime handles orchestration, cost and fallback. Excluded from every
+  // default chain and GA profile. `hydrafusion` is used implicitly only under
+  // the opt-in `hydrafusion` profile; `hydrafusion-max` only when named.
+  {
+    id: 'hydrafusion',
+    tier: 'premium',
+    provider: 'github',
+    family: 'hydrafusion',
+    githubCategory: 'powerful',
+    preview: true,
+    useCases: ['architecture proposals', 'reviewer gates', 'security audits', 'research', 'design'],
+  },
+  {
+    id: 'hydrafusion-max',
+    tier: 'premium',
+    provider: 'github',
+    family: 'hydrafusion',
+    githubCategory: 'powerful',
+    preview: true,
+    useCases: ['explicit opt-in only'],
   },
 ];
 
+/** Opt-in preview model the `hydrafusion` profile puts first for quality-sensitive work (#2014). */
+export const HYDRAFUSION_MODEL_ID = 'hydrafusion';
+
+/** True when `id` is a research-preview, opt-in-only {@link MODEL_CATALOG} entry. */
+export function isPreviewModel(id: string): boolean {
+  const key = id.trim().toLowerCase();
+  return MODEL_CATALOG.some((m) => m.preview === true && m.id === key);
+}
+
 /**
- * Default fallback chains per tier — real, CLI-reachable IDs ordered by preference.
- * Newest model in each series is first (tamirdresher PR #1444 follow-up, 2026-07-13).
+ * Default fallback chains per tier — public GA IDs ordered by preference
+ * (quality first within each tier, alternating providers for resilience).
+ * Must stay identical to `MODELS.FALLBACK_CHAINS` and `DEFAULT_CONFIG.models.tiers`.
  */
 export const DEFAULT_FALLBACK_CHAINS: Record<ModelTier, ModelId[]> = {
-  premium: ['claude-opus-4.8', 'claude-opus-4.7', 'claude-opus-4.6', 'claude-sonnet-4.6'],
-  standard: ['claude-sonnet-5', 'claude-sonnet-4.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.4', 'gpt-5.3-codex', 'claude-sonnet-4.5', 'gemini-2.5-pro'],
-  fast: ['claude-haiku-4.5', 'gpt-5.4-mini', 'gpt-5-mini'],
+  premium: ['claude-opus-5.5', 'gpt-6.1-sol', 'claude-opus-5', 'gpt-6-sol', 'claude-opus-4.8', 'gpt-5.6-sol'],
+  standard: ['claude-sonnet-5.5', 'gpt-5.6-terra', 'claude-sonnet-5', 'gpt-5.5', 'gpt-5.4', 'gpt-5.3-codex'],
+  fast: ['claude-haiku-5.5', 'gpt-6-luna', 'gpt-5.6-luna', 'gemini-3.8-flash', 'claude-haiku-4.5', 'gpt-5.4-mini', 'gpt-5-mini'],
 };
 
 /**
@@ -351,10 +464,10 @@ export class ModelRegistry {
   private catalog: Map<ModelId, ModelInfo>;
   private tierIndex: Map<ModelTier, ModelInfo[]>;
   private providerIndex: Map<string, ModelInfo[]>;
-  
+
   constructor(catalog: ModelInfo[] = MODEL_CATALOG) {
     this.catalog = new Map(catalog.map(model => [model.id, model]));
-    
+
     // Build tier index
     this.tierIndex = new Map();
     for (const tier of ['premium', 'standard', 'fast'] as ModelTier[]) {
@@ -363,7 +476,7 @@ export class ModelRegistry {
         catalog.filter(m => m.tier === tier)
       );
     }
-    
+
     // Build provider index
     this.providerIndex = new Map();
     for (const model of catalog) {
@@ -372,50 +485,50 @@ export class ModelRegistry {
       this.providerIndex.set(model.provider, existing);
     }
   }
-  
+
   /**
    * Gets model information by ID.
-   * 
+   *
    * @param id - Model identifier
    * @returns Model info if found, null otherwise
    */
   getModelInfo(id: ModelId): ModelInfo | null {
     return this.catalog.get(id) || null;
   }
-  
+
   /**
    * Checks if a model is available in the catalog.
-   * 
+   *
    * @param id - Model identifier
    * @returns True if model exists in catalog
    */
   isModelAvailable(id: ModelId): boolean {
     return this.catalog.has(id);
   }
-  
+
   /**
    * Gets all models for a specific tier.
-   * 
+   *
    * @param tier - Model tier
    * @returns Array of models in that tier
    */
   getModelsByTier(tier: ModelTier): ModelInfo[] {
     return this.tierIndex.get(tier) || [];
   }
-  
+
   /**
    * Gets all models from a specific provider.
-   * 
+   *
    * @param provider - Provider name
    * @returns Array of models from that provider
    */
   getModelsByProvider(provider: string): ModelInfo[] {
     return this.providerIndex.get(provider) || [];
   }
-  
+
   /**
    * Gets the fallback chain for a specific tier.
-   * 
+   *
    * @param tier - Model tier
    * @param preferSameProvider - If true, prefer models from same provider
    * @param currentModel - Current model (for provider preference)
@@ -427,34 +540,34 @@ export class ModelRegistry {
     currentModel?: ModelId
   ): ModelId[] {
     const defaultChain = DEFAULT_FALLBACK_CHAINS[tier] || [];
-    
+
     if (!preferSameProvider || !currentModel) {
       return defaultChain;
     }
-    
+
     // Get current model's provider
     const current = this.getModelInfo(currentModel);
     if (!current) {
       return defaultChain;
     }
-    
+
     // Reorder chain to prefer same provider
     const sameProvider = defaultChain.filter(id => {
       const model = this.getModelInfo(id);
       return model?.provider === current.provider;
     });
-    
+
     const otherProvider = defaultChain.filter(id => {
       const model = this.getModelInfo(id);
       return model?.provider !== current.provider;
     });
-    
+
     return [...sameProvider, ...otherProvider];
   }
-  
+
   /**
    * Gets the next fallback model in the chain.
-   * 
+   *
    * @param currentModel - Current model that failed
    * @param tier - Model tier
    * @param attemptedModels - Models already attempted
@@ -466,57 +579,60 @@ export class ModelRegistry {
     attemptedModels: Set<ModelId> = new Set()
   ): ModelId | null {
     const chain = this.getFallbackChain(tier, true, currentModel);
-    
+
     // Find next model in chain that hasn't been attempted
     for (const modelId of chain) {
       if (modelId !== currentModel && !attemptedModels.has(modelId)) {
         return modelId;
       }
     }
-    
+
     return null;
   }
-  
+
   /**
    * Gets model recommendations based on use case.
-   * 
+   *
    * @param useCase - Desired use case
    * @param tier - Optional tier constraint
    * @returns Recommended models sorted by relevance
    */
   getRecommendedModels(useCase: string, tier?: ModelTier): ModelInfo[] {
     const useCaseLower = useCase.toLowerCase();
-    const candidates = tier
+    // Preview entries are opt-in only (#2014): never recommended implicitly,
+    // but still available through explicit catalog lookup.
+    const candidates = (tier
       ? this.getModelsByTier(tier)
-      : Array.from(this.catalog.values());
-    
+      : Array.from(this.catalog.values())
+    ).filter(model => model.preview !== true);
+
     // Score models by use case match
     const scored = candidates
       .map(model => ({
         model,
-        score: model.useCases?.some(uc => 
+        score: model.useCases?.some(uc =>
           uc.toLowerCase().includes(useCaseLower) ||
           useCaseLower.includes(uc.toLowerCase())
         ) ? 10 : 0
       }))
       .filter(item => item.score > 0)
       .sort((a, b) => b.score - a.score);
-    
+
     return scored.map(item => item.model);
   }
-  
+
   /**
    * Gets all model IDs in the catalog.
-   * 
+   *
    * @returns Array of all model IDs
    */
   getAllModelIds(): ModelId[] {
     return Array.from(this.catalog.keys());
   }
-  
+
   /**
    * Gets catalog statistics.
-   * 
+   *
    * @returns Catalog stats
    */
   getStats(): {
@@ -529,14 +645,14 @@ export class ModelRegistry {
       standard: 0,
       fast: 0
     };
-    
+
     const byProvider: Record<string, number> = {};
-    
+
     for (const model of this.catalog.values()) {
       byTier[model.tier]++;
       byProvider[model.provider] = (byProvider[model.provider] || 0) + 1;
     }
-    
+
     return {
       total: this.catalog.size,
       byTier,
@@ -575,7 +691,7 @@ export function isModelAvailable(id: ModelId): boolean {
  * Estimate the cost of a model invocation based on token counts and
  * the SDK's built-in pricing table.
  *
- * @returns Estimated cost in USD, or 0 if pricing is unavailable for the model.
+ * @returns Estimated uncached input/output cost in USD, or 0 if pricing is unavailable.
  */
 export function estimateCost(model: string, inputTokens: number, outputTokens: number): number {
   const info = defaultRegistry.getModelInfo(model as ModelId);
@@ -594,19 +710,23 @@ export function estimateCost(model: string, inputTokens: number, outputTokens: n
  * economy mode is active. Layers 0–2 (explicit preferences) are
  * never substituted — the user's explicit choice always wins.
  *
- * Table source: issue #500
+ * Table source: issue #500, refreshed to public GA ids in #1598.
  */
 export const ECONOMY_MODEL_MAP: Record<string, string> = {
   // Premium → standard downgrade (architecture/review tasks)
-  'claude-opus-4.8':      'claude-sonnet-4.5',
-  'claude-opus-4.7':      'claude-sonnet-4.5',
-  'claude-opus-4.6':      'claude-sonnet-4.5',
+  'gpt-6.1-sol':          'gpt-5.6-terra',
+  'gpt-6-sol':            'gpt-5.6-terra',
+  'gpt-5.6-sol':          'gpt-5.6-terra',
+  'claude-opus-5.5':      'claude-sonnet-5.5',
+  'claude-opus-5':        'claude-sonnet-5',
+  'claude-opus-4.8':      'claude-sonnet-5',
   // Standard → fast downgrade (code writing, docs, planning, triage)
-  'claude-sonnet-5':      'gpt-5-mini',
-  'claude-sonnet-4.6':    'gpt-5-mini',
-  'claude-sonnet-4.5':    'gpt-5-mini',
+  'claude-sonnet-5.5':    'gpt-5.6-luna',
+  'gpt-5.6-terra':        'gpt-5.6-luna',
+  'claude-sonnet-5':      'gpt-5.6-luna',
   // Fast → cheapest fast (scribe/mechanical, docs)
-  'claude-haiku-4.5':     'gpt-5-mini',
+  'claude-haiku-5.5':     'gpt-5.6-luna',
+  'claude-haiku-4.5':     'gpt-5.6-luna',
 };
 
 /**
@@ -618,12 +738,44 @@ export function applyEconomyMode(model: string): string {
 }
 
 /**
+ * Quality profile for automatic model selection (#1598). Explicit model
+ * choices (user override, config model, session model, charter) are never
+ * changed by a profile.
+ * - `quality-first` (default): quality-sensitive work (architecture, research,
+ *   verification, review, security, design) gets premium; code, prompt and
+ *   language-heavy work gets standard; mechanical work gets fast.
+ * - `balanced`: premium for architecture/security/review-style work, standard
+ *   for code and language-heavy work, fast for planning and mechanical work.
+ * - `economy`: opt-in cost-first selection plus {@link ECONOMY_MODEL_MAP}
+ *   substitution. Legacy `economyMode: true` selects this profile.
+ * - `hydrafusion` (#2014): opt-in research preview. Quality-sensitive work
+ *   (architecture, research, verification, review, security, design) tries
+ *   {@link HYDRAFUSION_MODEL_ID} first, then the quality-first premium chain;
+ *   everything else follows `quality-first`. `hydrafusion-max` is never
+ *   chosen by this profile.
+ */
+export type ModelSelectionProfile = 'quality-first' | 'balanced' | 'economy' | 'hydrafusion';
+
+/** All supported {@link ModelSelectionProfile} values. */
+export const MODEL_SELECTION_PROFILES: readonly ModelSelectionProfile[] = ['quality-first', 'balanced', 'economy', 'hydrafusion'] as const;
+
+/** Profile used when neither the session nor `.squad/config.json` selects one. */
+export const DEFAULT_MODEL_SELECTION_PROFILE: ModelSelectionProfile = 'quality-first';
+
+/** True when `value` is a supported {@link ModelSelectionProfile}. */
+export function isModelSelectionProfile(value: unknown): value is ModelSelectionProfile {
+  return typeof value === 'string' && (MODEL_SELECTION_PROFILES as readonly string[]).includes(value);
+}
+
+/**
  * Shape of model preference fields within `.squad/config.json`.
  */
 export interface ModelPreferenceConfig {
   defaultModel?: string;
   agentModelOverrides?: Record<string, string>;
   economyMode?: boolean;
+  /** Persistent {@link ModelSelectionProfile}; unknown values are ignored. */
+  modelProfile?: ModelSelectionProfile;
   defaultReasoningEffort?: string;
   agentReasoningEffortOverrides?: Record<string, string>;
   defaultContextTier?: string;
@@ -643,7 +795,7 @@ export interface ModelPreferenceConfig {
  * Reads the economy mode setting from `.squad/config.json`.
  *
  * @param squadDir - Path to the `.squad/` directory
- * @returns True if economyMode is enabled, false otherwise
+ * @returns True if `economyMode` is enabled or `modelProfile` is `economy`, false otherwise
  */
 export function readEconomyMode(squadDir: string, storage: StorageProvider = new FSStorageProvider()): boolean {
   const configPath = join(squadDir, 'config.json');
@@ -656,7 +808,7 @@ export function readEconomyMode(squadDir: string, storage: StorageProvider = new
     const parsed = JSON.parse(raw);
     return parsed !== null &&
       typeof parsed === 'object' &&
-      parsed.economyMode === true;
+      (parsed.economyMode === true || parsed.modelProfile === 'economy');
   } catch {
     return false;
   }
@@ -687,6 +839,64 @@ export function writeEconomyMode(squadDir: string, enabled: boolean, storage: St
     config.economyMode = true;
   } else {
     delete config.economyMode;
+    // A persisted economy profile also selects economy; other profiles stay.
+    if (config.modelProfile === 'economy') delete config.modelProfile;
+  }
+
+  storage.writeSync(configPath, JSON.stringify(config, null, 2) + '\n');
+}
+
+/**
+ * Reads the persistent model selection profile (`modelProfile`) from
+ * `.squad/config.json`. Unknown values are ignored.
+ *
+ * @param squadDir - Path to the `.squad/` directory
+ * @returns The profile, or null when unset or invalid
+ */
+export function readModelProfile(squadDir: string, storage: StorageProvider = new FSStorageProvider()): ModelSelectionProfile | null {
+  const configPath = join(squadDir, 'config.json');
+  if (!storage.existsSync(configPath)) return null;
+  try {
+    const raw = storage.readSync(configPath);
+    if (raw === undefined) return null;
+    const parsed = JSON.parse(raw);
+    const value = parsed !== null && typeof parsed === 'object' ? parsed.modelProfile : undefined;
+    return isModelSelectionProfile(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Writes the persistent model selection profile to `.squad/config.json`.
+ * Merges with existing config; `null` removes the field.
+ *
+ * @param squadDir - Path to the `.squad/` directory
+ * @param profile - Profile to persist, or null to clear
+ */
+export function writeModelProfile(
+  squadDir: string,
+  profile: ModelSelectionProfile | null,
+  storage: StorageProvider = new FSStorageProvider(),
+): void {
+  const configPath = join(squadDir, 'config.json');
+  let config: Record<string, unknown> = { version: 1 };
+  if (storage.existsSync(configPath)) {
+    try {
+      const raw = storage.readSync(configPath);
+      if (raw !== undefined) config = JSON.parse(raw);
+    } catch {
+      config = { version: 1 };
+    }
+  }
+
+  if (profile === null) {
+    delete config.modelProfile;
+  } else {
+    if (!isModelSelectionProfile(profile)) {
+      throw new Error(`Unknown model profile '${String(profile)}'; expected one of ${MODEL_SELECTION_PROFILES.join(', ')}`);
+    }
+    config.modelProfile = profile;
   }
 
   storage.writeSync(configPath, JSON.stringify(config, null, 2) + '\n');
@@ -1607,18 +1817,14 @@ export function resolveContextTier(options: {
 }
 
 /**
- * Resolves the effective model for an agent spawn using the 5-layer hierarchy:
- *   Layer 0: Persistent config (.squad/config.json defaultModel)
- *   Layer 1: Session-wide user directive ("always use opus")
- *   Layer 2: Charter preference (agent's ## Model section)
- *   Layer 3: Task-aware auto-selection (code → sonnet, docs → haiku)
- *   Layer 4: Default (claude-haiku-4.5)
+ * Legacy string-returning adapter over the central model resolver
+ * (`resolveModel` in `@bradygaster/squad-sdk/agents`). It reads persistent
+ * `.squad/config.json` preferences and delegates precedence, the `auto`
+ * sentinel, quality profiles, and economy-mode handling to the central resolver:
+ *   config (agentModelOverrides, then defaultModel) > session directive >
+ *   charter preference > task model > default.
  *
- * Per-agent overrides from config.json take priority over the global defaultModel.
- *
- * Economy mode modifier: when active (via economyMode option or config.json),
- * shifts model selection at Layer 3 and Layer 4 to cheaper alternatives per
- * ECONOMY_MODEL_MAP. Layers 0–2 (explicit user preferences) are never overridden.
+ * Use the central resolver directly when you need the source and rationale.
  *
  * @param options - Resolution inputs
  * @returns Resolved model ID
@@ -1631,50 +1837,39 @@ export function resolveModel(options: {
   taskModel?: string | null;
   /** When true, apply economy mode substitution at Layer 3/4. Overrides config. */
   economyMode?: boolean;
+  /** Session-level quality profile; wins over persisted `modelProfile` and `economyMode`. */
+  profile?: ModelSelectionProfile;
   /** Storage provider for config file access. */
   storage?: StorageProvider;
 }): string {
   const { agentName, squadDir, sessionDirective, charterPreference, taskModel } = options;
   const storage = options.storage ?? new FSStorageProvider();
 
-  // Layer 0a: Per-agent persistent override (explicit — economy does not apply)
-  if (squadDir && agentName) {
-    const agentOverrides = readAgentModelOverrides(squadDir, storage);
-    if (agentOverrides[agentName]) {
-      return agentOverrides[agentName]!;
-    }
-  }
+  const configModel = squadDir
+    ? persistentConfigModel(
+        {
+          agentModelOverrides: agentName ? readAgentModelOverrides(squadDir, storage) : undefined,
+          defaultModel: readModelPreference(squadDir, storage) ?? undefined,
+        },
+        agentName,
+      )
+    : undefined;
 
-  // Layer 0b: Global persistent config (explicit — economy does not apply)
-  if (squadDir) {
-    const persistedModel = readModelPreference(squadDir, storage);
-    if (persistedModel) {
-      return persistedModel;
-    }
-  }
-
-  // Layer 1: Session-wide user directive (explicit — economy does not apply)
-  if (sessionDirective) {
-    return sessionDirective;
-  }
-
-  // Layer 2: Charter preference (explicit — economy does not apply)
-  if (charterPreference) {
-    return charterPreference;
-  }
-
-  // Determine if economy mode is active (option takes precedence over config)
-  const isEconomy =
+  const economyMode =
     options.economyMode !== undefined
       ? options.economyMode
       : (squadDir ? readEconomyMode(squadDir, storage) : false);
+  let profile = squadDir ? readModelProfile(squadDir, storage) ?? undefined : undefined;
+  // An explicit `economyMode: false` keeps its legacy meaning: economy is off.
+  if (options.economyMode === false && profile === 'economy') profile = undefined;
 
-  // Layer 3: Task-aware auto-selection (economy mode applies)
-  if (taskModel) {
-    return isEconomy ? applyEconomyMode(taskModel) : taskModel;
-  }
-
-  // Layer 4: Default (economy mode applies)
-  const defaultModel = 'claude-haiku-4.5';
-  return isEconomy ? applyEconomyMode(defaultModel) : defaultModel;
+  return resolveCentralModel({
+    configModel,
+    sessionModel: sessionDirective ?? undefined,
+    charterPreference: charterPreference ?? undefined,
+    taskModel: taskModel ?? undefined,
+    economyMode,
+    profile,
+    sessionProfile: options.profile,
+  }).model;
 }

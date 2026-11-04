@@ -9,6 +9,7 @@ export * from './models.js';
 export * from './init.js';
 export * from './agent-doc.js';
 export * from './claude-agent.js';
+export * from './team-capabilities.js';
 export * from './doc-sync.js';
 export * from './migration.js';
 export * from './markdown-migration.js';

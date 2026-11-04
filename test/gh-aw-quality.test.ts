@@ -8,16 +8,66 @@
  * - planning state machine structured-artifact consistency
  */
 
-import { afterAll, describe, it, expect } from 'vitest';
-import { cpSync, readFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { afterAll, describe, it, expect, vi } from 'vitest';
+import { chmodSync, cpSync, readFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { tmpdir } from 'node:os';
 import { execFileSync, execSync, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { minimatch } from 'minimatch';
+import { isMap, isSeq, parseDocument, type YAMLMap } from 'yaml';
+import { POSIX_SHELL, NO_POSIX_SHELL_MESSAGE, requirePosixShell } from './posix-shell';
+import { createFirstInstallFixture } from './helpers/gh-aw-install-fixture.js';
+import {
+  ACTIVATION_CAPTURE_SCHEMA, ACTIVATION_RECEIPT_SCHEMA, activationIssueLimit, activationRequest,
+  createActivation, digest, finalizeActivation, parseActivationPlan, validateCreateReceipt, validateReceiptSet,
+} from '../workflows/shared/squad-activation.mjs';
+import { classifySquadCommand } from '../workflows/shared/squad-command-contract.mjs';
+import {
+  extractRunBlocks,
+  scanRunBlocks,
+  scanShellLines,
+  formatViolations,
+  type ContractToken,
+} from './gh-aw-shell-contract';
+import {
+  CONTRACT_DESTINATION,
+  CONTRACT_SOURCE,
+  MIN_GH_AW_VERSION,
+  OWNERSHIP_ENTRY_COUNT,
+  PACKAGE_NAME,
+  RUNTIME_TUPLES,
+  SKILL_TUPLES,
+  TRIGGER_PROBE,
+  TRIGGER_PROBE_DESTINATION,
+  WORKFLOW_NAMES,
+  buildContract,
+  checkSource,
+  compileWithPinnedActions,
+  materializeRuntime,
+  normalizeCompiledLock,
+  validateContract,
+  validateCompilerActionPins,
+  verifyInstall,
+  verifyCanonicalManifest,
+  writeLocalTestOwnership,
+} from '../workflows/shared/squad-install-verifier.mjs';
 
 const WORKFLOWS_DIR = join(process.cwd(), 'workflows');
 const SQUAD_WORKFLOW = join(WORKFLOWS_DIR, 'squad.md');
+const SQUAD_IMPLEMENT_WORKER = join(WORKFLOWS_DIR, 'squad-implement-worker.md');
 const SHARED_DIR = join(WORKFLOWS_DIR, 'shared');
 const TEST_WORKSPACES_DIR = join(process.cwd(), '.test-workspaces');
+
+/**
+ * Some suites execute the workflow's own `bash`/`jq` snippets through a POSIX
+ * shell to prove the shipped one-liners behave as documented.
+ *
+ * These suites used to gate on `existsSync('/bin/sh')`, which is absent on a
+ * stock Windows dev box — so 13 tests (28 assertions) silently skipped while the
+ * suite still reported green (#1833). Git for Windows ships a POSIX shell, so
+ * resolve that instead of skipping, and fail loudly when none can be found.
+ */
 
 afterAll(() => {
   rmSync(TEST_WORKSPACES_DIR, { recursive: true, force: true });
@@ -27,9 +77,22 @@ afterAll(() => {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Read a text file with line endings normalized to LF.
+ *
+ * Markdown in this repo is not pinned to LF in .gitattributes, so Windows
+ * checkouts (core.autocrlf=true) materialize CRLF. Every assertion here — and
+ * gh-aw itself on the Linux runner — reasons in LF, so normalize on read rather
+ * than making each regex CRLF-aware. This also makes byte-budget measurements
+ * platform-independent.
+ */
+function readText(filePath: string): string {
+  return readFileSync(filePath, 'utf8').replace(/\r\n/g, '\n');
+}
+
 /** Extract YAML frontmatter from a markdown file (between --- delimiters). */
 function extractFrontmatter(filePath: string): string {
-  const content = readFileSync(filePath, 'utf8');
+  const content = readText(filePath);
   const match = content.match(/^---\n([\s\S]*?)\n---/);
   if (!match) throw new Error(`No frontmatter found in ${filePath}`);
   return match[1];
@@ -119,6 +182,7 @@ function extractImports(frontmatter: string): string[] {
       inImports = true;
       continue;
     }
+
     if (inImports) {
       const itemMatch = line.match(/^\s+-\s+(.+)$/);
       if (itemMatch) {
@@ -132,6 +196,83 @@ function extractImports(frontmatter: string): string[] {
   return imports;
 }
 
+/** Extract the resources list from frontmatter. */
+function extractResources(frontmatter: string): string[] {
+  const resources: string[] = [];
+  const lines = frontmatter.split('\n');
+  let inResources = false;
+
+  for (const line of lines) {
+    if (line.match(/^resources:\s*$/)) {
+      inResources = true;
+      continue;
+    }
+
+    if (inResources) {
+      const itemMatch = line.match(/^\s+-\s+(.+)$/);
+      if (itemMatch) {
+        resources.push(itemMatch[1].trim());
+      } else if (line.match(/^\S/)) {
+        break;
+      }
+    }
+  }
+
+  return resources;
+}
+
+function extractWorkflowDispatchInputs(frontmatter: string): Record<string, Record<string, string>> {
+  const inputs: Record<string, Record<string, string>> = {};
+  const lines = frontmatter.split('\n');
+  const workflowDispatchLine = lines.findIndex(line => /^  workflow_dispatch:\s*$/.test(line));
+  if (workflowDispatchLine === -1) return inputs;
+
+  const inputsLine = lines.findIndex((line, index) =>
+    index > workflowDispatchLine && /^    inputs:\s*$/.test(line)
+  );
+  if (inputsLine === -1) return inputs;
+
+  let currentInput: string | null = null;
+  for (let i = inputsLine + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^ {0,3}\S/.test(line)) break;
+
+    const inputMatch = line.match(/^      ([A-Za-z0-9_-]+):\s*$/);
+    if (inputMatch) {
+      currentInput = inputMatch[1];
+      inputs[currentInput] = {};
+      continue;
+    }
+
+    if (!currentInput) continue;
+
+    const propertyMatch = line.match(/^        ([A-Za-z0-9_-]+):\s*(.+)$/);
+    if (propertyMatch) {
+      inputs[currentInput][propertyMatch[1]] = propertyMatch[2].replace(/^['"]|['"]$/g, '');
+    }
+  }
+
+  return inputs;
+}
+function extractConcurrency(frontmatter: string): Record<string, string> | undefined {
+  const lines = frontmatter.split('\n');
+  const concurrencyLine = lines.findIndex(line => /^concurrency:\s*$/.test(line));
+  if (concurrencyLine === -1) return undefined;
+
+  const block: Record<string, string> = {};
+  for (let i = concurrencyLine + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^\S/.test(line)) break;
+
+    const propertyMatch = line.match(/^  ([A-Za-z0-9_-]+):\s*(.+)$/);
+    if (propertyMatch) {
+      block[propertyMatch[1]] = propertyMatch[2];
+    }
+  }
+
+  return Object.keys(block).length > 0 ? block : undefined;
+}
+
 /** Extract mode table rows from the "## Modes" section of the workflow body. */
 function extractModeTable(content: string): Array<{ command: string; mode: string; description: string }> {
   const rows: Array<{ command: string; mode: string; description: string }> = [];
@@ -142,13 +283,16 @@ function extractModeTable(content: string): Array<{ command: string; mode: strin
 
   const section = modesSection[1];
 
-  // Match 3-column table rows: | `command` | Mode | Description |
-  const tableRowRegex = /^\|\s*`([^`]+)`\s*\|\s*([^|]+?)\s*\|\s*([^|]*?)\s*\|/gm;
+  // Match table rows with 2 or 3 columns: | `command` | Mode | [Description] |
+  // The shipped table is 2-column; a 3-column-only pattern silently matched
+  // every other row (the trailing `|` of one row doubling as the opening `|`
+  // of the next), which under-reported coverage by half.
+  const tableRowRegex = /^\|\s*`([^`]+)`\s*\|\s*([^|\n]+?)\s*\|(?:\s*([^|\n]*?)\s*\|)?[ \t]*$/gm;
   let match: RegExpExecArray | null;
   while ((match = tableRowRegex.exec(section)) !== null) {
     const command = match[1].trim();
     const mode = match[2].trim();
-    const description = match[3].trim();
+    const description = (match[3] ?? '').trim();
     // Skip table headers
     if (command === 'Command' || mode === 'Mode') continue;
     rows.push({ command, mode, description });
@@ -195,11 +339,123 @@ function createTestWorkspace(prefix: string): string {
   return mkdtempSync(join(TEST_WORKSPACES_DIR, prefix));
 }
 
+function dispatchedSkill(content: string, command: string): string {
+  const invocation = command
+    .replace('<request-comment-id>', '123')
+    .replace('<request-sha256>', 'a'.repeat(64))
+    .replace(/\{N\}/g, '1')
+    .replace(/<[^>]+>/g, 'example');
+  const parsed = classifySquadCommand({ comment: { body: invocation } }, 'issue_comment');
+  expect(parsed.status, `${command} must be accepted by the real command parser`).toBe('accepted');
+  const table = content.match(/^## Execute Mode\n([\s\S]*?)(?=\n## )/m)?.[1] ?? '';
+  const mappings = [...table.matchAll(/^\| `([^`]+)` \| `(squad-[^`]+)` \|$/gm)];
+  const matches = mappings.filter(([, mode]) => mode === parsed.mode);
+  expect(matches, `${command} must have exactly one parsed-mode dispatch row`).toHaveLength(1);
+  return matches[0][2];
+}
+
+function activationFixture() {
+  const root = createTestWorkspace('quality-activation-');
+  mkdirSync(join(root, '.squad/casting'), { recursive: true });
+  const timestamp = '2026-01-01T00:00:00Z';
+  const registry = {
+    schema: 'squad-agent-provenance/v1', schema_version: 1, revision: 1,
+    generated_at: timestamp, transaction_id: 'quality-fixture',
+    agents: { builder: {
+      agent_id: 'builder', display_name: 'Builder', persistent_name: 'Builder',
+      role: 'Engineer', universe: 'synthetic', status: 'active',
+      created_at: timestamp, updated_at: timestamp,
+    } },
+  };
+  const history = {
+    transaction_id: registry.transaction_id, registry_revision: 1,
+    assignment_cast_snapshots: { genesis: { created_at: timestamp, agents: ['builder'], universe: 'synthetic' } },
+    universe_usage_history: [{ universe: 'synthetic', used_at: timestamp }],
+  };
+  for (const [name, value] of Object.entries({
+    registry, history,
+    'registry-history.commit': {
+      transaction_id: registry.transaction_id, registry_revision: 1,
+      registry_sha256: digest(JSON.stringify(registry)), history_sha256: digest(JSON.stringify(history)),
+    },
+  })) writeFileSync(join(root, `.squad/casting/${name}.json`), JSON.stringify(value));
+  const team = '## Members\n| Name | Role |\n|------|------|\n| Builder | Engineer |\n';
+  writeFileSync(join(root, '.squad/team.md'), team);
+  const body = [
+    '| # | Title | Owner | Agent ID | Depends On |', '|---|---|---|---|---|',
+    '| first | Same title | Builder | builder | None |',
+    '| second | Same title | Builder | builder | first |',
+  ].join('\n');
+  const plan = parseActivationPlan(body, 'plan', registry, team);
+  const context = {
+    repo: { owner: 'owner', repo: 'repo' }, actor: 'operator',
+    payload: {
+      action: 'created', sender: { login: 'operator', type: 'User' },
+      issue: { number: 42 },
+      comment: { body: '/squad activate', user: { login: 'operator', type: 'User' } },
+    },
+  };
+  const env = {
+    GITHUB_EVENT_NAME: 'issue_comment', GITHUB_RUN_ID: '900', GITHUB_RUN_ATTEMPT: '1',
+    SQUAD_WORKFLOW_SHA: 'a'.repeat(40),
+  };
+  const capture = {
+    schema: ACTIVATION_CAPTURE_SCHEMA, repository: 'owner/repo', origin_issue: 42,
+    run_id: 900, run_attempt: 1, workflow_sha: env.SQUAD_WORKFLOW_SHA, command: 'activate',
+    phase: null, actor: 'operator', registry, registry_sha256: digest(registry), team, plan, fullPlan: plan,
+    plan_comment: { id: 10, body, sha256: digest(body), updated_at: timestamp,
+      url: 'https://github.com/owner/repo/issues/42#issuecomment-10' },
+    operations: plan.tasks.map((task: any) => ({
+      id: `task:${task.id}`, task: task.id, epic: task.epic, title: task.title,
+      labels: ['squad', task.label],
+    })),
+    issue_limit: 20,
+  };
+  const comments: any[] = [];
+  const rest = {
+    repos: { getCollaboratorPermissionLevel: vi.fn(async () => ({ data: { permission: 'write' } })) },
+    issues: {
+      listComments: vi.fn(async () => ({ data: structuredClone(comments) })),
+      getComment: vi.fn(async () => ({ data: structuredClone(capture.plan_comment) })),
+      createComment: vi.fn(async (params: any) => {
+        const comment = { ...params, id: 1000 + comments.length };
+        comments.push(comment);
+        return { data: comment };
+      }),
+      getLabel: vi.fn(async () => { throw Object.assign(new Error('Missing'), { status: 404 }); }),
+      createLabel: vi.fn(async () => ({})),
+      addSubIssue: vi.fn(async () => ({})),
+    },
+  };
+  const github = { rest, paginate: async (method: any, params: any) => (await method(params)).data };
+  const journalPath = join(root, 'receipts.json');
+  const savedJournal = () => JSON.parse(readFileSync(journalPath, 'utf8'));
+  const createIssue = vi.fn(async (params: any) => {
+    const journal = savedJournal();
+    expect(comments.find(comment => comment.id === journal.pending_comment_id)?.body)
+      .toContain('squad-activation-pending/v1');
+    expect(journal.started).toHaveLength(journal.receipts.length + 1);
+    const number = 101 + journal.receipts.length;
+    return { staged: false, issue: {
+      ...params, number, id: number + 1000, node_id: `I_${number}`,
+      html_url: `https://github.com/owner/repo/issues/${number}`,
+      url: `https://api.github.com/repos/owner/repo/issues/${number}`,
+    } };
+  });
+  const create = () => createActivation({
+    github, context, env, root, capture, captureArtifactId: 800, journalPath, createIssue,
+    sanitizeContent: (value: string) => value,
+    formatIssueBody: (value: string) => value,
+  });
+  return { root, capture, context, env, github, comments, createIssue, create, savedJournal };
+}
+
 // ---------------------------------------------------------------------------
 // Test: Safe-Output Configuration Validation
 // ---------------------------------------------------------------------------
 
 describe('gh-aw: safe-output configuration', () => {
+  const workflow = readText(SQUAD_WORKFLOW);
   const frontmatter = extractFrontmatter(SQUAD_WORKFLOW);
   const safeOutputs = extractSafeOutputs(frontmatter);
 
@@ -209,9 +465,25 @@ describe('gh-aw: safe-output configuration', () => {
 
   it('each safe-output has a max value that is a positive integer ≤ 1000', () => {
     for (const [name, config] of Object.entries(safeOutputs)) {
-      if (name === 'data') continue;
+      if (['data', 'messages', 'jobs', 'steps', 'allowed-domains', 'threat-detection'].includes(name)) continue;
       expect(config.max, `${name} should have a max field`).toBeDefined();
       const max = config.max as number;
+      expect(max, `${name}.max should be > 0`).toBeGreaterThan(0);
+      expect(max, `${name}.max should be ≤ 1000`).toBeLessThanOrEqual(1000);
+      expect(Number.isInteger(max), `${name}.max should be an integer`).toBe(true);
+    }
+  });
+
+  it('each custom safe-output job has a bounded max value', () => {
+    const jobsBlock = frontmatter.match(
+      /^  jobs:\n([\s\S]*?)(?=^  [\w-]+:)/m,
+    )?.[1] ?? '';
+    const jobs = [...jobsBlock.matchAll(
+      /^    ([\w-]+):\n([\s\S]*?)(?=^    [\w-]+:|(?![\s\S]))/gm,
+    )];
+    expect(jobs.length).toBeGreaterThan(0);
+    for (const [, name, config] of jobs) {
+      const max = Number(config.match(/^      max:\s*(\d+)\s*$/m)?.[1]);
       expect(max, `${name}.max should be > 0`).toBeGreaterThan(0);
       expect(max, `${name}.max should be ≤ 1000`).toBeLessThanOrEqual(1000);
       expect(Number.isInteger(max), `${name}.max should be an integer`).toBe(true);
@@ -252,7 +524,26 @@ describe('gh-aw: safe-output configuration', () => {
     expect(pr.labels, 'should have labels').toBeDefined();
     expect(pr.max, 'should have max').toBeDefined();
     expect(pr['allowed-base-branches'], 'should have allowed-base-branches').toBeDefined();
+    expect(pr['allowed-files'], 'Cast PR must allow generated agent definitions').toContain(
+      '.github/agents/*.agent.md',
+    );
     expect(pr['auto-close-issue'], 'Cast PR must not close the originating work issue').toBe(false);
+  });
+
+  it('reports the verified pull request after safe-output creation', () => {
+    const cast = workflow.slice(
+      workflow.indexOf('## skill: `squad-cast`'),
+      workflow.indexOf('## skill: `squad-review-relay`'),
+    );
+
+    expect(frontmatter).toContain(
+      'pull-request-created: "🤖 Squad created [PR #{item_number}]({item_url}) for review.',
+    );
+    expect(safeOutputs.messages['append-only-comments']).toBe(true);
+    expect(cast).toContain(
+      '`safe-outputs.messages.pull-request-created` notification runs after PR creation',
+    );
+    expect(cast).not.toContain('**PR:** #{pr_number}');
   });
 
   it('defines the minimum schema-validated durable artifact envelope', () => {
@@ -269,10 +560,129 @@ describe('gh-aw: safe-output configuration', () => {
     expect(safeOutputs['add-comment'], 'add-comment should exist').toBeDefined();
   });
 
+  it('keeps built-in comment targets explicit (#1916)', () => {
+    expect(safeOutputs['add-comment'].target).toBe('*');
+    expect(safeOutputs['add-comment']['allows-comment-ids']).toBeUndefined();
+  });
+
   it('create-issue max is 75 (supports large plans, forward-port of #1683)', () => {
     const ci = safeOutputs['create-issue'];
     expect(ci, 'create-issue block must exist').toBeDefined();
     expect(ci['max'], 'create-issue max must be 75 — do not reduce below this').toBe(75);
+  });
+
+  it('add-labels exists and can auto-provision squad labels on a fresh repo (#1955)', () => {
+    const al = safeOutputs['add-labels'];
+    expect(al, 'add-labels block must exist').toBeDefined();
+    expect(al['create-if-missing'], 'add-labels must set create-if-missing so a fresh repo with no squad labels does not silently drop them').toBe(true);
+    expect(al['allowed']).toEqual(['squad', 'squad:*']);
+    expect(al['issues'], 'add-labels must be allowed to target issues').toBe(true);
+    expect(al['target'], 'add-labels must target created issues, not only the triggering one').toBe('*');
+    // One add_labels call per created issue; must cover the largest possible
+    // create-issue run (max 75) with headroom, never less.
+    expect(al['max'] as number).toBeGreaterThanOrEqual(safeOutputs['create-issue']['max'] as number);
+  });
+});
+
+describe('#1916: lifecycle comment updates use a deterministic safe-output job', () => {
+  const workflow = readText(SQUAD_WORKFLOW);
+  const shared = readText(join(SHARED_DIR, 'squad.md'));
+  const repairJob = shared.match(
+    /^  repair_activated_lifecycle:\n([\s\S]*?)(?=^  activation:\n)/m,
+  )?.[0] ?? '';
+
+  function assertRepairAuthorization(job: string): void {
+    expect(job).toContain('context.payload.comment?.user?.login');
+    expect(job).toContain('github.rest.repos.getCollaboratorPermissionLevel');
+    expect(job).toContain('["admin", "maintain", "write"].includes(permission)');
+    expect(job).toContain('Unable to verify lifecycle repair permission');
+    expect(job).toContain('core.setFailed');
+  }
+
+  it('defines a bounded, permission-scoped lifecycle upsert', () => {
+    expect(shared).toContain('upsert-lifecycle-state:');
+    expect(shared).toContain('needs: safe_outputs');
+    expect(shared).toContain('issues: write');
+    expect(shared).toContain('pull-requests: write');
+    expect(shared).toContain('max: 1');
+  });
+
+  it('selects only bot-authored lifecycle artifacts and chooses the newest', () => {
+    expect(shared).toContain('comment.user?.login === "github-actions[bot]"');
+    expect(shared).toContain('includes(marker)');
+    expect(shared).toContain('.sort((left, right)');
+    expect(shared).toContain('const current = matches.at(-1);');
+  });
+
+  it('updates in place or creates the first lifecycle comment', () => {
+    expect(shared).toContain('github.rest.issues.updateComment');
+    expect(shared).toContain('comment_id: current.id');
+    expect(shared).toContain('github.rest.issues.createComment');
+  });
+
+  it('requires one lifecycle upsert with a complete body', () => {
+    expect(workflow).toContain('call `upsert_lifecycle_state` once');
+    expect(workflow).toContain('updates the newest trusted tracker or creates the first one');
+  });
+
+  it('repairs terminal state deterministically when an idempotent rerun omits the upsert', () => {
+    expect(shared).toContain('repair_activated_lifecycle:');
+    expect(shared).toContain(
+      "!contains(needs.agent.outputs.output_types, 'upsert_lifecycle_state')",
+    );
+    expect(shared).toContain("github.event.comment.body == '/squad activate'");
+    expect(shared).toContain('["plan-accepted", "activated"].includes(e?.squad_artifact)');
+    expect(shared).toContain('name: Repair terminal lifecycle after idempotent activation');
+  });
+
+  it('independently verifies the triggering comment author has mutating permission', () => {
+    assertRepairAuthorization(repairJob);
+  });
+
+  it('kills lifecycle repair authorization mutations', () => {
+    for (const mutation of [
+      repairJob.replace(
+        'github.rest.repos.getCollaboratorPermissionLevel',
+        'github.rest.repos.get',
+      ),
+      repairJob.replace(
+        '["admin", "maintain", "write"].includes(permission)',
+        '["admin", "maintain", "write", "read"].includes(permission)',
+      ),
+      repairJob.replace(
+        'Unable to verify lifecycle repair permission',
+        'Ignoring lifecycle repair permission lookup failure',
+      ),
+    ]) {
+      expect(() => assertRepairAuthorization(mutation)).toThrow();
+    }
+  });
+});
+
+describe('gh-aw: router concurrency guard (#1730)', () => {
+  const frontmatter = extractFrontmatter(SQUAD_WORKFLOW);
+  const concurrency = extractConcurrency(frontmatter);
+
+  it('lets the router post explicit mode-specific authorization refusals', () => {
+    expect(frontmatter).toMatch(/^  roles: all$/m);
+  });
+
+  it('declares issue-scoped concurrency without cancel-in-progress', () => {
+    expect(concurrency, 'squad.md should declare a concurrency block').toBeDefined();
+    expect(concurrency?.group).toBe(
+      '"squad-${{ github.event.inputs.issue_number || github.event.issue.number || github.event.pull_request.number || github.run_id }}"'
+    );
+    expect(concurrency?.['cancel-in-progress']).toBe('false');
+    expect(concurrency?.group, 'group must resolve the manual-dispatch issue number').toContain(
+      'github.event.inputs.issue_number'
+    );
+    expect(concurrency?.group, 'group must resolve issue and issue_comment events').toContain(
+      'github.event.issue.number'
+    );
+    expect(concurrency?.group, 'group must resolve pull_request_review_comment events').toContain(
+      'github.event.pull_request.number'
+    );
+    expect(concurrency?.group, 'group must not collapse to a static/global lock').toContain('github.run_id');
   });
 });
 
@@ -281,7 +691,7 @@ describe('gh-aw: safe-output configuration', () => {
 // ---------------------------------------------------------------------------
 
 describe('gh-aw: mode dispatch completeness', () => {
-  const content = readFileSync(SQUAD_WORKFLOW, 'utf8');
+  const content = readText(SQUAD_WORKFLOW);
   const modeTable = extractModeTable(content);
 
   it('mode table has entries', () => {
@@ -289,29 +699,10 @@ describe('gh-aw: mode dispatch completeness', () => {
   });
 
   it('each mode in the dispatch table has a corresponding section', () => {
-    // Modes that have dedicated sections (#### Mode Name or similar heading)
-    const headingRegex = /^#{2,4}\s+(.+?)$/gm;
-    const headings: string[] = [];
-    let match: RegExpExecArray | null;
-    while ((match = headingRegex.exec(content)) !== null) {
-      headings.push(match[1].trim().toLowerCase());
-    }
-
-    // Unique mode names from the dispatch table (normalize combined modes)
-    const uniqueModes = [...new Set(modeTable.map(r => r.mode))];
-
-    for (const mode of uniqueModes) {
-      const normalized = mode.toLowerCase();
-      // Check if any heading contains the mode name (flexible match)
-      // For multi-word modes like "Plan Accept", check for "plan accept" or "plan-accept"
-      // Also check if the base mode has a section (e.g., "Cast" for "Cast Mode")
-      const found = headings.some(h =>
-        h.includes(normalized) ||
-        h.includes(normalized.replace(/\s+/g, '-')) ||
-        h.includes(`${normalized} mode`) ||
-        h === `${normalized} mode`
-      );
-      expect(found, `Mode "${mode}" should have a corresponding section heading`).toBe(true);
+    for (const { command } of modeTable) {
+      const skill = dispatchedSkill(content, command);
+      expect(content, `${command} must dispatch to an existing skill section`)
+        .toContain(`## skill: \`${skill}\``);
     }
   });
 
@@ -355,6 +746,46 @@ describe('gh-aw: shared component imports', () => {
     expect(imports.length).toBeGreaterThan(0);
   });
 
+  it('declares the plaintext Cast validator resource and canonical built-in charter resources, not imported skills', () => {
+    const runtimeResources = [
+      'shared/squad-activation.mjs',
+      'shared/check-agent-binding.mjs',
+      'shared/squad-command-contract.mjs',
+      'shared/squad-evidence-provider.mjs',
+      'shared/squad-cast-validator.mjs',
+      'shared/squad-bootstrap-validator.mjs',
+      'shared/squad-improvement-gate.mjs',
+      'shared/squad-retro-evidence.mjs',
+      'shared/squad-retro-provenance.mjs',
+      'shared/squad-implementation-provenance.mjs',
+      'shared/implementation-provenance-v1.schema.json',
+    ];
+    const builtinResources = [
+      'shared/builtins/scribe-charter.md',
+      'shared/builtins/ralph-charter.md',
+      'shared/builtins/rai-charter.md',
+      'shared/builtins/fact-checker-charter.md',
+    ];
+    expect(extractResources(frontmatter)).toEqual([...runtimeResources, ...builtinResources]);
+    expect(imports).not.toContain('shared/squad-cast-validator.md');
+    for (const runtimeResource of runtimeResources) {
+      expect(existsSync(join(WORKFLOWS_DIR, runtimeResource))).toBe(true);
+    }
+    for (const builtinResource of builtinResources) {
+      expect(existsSync(join(WORKFLOWS_DIR, builtinResource))).toBe(true);
+    }
+    expect(existsSync(join(SHARED_DIR, 'squad-cast-validator.md'))).toBe(false);
+    expect(existsSync(join(SHARED_DIR, 'squad-gh-aw-resource-probe.txt'))).toBe(false);
+
+    for (const sharedFile of [
+      'squad.md',
+      'squad-planning-ontology.md',
+      'squad-planning-policy.md',
+    ]) {
+      expect(readText(join(SHARED_DIR, sharedFile))).not.toMatch(/^resources:/m);
+    }
+  });
+
   it('each imported file exists in workflows/shared/', () => {
     for (const importPath of imports) {
       const fullPath = join(WORKFLOWS_DIR, importPath);
@@ -370,7 +801,7 @@ describe('gh-aw: shared component imports', () => {
       const fullPath = join(WORKFLOWS_DIR, importPath);
       if (!existsSync(fullPath)) continue;
 
-      const content = readFileSync(fullPath, 'utf8');
+      const content = readText(fullPath);
       expect(content.length, `${importPath} should not be empty`).toBeGreaterThan(0);
       expect(content, `${importPath} should contain at least one heading`).toMatch(/^#+\s+.+/m);
     }
@@ -381,7 +812,7 @@ describe('gh-aw: shared component imports', () => {
       const fullPath = join(WORKFLOWS_DIR, importPath);
       if (!existsSync(fullPath)) continue;
 
-      const content = readFileSync(fullPath, 'utf8');
+      const content = readText(fullPath);
       // Check for markdown links to local files (not URLs)
       const localLinks = content.match(/\[.*?\]\((?!https?:\/\/|#)([^)]+)\)/g) || [];
       for (const link of localLinks) {
@@ -398,18 +829,124 @@ describe('gh-aw: shared component imports', () => {
   });
 });
 
+describe('gh-aw: clean install runtime resource closure', () => {
+  const workflowNames = [
+    'squad',
+    'squad-implement-worker',
+    'squad-review',
+    'squad-deps-worker',
+    'squad-retro',
+    'squad-improvement-worker',
+    'squad-bootstrap',
+    'squad-command-router',
+  ];
+  const expectedRuntimeResources = [
+    'shared/check-agent-binding.mjs',
+    'shared/implementation-provenance-v1.schema.json',
+    'shared/squad-activation.mjs',
+    'shared/squad-bootstrap-validator.mjs',
+    'shared/squad-cast-validator.mjs',
+    'shared/squad-command-contract.mjs',
+    'shared/squad-evidence-provider.mjs',
+    'shared/squad-implementation-provenance.mjs',
+    'shared/squad-improvement-gate.mjs',
+    'shared/squad-install-verifier.mjs',
+    'shared/squad-retro-evidence.mjs',
+    'shared/squad-retro-provenance.mjs',
+    'shared/squad-review-guard.mjs',
+  ];
+
+  function runtimeResourceReferences(text: string): string[] {
+    return [...text.matchAll(
+      /(?:\.github\/workflows\/)?(shared\/(?:[A-Za-z0-9._/-]+\.mjs|implementation-provenance-v1\.schema\.json))/g,
+    )]
+      .map(match => match[1]);
+  }
+
+  function assertRuntimeClosure(workflowDir: string, references: string[]): void {
+    const missing = references.filter(reference => !existsSync(join(workflowDir, reference)));
+    expect(missing, 'clean gh-aw install is missing referenced runtime modules').toEqual([]);
+  }
+
+  function createCleanInstalledTarget(): string {
+    const workspace = createTestWorkspace('gh-aw-clean-install-');
+    const workflowDir = join(workspace, '.github', 'workflows');
+    mkdirSync(workflowDir, { recursive: true });
+
+    const importedFiles = new Set<string>();
+    for (const workflowName of workflowNames) {
+      const source = join(WORKFLOWS_DIR, `${workflowName}.md`);
+      cpSync(source, join(workflowDir, `${workflowName}.md`));
+      for (const imported of extractImports(extractFrontmatter(source))) {
+        importedFiles.add(imported);
+      }
+    }
+    for (const imported of importedFiles) {
+      const destination = join(workflowDir, imported);
+      mkdirSync(dirname(destination), { recursive: true });
+      cpSync(join(WORKFLOWS_DIR, imported), destination);
+    }
+
+    for (const workflowName of workflowNames) {
+      const source = join(WORKFLOWS_DIR, `${workflowName}.md`);
+      for (const resource of extractResources(extractFrontmatter(source))) {
+        const destination = join(workflowDir, resource);
+        mkdirSync(dirname(destination), { recursive: true });
+        cpSync(join(WORKFLOWS_DIR, resource), destination);
+      }
+    }
+
+    execFileSync('git', ['init', '--quiet'], { cwd: workspace });
+    execFileSync(
+      'gh',
+      ['aw', 'compile', '--strict', '--approve', '--no-check-update'],
+      { cwd: workspace, encoding: 'utf8', stdio: 'pipe', timeout: 120000 },
+    );
+    return workflowDir;
+  }
+
+  it('emits every shared runtime resource referenced by all eight sources and locks', () => {
+    const workflowDir = createCleanInstalledTarget();
+    const references = new Set<string>();
+    for (const workflowName of workflowNames) {
+      for (const extension of ['md', 'lock.yml']) {
+        const file = join(workflowDir, `${workflowName}.${extension}`);
+        expect(existsSync(file), `${file} must exist in the installed target`).toBe(true);
+        for (const reference of runtimeResourceReferences(readText(file))) {
+          references.add(reference);
+        }
+      }
+    }
+
+    const sortedReferences = [...references].sort();
+    expect(sortedReferences).toEqual(expectedRuntimeResources);
+    assertRuntimeClosure(workflowDir, sortedReferences);
+
+    for (const modulePath of sortedReferences) {
+      const installedModule = join(workflowDir, modulePath);
+      rmSync(installedModule);
+      expect(
+        () => assertRuntimeClosure(workflowDir, sortedReferences),
+        `deleting ${modulePath} must break clean-install closure`,
+      ).toThrow();
+      cpSync(join(WORKFLOWS_DIR, modulePath), installedModule);
+    }
+  }, 120000);
+});
+
 // ---------------------------------------------------------------------------
 // Test: Planning State Machine
 // ---------------------------------------------------------------------------
 
 describe('gh-aw: planning state machine', () => {
-  const ontologyContent = readFileSync(join(SHARED_DIR, 'planning-ontology.md'), 'utf8');
-  const squadContent = readFileSync(SQUAD_WORKFLOW, 'utf8');
+  const ontologyContent = readText(join(SHARED_DIR, 'squad-planning-ontology.md'));
+  const squadContent = readText(SQUAD_WORKFLOW);
 
   function registryArtifactKinds(): string[] {
     const registry = ontologyContent.match(/## 4\. Structured Artifact Registry([\s\S]*?)(?=\n---|\n## \d)/);
     if (!registry) throw new Error('Structured Artifact Registry section is missing');
-    return [...registry[1].matchAll(/^\| `([^`]+)` \|/gm)].map(match => match[1]);
+    return [...registry[1].matchAll(/^\| `([^`]+)` \|/gm)]
+      .map(match => match[1]).filter(kind => kind !== 'squad_artifact');
   }
 
   it('uses no Squad HTML comment as machine state', () => {
@@ -445,17 +982,29 @@ describe('gh-aw: planning state machine', () => {
     }
   });
 
-  it('workflow schema enumerates every registered artifact kind', () => {
+  it('registered artifacts have a model schema or an explicit trusted-only publisher', () => {
+    const schema = parseDocument(extractFrontmatter(SQUAD_WORKFLOW)).toJS()['safe-outputs'].data;
+    const kinds = schema.properties.squad_artifact.enum;
+    const trustedPublisher = readText(join(SHARED_DIR, 'squad-activation.mjs'));
     for (const artifactKind of registryArtifactKinds()) {
-      expect(squadContent, `safe-outputs.data should allow "${artifactKind}"`).toMatch(
-        new RegExp(`^\\s+- ${artifactKind}$`, 'm')
-      );
+      if (artifactKind === 'activation-reconciled') {
+        expect(kinds, 'the model must not author a trusted reconciliation supplement').not.toContain(artifactKind);
+        expect(trustedPublisher).toContain("squad_artifact: 'activation-reconciled'");
+        expect(trustedPublisher).toContain("basis: 'current-state-authorized'");
+        const job = parseDocument(extractFrontmatter(SQUAD_WORKFLOW)).toJS()['safe-outputs'].jobs['reconcile-activation'];
+        expect(job.max).toBe(1);
+        expect(Object.keys(job.inputs)).toEqual(['action']);
+        expect(job.steps.at(-1).with.script).toContain('await activation.reconcileActivation');
+        expect(job.steps.at(-1).with.script).toContain('Reconciliation rejects model-provided mappings');
+      } else {
+        expect(kinds, `safe-outputs.data should allow "${artifactKind}"`).toContain(artifactKind);
+      }
     }
   });
 
   it('Research fixture data supports downstream Triage discovery', () => {
     const fixtures = join(process.cwd(), 'test-fixtures', 'planning', 'aspiregregator');
-    const researchBody = readFileSync(join(fixtures, 'research-output.md'), 'utf8');
+    const researchBody = readText(join(fixtures, 'research-output.md'));
     const wrongOrigin = researchBody.replace('"origin_issue": 8', '"origin_issue": 999');
     const discovered = findLatestArtifact(
       ['No structured artifact here', wrongOrigin, researchBody],
@@ -485,7 +1034,7 @@ describe('gh-aw: planning state machine', () => {
     ]);
 
     for (const [file, artifactKinds] of expected) {
-      const artifacts = extractStructuredData(readFileSync(join(fixtures, file), 'utf8'));
+      const artifacts = extractStructuredData(readText(join(fixtures, file)));
       expect(artifacts.map(item => item.squad_artifact), file).toEqual(artifactKinds);
       for (const artifact of artifacts) {
         expect(artifact.schema_version, file).toBe('1');
@@ -507,6 +1056,113 @@ describe('gh-aw: planning state machine', () => {
 
     expect(findLatestArtifact([body], 'phases-accepted', 8)?.data.phases).toEqual([1, 2]);
     expect(squadContent).toContain('"phases":[{accumulated}]');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: Validation schema must not ship its own verdict (#1801)
+// ---------------------------------------------------------------------------
+
+/**
+ * The planning ontology's Validation Result schema (§3.6) once listed five named
+ * checks, each pre-filled with a literal `✅`. The model was therefore not asked
+ * to determine a verdict — it was handed a table whose verdict was already PASS
+ * and asked to reproduce it. It did, including on a run where every agent binding
+ * was invalid: `| Agent assignments valid | ✅ (lead, lead, devrel) |`. The check
+ * passed on precisely the input it exists to reject.
+ *
+ * That is #1784's mechanism aimed at the verdict instead of the value — a concrete
+ * literal in the prompt gets copied verbatim, and here the salient literal was the
+ * pass mark. The ontology's own convention already said how to avoid it: angle
+ * brackets mean "you fill this in", which §3.6's final row obeyed while the five
+ * above it did not.
+ *
+ * Scope note: this deliberately targets the *validation* schema rather than every
+ * status literal in the file. §5's Lifecycle Summary legitimately ships a worked
+ * snapshot with mixed `✅ Done` / `⬚ Pending` rows plus an icon legend — that is
+ * bookkeeping recorded from which command ran, not a judgment determined from
+ * evidence, and a blanket rule would fail it for no benefit. A precise gate that
+ * provably catches the real defect beats a general one that misfires.
+ */
+describe('gh-aw: validation schema ships no pre-filled verdict (#1801)', () => {
+  const ontology = readText(join(SHARED_DIR, 'squad-planning-ontology.md'));
+
+  /** The fenced `## Plan Validation` template from ontology §3.6. */
+  function validationSchema(): string {
+    const match = ontology.match(/```markdown\n(## Plan Validation[\s\S]*?)```/);
+    if (!match) {
+      throw new Error(
+        'Could not locate the fenced `## Plan Validation` schema in ' +
+          'squad-planning-ontology.md. If §3.6 was renamed, update this test — ' +
+          'do not delete it.',
+      );
+    }
+    return match[1];
+  }
+
+  /** Rows of a markdown table, minus header and separator. */
+  function dataRows(block: string): string[][] {
+    return block
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l.startsWith('|') && !/^\|[\s\-:|]+\|$/.test(l))
+      .map((l) =>
+        l
+          .replace(/^\||\|$/g, '')
+          .split('|')
+          .map((c) => c.trim()),
+      )
+      .filter((cells) => cells[0] !== 'Check');
+  }
+
+  it('locates the validation schema', () => {
+    // Guards the assertions below against silently evaluating an empty set —
+    // the same vacuous-pass failure this suite exists to prevent.
+    expect(dataRows(validationSchema()).length).toBeGreaterThan(0);
+  });
+
+  it('supplies no literal verdict in a cell the model must determine', () => {
+    const offenders = dataRows(validationSchema())
+      .filter((cells) => cells.slice(1).some((c) => /^(✅|❌)/.test(c)))
+      .map((cells) => `| ${cells.join(' | ')} |`);
+
+    expect(
+      offenders,
+      'A named check paired with a literal verdict hands the model its answer, ' +
+        'and it will be copied verbatim (#1784). Use <placeholder> syntax for ' +
+        `every cell the model must determine:\n${offenders.join('\n')}`,
+    ).toEqual([]);
+  });
+
+  it('defers to one check vocabulary instead of naming its own', () => {
+    // Three surfaces once disagreed on what the checks were: this schema listed
+    // five names, `squad-plan-validate` Step 2 numbered ten different ones, and
+    // the implementation plan specified none at all. The ambiguity resolved
+    // toward the pre-filled template. One vocabulary, named in one place.
+    expect(
+      validationSchema(),
+      'The Validation Result schema must point at squad-plan-validate Step 2 ' +
+        'as the sole check vocabulary rather than restating check names.',
+    ).toMatch(/Step 2/);
+  });
+
+  it('does not restate a pass threshold that Step 2 owns', () => {
+    // The removed rows carried `Sizing within bounds (no >XL)` while Step 2
+    // Check 5 fails a task `> L`. Two surfaces, two thresholds, one silent
+    // contradiction — duplication is how they drifted apart.
+    expect(validationSchema()).not.toMatch(/>\s*XL/);
+  });
+
+  it('keeps the self-assessed pre-check out of the implementation plan', () => {
+    // Surface 1: the implementation plan named a `Validation Pre-check` section
+    // with zero rows specified, so the model reached for the pre-cleared
+    // template in §3.6. A pass claimed by the skill that authored the plan is
+    // not evidence.
+    expect(
+      readText(SQUAD_WORKFLOW),
+      'squad.md must not reintroduce a self-assessed Validation Pre-check; ' +
+        'validation is /squad plan validate\'s artifact.',
+    ).not.toMatch(/→\s*Validation Pre-check/);
   });
 });
 
@@ -550,112 +1206,1380 @@ describe('gh-aw: workflow frontmatter schema', () => {
 describe('gh-aw: prompt budget & planning import regression', () => {
   const frontmatter = extractFrontmatter(SQUAD_WORKFLOW);
   const imports = extractImports(frontmatter);
-  const squadContent = readFileSync(SQUAD_WORKFLOW, 'utf8');
+  const squadContent = readText(SQUAD_WORKFLOW);
 
-  // gh-aw enforces a hard 100 KB prompt ceiling (102 400 bytes)
-  const GH_AW_PROMPT_CEILING_KB = 100;
-  const GH_AW_PROMPT_CEILING_BYTES = GH_AW_PROMPT_CEILING_KB * 1024;
+  // There is no hard gh-aw prompt ceiling, and this block used to assert one (#1842).
+  //
+  // The 102 400 figure previously cited here as "gh-aw enforces a hard 100 KB prompt
+  // ceiling" is `defaultRepoMemoryMaxFileSize` in gh-aw's pkg/workflow/repo_memory.go —
+  // a cap on repo-MEMORY files, unrelated to prompts. gh-aw's own guidance
+  // (.github/aw/token-optimization.md) treats prompt size as a cost/quality concern
+  // ("strip redundant instructions"), never as a byte limit.
+  //
+  // It also measured the wrong quantity. What reaches the model is the AMBIENT prompt:
+  // gh-aw strips every inline `## skill:` block during the setup/interpolation step
+  // (.github/aw/skills.md), and ~2/3 of this workflow plus two entire imports are such
+  // blocks. Summing raw source therefore counted ~65 KB that never enters the initial
+  // request, while ignoring the boilerplate gh-aw injects (xpia.md, markdown.md,
+  // safe_outputs_*.md). Both sides of the comparison were wrong, which left the gate
+  // reporting ~26 bytes of headroom and failing correct changes on byte count alone.
+  //
+  // The real budget is asserted canonically in "gh-aw: inline skill extraction" →
+  // "keeps the ambient prompt under 40 KB". The check below is only a source-GROWTH
+  // regression guard: it keeps unbounded authoring growth visible without pretending
+  // authored bytes are delivered bytes.
+  //
+  // Raised 160 → 170 KB by #1959. The fast-path label-provisioning contract it adds
+  // lives entirely inside the `squad-plan-accept` inline `## skill:` block, so gh-aw
+  // strips it from the ambient prompt — "keeps the ambient prompt under 40 KB" is
+  // unaffected and still passing, which is exactly the condition the comment above
+  // names as making a raise legitimate. #1962's follow-up trims bought some room back
+  // but not enough: combined source measures 164.8 KB after both changes, still over
+  // 160, so the raise stays. 170 KB leaves a usable margin without removing the signal.
+  //
+  // Raised 170 -> 173 KB by #1963, which makes both activation paths report actual
+  // accepted label-operation outcomes and fixes the `Activation bindings:` JSON to carry
+  // quoted temporary-ID references. Nearly all of that prose lands inside the
+  // `squad-plan-activate` and `squad-plan-accept` inline skill blocks; only the shared
+  // ontology's binding contract is ambient, and "keeps the ambient prompt under 40 KB"
+  // still passes at ~32 KB - the condition above that makes a raise legitimate.
+  //
+  // Raised 173 -> 177 KB by #1961, which bounds activation label capacity and makes
+  // truncation explicit. #1963 deliberately did not pre-raise for this branch and
+  // projected it would land at ~180 002 B; measured on the actual merge of #1961 into
+  // dev (with #1963 already merged) the combined authored source is 180 036 B = 175.8 KB,
+  // within 34 bytes of that projection.
+  //
+  // 176 KB would pass by only 188 bytes, which reproduces the near-zero-margin failure
+  // mode this guard already hit once: before the 160 -> 170 raise it sat 21-28 bytes from
+  // its ceiling, so two independently compliant PRs could not coexist and correct changes
+  // failed on byte count alone. 177 KB leaves 1 212 bytes, so the guard still bites on
+  // genuine growth without re-creating a threshold the next change trips by accident.
+  // All of #1961's growth is inside the `squad-plan-activate` inline skill, which the
+  // extractor strips from the ambient prompt and loads on demand; ambient re-measured at
+  // 32 KB against 40 KB on the merged tree.
+  // Raised 177 -> 181 KB by the online-research capability (web-fetch in
+  // `/squad research`). The growth is the squad-research skill's online-doc
+  // consultation guidance, the required "Online sources" disclosure, and its
+  // Step 5 checklist item — all inside the `squad-research` inline `## skill:`
+  // block, which the extractor closes at the next `## skill:` H2 and strips from
+  // the ambient prompt. Only a ~300 B "Online sources" line added to the shared
+  // ontology's §3.2 template is ambient. "keeps the ambient prompt under 40 KB"
+  // still passes on this tree — the condition above that makes a raise
+  // legitimate. Combined authored source measured 183 626 B = 179.3 KB
+  // (Buffer.byteLength over squad.md + all imports, same sum this test performs);
+  // 181 KB leaves 1 718 bytes of margin, comparable to the 1 212 the 177 raise
+  // left, so the guard still bites on genuine growth.
+  //
+  // Raised 181 -> 183 KB by the Cast validator's deterministic disk-extraction and
+  // SHA-256 authentication command. That command is authored between marker comments
+  // inside the `squad-cast` inline skill in workflows/squad.md; gh-aw strips the full
+  // skill from the ambient prompt and loads it on demand.
+  // Raised 183 -> 189 KB by the truthful Cast terminal contract and its typed
+  // post-agent failure job. The ambient 40 KB guard still passes; the behavioral
+  // detail is confined to the on-demand `squad-cast` skill, while the safe job is
+  // required executable policy rather than ambient model guidance.
+  // Raised 189 -> 194 KB when the authenticated extraction and validation sequence
+  // moved from agent-transcribed prompt text into a deterministic pre-agent runner.
+  // The runner also emits a machine-readable factual failure record. The Cast skill
+  // shrank, and the ambient prompt remains below its independently enforced 40 KB cap.
+  // Raised 194 -> 196 KB by #1982's gh-aw-only resource assertion. The deterministic
+  // step runs before the agent and does not enter its prompt; the separate ambient
+  // prompt budget remains the authoritative delivered-context guard.
+  // Lowered 196 -> 187 KB by #1984: replaced the gzip+Base64-encoded validator skill
+  // wrapper (`shared/squad-cast-validator.md`, imported) and the experimental probe
+  // resource with a canonical plaintext top-level `resources:` sidecar
+  // (`shared/squad-cast-validator.mjs`). Resources are installed verbatim by gh-aw but
+  // are not summed into this budget (they were never part of the imported/ambient
+  // source), so removing the large embedded payload from `imports:` drops the total.
+  // Combined authored source now measures ~186.1 KB; 187 KB leaves a similar margin to
+  // prior raises so the guard still bites on genuine growth.
+  // Raised 187 -> 191 KB by the gh-aw Cast built-in preservation change: `squad-cast`
+  // Step 4 now defines the permanent four-built-in support set (scribe, ralph, rai,
+  // fact-checker), preserves their materialized directories during bootstrap cleanup,
+  // and requires a dedicated `## Built-in Support Agents` section in generated
+  // team.md/coordinator output plus their four charter paths in the safe-output
+  // payload. The canonical charter *content* for those four built-ins is shipped as
+  // `resources:` (`shared/builtins/*-charter.md`), which — like the validator sidecar
+  // above — is installed verbatim by gh-aw and is not summed into this budget; only the
+  // added prose describing how to preserve/reference them grew the authored source.
+  // Combined authored source now measures ~190.3 KB; 191 KB leaves a similar tight
+  // margin to prior raises so the guard still bites on genuine growth.
+  // Raised 191 -> 193 KB for the lifecycle repair authorization gate. The added
+  // source independently verifies the triggering comment author's live repository
+  // permission before the deterministic repair job can write a terminal state.
+  // The ambient prompt remains below its separate 40 KB delivery guard.
+  // Raised 193 -> 194 KB for the command-only lifecycle next-action contract.
+  // Its validation and retry guidance are inside the on-demand plan-validation
+  // skill; the ambient prompt remains below the independently enforced 40 KB cap.
+  // Raised 194 -> 198 KB for versioned work-to-agent provenance. The additional
+  // contract is confined to on-demand planning/activation skills.
+  const SOURCE_GROWTH_BUDGET_KB = 198;
+  const SOURCE_GROWTH_BUDGET_BYTES = SOURCE_GROWTH_BUDGET_KB * 1024;
 
-  it('planning-ontology.md is in the imports list', () => {
-    expect(imports, 'shared/planning-ontology.md must be imported').toContain('shared/planning-ontology.md');
+  it('squad-planning-ontology.md is in the imports list', () => {
+    expect(imports, 'shared/squad-planning-ontology.md must be imported').toContain('shared/squad-planning-ontology.md');
   });
 
-  it('planning-policy.md is in the imports list', () => {
-    expect(imports, 'shared/planning-policy.md must be imported').toContain('shared/planning-policy.md');
+  it('squad-planning-policy.md is in the imports list', () => {
+    expect(imports, 'shared/squad-planning-policy.md must be imported').toContain('shared/squad-planning-policy.md');
   });
 
   it('no runtime cat of planning files remains in squad.md', () => {
     expect(
       squadContent,
-      'squad.md must not contain runtime `cat .github/workflows/shared/planning-*.md` instructions'
-    ).not.toMatch(/cat .github\/workflows\/shared\/planning-[\w-]+\.md/);
+      'squad.md must not contain runtime `cat .github/workflows/shared/*planning-*.md` instructions'
+    ).not.toMatch(/cat .github\/workflows\/shared\/[\w-]*planning-[\w-]+\.md/);
   });
 
-  it(`combined prompt (workflow + all imports) is under ${GH_AW_PROMPT_CEILING_KB} KB`, () => {
+  it(`combined source (workflow + all imports) stays under ${SOURCE_GROWTH_BUDGET_KB} KB`, () => {
     let totalBytes = Buffer.byteLength(squadContent, 'utf8');
 
     for (const importPath of imports) {
       const fullPath = join(WORKFLOWS_DIR, importPath);
       if (existsSync(fullPath)) {
-        const content = readFileSync(fullPath, 'utf8');
+        const content = readText(fullPath);
         totalBytes += Buffer.byteLength(content, 'utf8');
       }
     }
 
     const totalKB = (totalBytes / 1024).toFixed(1);
-    const headroomKB = ((GH_AW_PROMPT_CEILING_BYTES - totalBytes) / 1024).toFixed(1);
 
     expect(
       totalBytes,
-      `Combined prompt is ${totalKB} KB — exceeds the gh-aw ${GH_AW_PROMPT_CEILING_KB} KB ceiling. Headroom: ${headroomKB} KB.`
-    ).toBeLessThan(GH_AW_PROMPT_CEILING_BYTES);
-  });
-
-  it('reports combined bytes and headroom', () => {
-    let totalBytes = Buffer.byteLength(squadContent, 'utf8');
-    for (const importPath of imports) {
-      const fullPath = join(WORKFLOWS_DIR, importPath);
-      if (existsSync(fullPath)) totalBytes += Buffer.byteLength(readFileSync(fullPath, 'utf8'), 'utf8');
-    }
-    const headroomBytes = GH_AW_PROMPT_CEILING_BYTES - totalBytes;
-    // Informational — log bytes/headroom; fail only if headroom < 5 KB (regression guard)
-    expect(
-      headroomBytes,
-      `Headroom too low: ${(headroomBytes / 1024).toFixed(1)} KB remaining of ${GH_AW_PROMPT_CEILING_KB} KB ceiling`
-    ).toBeGreaterThan(5 * 1024);
+      `Combined authored source is ${totalKB} KB, over the ${SOURCE_GROWTH_BUDGET_KB} KB growth guard. ` +
+        `This is NOT a gh-aw limit — it flags unbounded growth of the workflow and its imports. ` +
+        `Check "keeps the ambient prompt under 40 KB" first: if ambient is healthy, the growth is ` +
+        `in inline skills (loaded on demand) and raising this guard is legitimate.`
+    ).toBeLessThan(SOURCE_GROWTH_BUDGET_BYTES);
   });
 });
 
 // ---------------------------------------------------------------------------
-// Test: gh-aw compilation retains durable state and Auto-Cast contracts
+// Test: inline skill extraction semantics (gh-aw setup step)
+//
+// The shipped workflow moves its mode playbooks and planning reference material
+// into gh-aw inline `## skill:` blocks so they load on demand instead of
+// sitting in every run's ambient prompt.
+//
+// This models the real extractor (gh-aw-actions setup/js/extract_inline_skills.cjs)
+// so the invariants are enforced here rather than discovered at runtime:
+//
+//   * a block runs from its start marker to a matching "## end skill: `name`"
+//     if one exists, otherwise to the next H2 heading or EOF;
+//   * when a block closes IMPLICITLY at an H2, everything between that boundary
+//     and the next start marker is DISCARDED — not extracted, not kept.
+//
+// That discard rule is the sharp edge: a skill marker placed above a body whose
+// own sections are H2s silently drops the rest of the file (and, because the
+// imports are concatenated ahead of the workflow body, potentially the router
+// itself). Conservation is asserted below so that can never ship unnoticed.
 // ---------------------------------------------------------------------------
 
-describe('gh-aw: compiled workflow contract', () => {
-  const ghAwAvailable = spawnSync('gh', ['aw', '--version'], { encoding: 'utf8' }).status === 0;
+const SKILL_START_RE = /^##[ \t]+skill:[ \t]+`([a-z][a-z0-9_-]*)`[ \t]*$/gm;
 
-  // Explicit timeout: this test shells out to the real `gh aw compile` binary,
-  // which reliably finishes in ~2-3s in isolation but can exceed the 5s vitest
-  // default under full-suite parallel load/contention. Bumping this avoids
-  // spurious CI flakiness unrelated to the assertions themselves.
-  it.skipIf(!ghAwAvailable)('strict-compiles and preserves prompt/config behavior', () => {
-    const workspace = createTestWorkspace('gh-aw-compile-');
-    try {
-      execFileSync('git', ['init', '--quiet'], { cwd: workspace });
-      // gh-aw's dispatch-workflow validation (added alongside #1682's
-      // safe-outputs.dispatch-workflow config) resolves its dispatch target against
-      // a `.github/workflows/` directory that it locates relative to the compiled
-      // file's path, assuming the standard `<repo-root>/.github/workflows/<file>.md`
-      // layout. This repo distributes the gh-aw *source* one level shallower, from a
-      // top-level `workflows/` directory (see docs/src/content/docs/guide/gh-aw.md),
-      // which downstream consumers install into their own `.github/workflows/` via
-      // `gh aw add owner/squad/workflows/squad-implement-worker.md@dev
-      // owner/squad/workflows/squad.md@dev` — landing both files side-by-side there.
-      // Mirror that real deployment layout in the ephemeral test workspace (instead
-      // of a bare `workflows/` copy) so the dispatch target `squad-implement-worker`
-      // resolves the same way it will for every real downstream install.
-      cpSync(WORKFLOWS_DIR, join(workspace, '.github', 'workflows'), { recursive: true });
-      execFileSync('gh', ['aw', 'compile', '.github/workflows/squad.md', '--strict'], {
-        cwd: workspace,
-        encoding: 'utf8',
-        stdio: 'pipe',
+interface ExtractionResult {
+  ambient: string;
+  skills: { name: string; bytes: number; body: string }[];
+  discardedBytes: number;
+  markerBytes: number;
+}
+
+/**
+ * Report why a skill's frontmatter would fail to parse as YAML, or null if it is fine.
+ *
+ * gh-aw's extractor (setup/js/extract_inline_skills.cjs) filters skill frontmatter
+ * LINE BY LINE and never parses it, so a malformed `description:` is written to
+ * .github/skills/<name>/SKILL.md verbatim and surfaces only when the agent tries to
+ * load that skill. `gh aw compile --strict` does not catch it either: at compile time
+ * a skill block is still ordinary markdown. This check closes that gap.
+ *
+ * Deliberately hand-rolled rather than delegating to a YAML library: this repo has no
+ * YAML parser in its dependency tree (frontmatter elsewhere is validated by actionlint,
+ * which only reads real workflow YAML), and a lint this narrow does not justify adding
+ * one. It targets the plain-scalar hazards that actually bite in a one-line description.
+ */
+function findFrontmatterScalarError(body: string): { key: string; value: string; reason: string } | null {
+  if (!body.startsWith('\n---\n') && !body.startsWith('---\n')) return null;
+  const opened = body.slice(body.indexOf('---\n') + 4);
+  const closeIdx = opened.indexOf('\n---');
+  if (closeIdx === -1) return null;
+
+  for (const line of opened.slice(0, closeIdx).split('\n')) {
+    const m = /^([A-Za-z_][A-Za-z0-9_-]*):[ \t]+(.*)$/.exec(line);
+    if (!m) continue;
+    const [, key, raw] = m;
+    const value = raw.trim();
+    if (!value) continue;
+
+    // A quoted scalar escapes every hazard below.
+    const quoted =
+      (value.startsWith('"') && value.endsWith('"') && value.length > 1) ||
+      (value.startsWith("'") && value.endsWith("'") && value.length > 1);
+    if (quoted) continue;
+
+    // Block scalars (`|`, `>`) carry their value on following lines.
+    if (/^[|>][-+0-9]*$/.test(value)) continue;
+
+    // `[` and `{` open YAML flow collections, which are valid unquoted and parse
+    // fine -- `[a, b]` and `{a: b}` are not errors. Only an unterminated one is.
+    // Checked before the ": " rule below so a flow mapping is not mistaken for a
+    // nested mapping.
+    if (/^[[{]/.test(value)) {
+      const opens = (value.match(/[[{]/g) ?? []).length;
+      const closes = (value.match(/[\]}]/g) ?? []).length;
+      if (opens !== closes) {
+        return { key, value, reason: 'unquoted value opens a YAML flow collection that is never closed' };
+      }
+      continue;
+    }
+
+    if (/:\s/.test(value)) {
+      return { key, value, reason: 'unquoted value contains ": " and parses as a nested mapping' };
+    }
+    if (/\s#/.test(value)) {
+      return { key, value, reason: 'unquoted value contains " #" and would be truncated as a comment' };
+    }
+    if (/^[&*!%@`]/.test(value)) {
+      return { key, value, reason: `unquoted value starts with the YAML indicator "${value[0]}"` };
+    }
+  }
+  return null;
+}
+
+/** Mirror of gh-aw's inline-skill extraction, including its discard behaviour. */
+function extractInlineSkills(content: string): ExtractionResult {
+  const starts = [...content.matchAll(SKILL_START_RE)];
+  if (starts.length === 0) {
+    return { ambient: content, skills: [], discardedBytes: 0, markerBytes: 0 };
+  }
+
+  const h2Positions = [...content.matchAll(/^## .*$/gm)]
+    .map(m => m.index!)
+    .filter(i => i !== undefined);
+
+  let ambient = '';
+  let cursor = 0;
+  let discardedBytes = 0;
+  let markerBytes = 0;
+  const skills: { name: string; bytes: number; body: string }[] = [];
+
+  for (const start of starts) {
+    const startIdx = start.index!;
+    if (startIdx < cursor) continue;
+
+    ambient += content.slice(cursor, startIdx);
+    markerBytes += Buffer.byteLength(start[0], 'utf8');
+
+    const bodyStart = startIdx + start[0].length;
+    const endMarker = new RegExp(
+      `^##[ \\t]+end[ \\t]+skill:[ \\t]+\`${start[1]}\`[ \\t]*$`,
+      'm'
+    ).exec(content.slice(bodyStart));
+
+    if (endMarker) {
+      const bodyEnd = bodyStart + endMarker.index;
+      skills.push({
+        name: start[1],
+        bytes: Buffer.byteLength(content.slice(bodyStart, bodyEnd), 'utf8'),
+        body: content.slice(bodyStart, bodyEnd),
+      });
+      markerBytes += Buffer.byteLength(endMarker[0], 'utf8');
+      cursor = bodyEnd + endMarker[0].length;
+      continue;
+    }
+
+    // Implicit close: next H2 after the start marker, else EOF.
+    const nextH2 = h2Positions.find(p => p > startIdx);
+    const bodyEnd = nextH2 ?? content.length;
+    skills.push({
+      name: start[1],
+      bytes: Buffer.byteLength(content.slice(bodyStart, bodyEnd), 'utf8'),
+      body: content.slice(bodyStart, bodyEnd),
+    });
+
+    // Everything from here to the next start marker is dropped on the floor.
+    const nextStart = starts.find(s => s.index! > startIdx)?.index ?? content.length;
+    discardedBytes += Buffer.byteLength(content.slice(bodyEnd, Math.max(bodyEnd, nextStart)), 'utf8');
+    cursor = Math.max(bodyEnd, nextStart);
+  }
+
+  ambient += content.slice(cursor);
+  return { ambient, skills, discardedBytes, markerBytes };
+}
+
+describe('gh-aw: inline skill extraction', () => {
+  const frontmatter = extractFrontmatter(SQUAD_WORKFLOW);
+  const imports = extractImports(frontmatter);
+
+  // Reproduce the prompt a real run assembles: imports first, then the body.
+  const assembled = [
+    ...imports
+      .map(rel => join(WORKFLOWS_DIR, rel))
+      .filter(existsSync)
+      .map(path => readText(path).replace(/^---\n[\s\S]*?\n---\n/, '')),
+    readText(SQUAD_WORKFLOW).replace(/^---\n[\s\S]*?\n---\n/, ''),
+  ].join('\n');
+
+  const result = extractInlineSkills(assembled);
+
+  // Sections that must stay in the ambient prompt — without these the agent
+  // cannot parse a command or route to a skill in the first place.
+  const REQUIRED_AMBIENT_SECTIONS = [
+    'Planning Artifact Data Contract',
+    'Trigger Context',
+    'Modes',
+    'Parse Command',
+    'Execute Mode',
+    'Team Guard',
+  ];
+
+  const AMBIENT_BUDGET_BYTES = 40 * 1024;
+
+  it('extracts every declared skill block', () => {
+    expect(result.skills.length, 'expected inline skill blocks to be extracted').toBeGreaterThan(20);
+  });
+
+  it('discards no content during extraction', () => {
+    const offenders = result.skills.filter(s => s.bytes < 200).map(s => s.name);
+    expect(
+      result.discardedBytes,
+      `${result.discardedBytes} bytes were silently dropped. A skill block closed at an H2 ` +
+        `instead of an explicit "## end skill:" marker. Suspiciously small skills: ` +
+        `${offenders.join(', ') || '(none)'}. Add an explicit end marker to any skill whose ` +
+        `body contains H2 headings.`
+    ).toBe(0);
+  });
+
+  it('keeps the router sections in the ambient prompt', () => {
+    for (const section of REQUIRED_AMBIENT_SECTIONS) {
+      expect(
+        result.ambient,
+        `"${section}" must remain in the ambient prompt — it is required to dispatch a mode`
+      ).toContain(section);
+    }
+  });
+
+  it('loses no bytes overall (ambient + skills + markers == source)', () => {
+    const accounted =
+      Buffer.byteLength(result.ambient, 'utf8') +
+      result.skills.reduce((n, s) => n + s.bytes, 0) +
+      result.markerBytes;
+    const source = Buffer.byteLength(assembled, 'utf8');
+    // Marker lines carry trailing newlines that fall on either side of a split.
+    expect(Math.abs(source - accounted), 'byte conservation check failed').toBeLessThan(
+      result.skills.length * 4
+    );
+  });
+
+  it(`keeps the ambient prompt under ${AMBIENT_BUDGET_BYTES / 1024} KB`, () => {
+    const ambientBytes = Buffer.byteLength(result.ambient, 'utf8');
+    expect(
+      ambientBytes,
+      `Ambient prompt is ${(ambientBytes / 1024).toFixed(1)} KB. Mode playbooks and planning ` +
+        `reference material belong in inline skills, not the always-loaded prompt.`
+    ).toBeLessThan(AMBIENT_BUDGET_BYTES);
+  });
+
+  it('gives every skill parseable YAML frontmatter', () => {
+    const offenders = result.skills
+      .map(s => ({ name: s.name, err: findFrontmatterScalarError(s.body) }))
+      .filter((s): s is { name: string; err: NonNullable<ReturnType<typeof findFrontmatterScalarError>> } => s.err !== null);
+
+    expect(
+      offenders.map(o => `${o.name}: ${o.err.key} — ${o.err.reason}\n    ${o.err.value}`).join('\n  '),
+      'Skill frontmatter must be valid YAML. Nothing upstream catches this: the extractor ' +
+        'filters frontmatter line-by-line without parsing it, and `gh aw compile --strict` ' +
+        'sees skill blocks as plain markdown. A broken value reaches the agent as a skill ' +
+        'that cannot load. Quote the value.'
+    ).toBe('');
+  });
+
+  it('flags real frontmatter scalar hazards without flagging valid YAML', () => {
+    const wrap = (line: string) => `\n---\n${line}\nname: x\n---\nbody`;
+
+    // Valid unquoted plain scalars and flow collections must not be flagged.
+    for (const ok of [
+      'description: Cast a squad',
+      'description: "Cast a squad: from a repo"',
+      "description: 'already quoted'",
+      'allowed: [read, write]',
+      'options: {mode: fast}',
+      'description: |',
+    ]) {
+      expect(findFrontmatterScalarError(wrap(ok)), `false positive on: ${ok}`).toBeNull();
+    }
+
+    // Genuine hazards must still be caught.
+    for (const bad of [
+      'description: Cast a squad: from a repo',
+      'description: Cast a squad #1',
+      'description: &anchor',
+      'allowed: [read, write',
+    ]) {
+      expect(findFrontmatterScalarError(wrap(bad)), `missed hazard in: ${bad}`).not.toBeNull();
+    }
+  });
+
+  it('gives every dispatchable mode a skill to load', () => {
+    const skillNames = new Set(result.skills.map(s => s.name));
+    const modes = extractModeTable(readText(SQUAD_WORKFLOW));
+    expect(modes.length, 'mode table should parse').toBeGreaterThan(15);
+
+    for (const { command } of modes) {
+      const skill = dispatchedSkill(readText(SQUAD_WORKFLOW), command);
+      expect(skillNames.has(skill), `${command} must load extracted skill ${skill}`).toBe(true);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: gh-aw compilation retains durable state, Auto-Cast contracts, command
+// rejection, AND the shell input security contract over compiled output.
+// ---------------------------------------------------------------------------
+//
+// The gate FAILS CLOSED. It used to gate on `it.skipIf(!ghAwAvailable)`, which is
+// the exact "silently skipped while the suite reports green" defect this file's
+// header (see #1833) complains about: a check that never runs is indistinguishable
+// from no check. So `gh aw` missing, a lock that fails to compile, an absent lock,
+// or zero inspected surfaces are all FAILURES, never skips. CI installs gh aw for
+// exactly this reason (.github/workflows/squad-ci.yml, #1732/#1834).
+
+const GH_AW_INSTALL_HINT =
+  '`gh aw` is required to compile the workflow this gate inspects. Install it with ' +
+  '`gh extension install github/gh-aw` (matches .github/workflows/squad-ci.yml). This ' +
+  'gate fails closed rather than skipping: an unmeasured contract is indistinguishable ' +
+  'from a violated one (#1834).';
+
+const CONTRACT_FIXTURE = join(
+  process.cwd(),
+  'test',
+  'fixtures',
+  'gh-aw-shell-contract',
+  'violating.lock.yml'
+);
+
+describe('gh-aw: compiled workflow shell input security contract', () => {
+  // Compile the real workflow once and memoize. The top-level afterAll wipes
+  // TEST_WORKSPACES_DIR, so the ephemeral workspace is cleaned globally.
+  let compiledLock: string | null = null;
+
+  function lockText(): string {
+    if (compiledLock !== null) return compiledLock;
+
+    const versionProbe = spawnSync('gh', ['aw', '--version'], { encoding: 'utf8' });
+    if (versionProbe.status !== 0) {
+      throw new Error(`gh aw --version failed. ${GH_AW_INSTALL_HINT}`);
+    }
+
+    const workspace = createTestWorkspace('gh-aw-contract-');
+    execFileSync('git', ['init', '--quiet'], { cwd: workspace });
+    // gh-aw's dispatch-workflow validation resolves its dispatch target against a
+    // `.github/workflows/` directory located relative to the compiled file. This
+    // repo ships the gh-aw *source* from a top-level `workflows/` dir; downstream
+    // consumers install it into `.github/workflows/` via `gh aw add`. Mirror that
+    // real deployment layout so `squad-implement-worker` resolves as it will in
+    // every real install.
+    cpSync(WORKFLOWS_DIR, join(workspace, '.github', 'workflows'), { recursive: true });
+    // Match consumer compilation: seed and verify immutable compiler-action pins.
+    compileWithPinnedActions(workspace);
+
+    const lockPath = join(workspace, '.github', 'workflows', 'squad.lock.yml');
+    if (!existsSync(lockPath)) {
+      throw new Error(
+        `gh aw compile produced no squad.lock.yml — the compiled artifact this gate ` +
+          `inspects is absent, so the contract is unmeasured. ${GH_AW_INSTALL_HINT}`
+      );
+    }
+    compiledLock = readText(lockPath);
+    return compiledLock;
+  }
+
+  // Explicit timeout: shells out to the real `gh aw compile`, ~2-3s in isolation
+  // but can exceed the 5s vitest default under full-suite parallel contention.
+  it('strict-compiles and preserves prompt/config behavior', () => {
+    const compiled = lockText();
+    // gh-aw v0.87.x (bumped from v0.86.2 for #1955's add-labels/create-if-missing
+    // support) now emits this JSON config only embedded inside a double-quoted YAML
+    // env var value, so every `"` is backslash-escaped (`\"key\":value`) rather than
+    // appearing as bare JSON. De-escape before matching so this assertion holds
+    // regardless of which quoting style a given compiler version chooses.
+    const unescaped = compiled.replace(/\\"/g, '"');
+    expect(unescaped).toContain('"auto_close_issue":false');
+    expect(unescaped).toContain('"data_enabled":true');
+    expect(unescaped).toContain('"required":["origin_issue","phases","schema_version","squad_artifact"]');
+    expect(unescaped).toContain('"enum":["research","plan","plan-accepted"');
+    // gh-aw records runtime-import paths relative to the repo root, so with the
+    // real `.github/workflows/` deployment layout these are prefixed accordingly.
+    expect(compiled).toContain('{{#runtime-import .github/workflows/shared/squad-planning-ontology.md}}');
+    expect(compiled).toContain('{{#runtime-import .github/workflows/squad.md}}');
+    expect(compiled).not.toMatch(/<!-- squad-[\w-]+(?:-v\d+)? -->/);
+    const jobs = parseDocument(compiled).toJS().jobs;
+    const activation = jobs.activate_plan;
+    expect(activation.needs).toContain('safe_outputs');
+    expect(activation.permissions).toEqual({ contents: 'read', actions: 'read', issues: 'write' });
+    expect(activation.if).toContain("contains(needs.agent.outputs.output_types, 'activate_plan')");
+    const steps = activation.steps;
+    const step = (name: string) => {
+      const matches = steps.filter((item: any) => item.name === name);
+      expect(matches, `compiled activation step ${name}`).toHaveLength(1);
+      return matches[0];
+    };
+    expect(step('Checkout trusted activation implementation').with).toMatchObject({
+      ref: '${{ github.workflow_sha }}', 'persist-credentials': false, path: '.squad-activation-trusted-base',
+    });
+    expect(step('Setup pinned issue creation API').uses)
+      .toBe('github/gh-aw-actions/setup@16b430146d5d5646eccef5a1ceb72152333b18b9');
+    const prepare = step('Freeze and validate activation inputs');
+    const capture = step('Persist frozen activation capture');
+    const create = step('Reserve activation and record actual create results');
+    const receipts = step('Persist actual activation receipts including partial outcomes');
+    const finalize = step('Validate actual bindings before publishing acceptance');
+    expect(prepare.with.script).toContain('activation.prepareActivation');
+    expect(capture.with['if-no-files-found']).toBe('error');
+    expect(create.with.script).toContain("const { setupGlobals, createIssue } = require(join(actionsDir, 'index.cjs'))");
+    expect(create.with.script).toContain('createIssue, sanitizeContent');
+    expect(create.with.script).toContain('activation.createActivation');
+    expect(create.env.CAPTURE_ARTIFACT_ID).toContain('steps.activation_capture.outputs.artifact-id');
+    expect(receipts.if).toContain("always() && steps.activation_create.outcome != 'skipped'");
+    expect(receipts.with['if-no-files-found']).toBe('error');
+    expect(finalize.env.RECEIPT_ARTIFACT_ID).toContain('steps.activation_receipts.outputs.artifact-id');
+    expect(finalize.with.script).toContain('activation.finalizeActivation');
+    expect(finalize.if).not.toContain('always()');
+    const order = [prepare, capture, create, receipts, finalize].map(item => steps.indexOf(item));
+    expect(order).toEqual([...order].sort((left, right) => left - right));
+    expect(jobs.conclusion.needs).toContain('activate_plan');
+  }, 20000);
+
+  it('keeps safe-output expressions valid after JSON serialization', () => {
+    const compiled = lockText();
+    // The JSON string is itself YAML-escaped, so the emitted file contains
+    // two backslashes before the unicode escape that GitHub misparses.
+    const escapedOperators = [
+      ...compiled.matchAll(/\$\{\{[^}\n]*\\\\u(?:0026|003c|003e)[^}\n]*\}\}/gi),
+    ].map(match => match[0]);
+
+    expect(
+      escapedOperators,
+      'gh-aw serialized a JSON-escaped operator inside a GitHub expression. ' +
+        'GitHub rejects the emitted lockfile before any job starts.',
+    ).toEqual([]);
+    expect(compiled).toContain(
+      'activationComments\\\":\\\"false',
+    );
+  }, 20000);
+
+  it('detects the previous activation-comments serialization mutation', () => {
+    const source = readText(SQUAD_WORKFLOW);
+    const safeExpression = 'activation-comments: false';
+    const unsafeExpression =
+      "${{ !startsWith(github.event.comment.body, '/squad approve-improvement') && " +
+      "!startsWith(github.event.comment.body, '/squad revoke-improvement') }}";
+
+    expect(source).toContain(safeExpression);
+    const workspace = createTestWorkspace('gh-aw-expression-mutation-');
+    execFileSync('git', ['init', '--quiet'], { cwd: workspace });
+    cpSync(WORKFLOWS_DIR, join(workspace, '.github', 'workflows'), { recursive: true });
+    const mutantPath = join(workspace, '.github', 'workflows', 'squad.md');
+    writeFileSync(mutantPath, readText(mutantPath).replace(safeExpression, `activation-comments: ${unsafeExpression}`));
+
+    execFileSync('gh', ['aw', 'compile', mutantPath, '--strict', '--approve'], {
+      cwd: workspace,
+      encoding: 'utf8',
+      stdio: 'pipe',
+    });
+
+    const mutantLock = readText(join(workspace, '.github', 'workflows', 'squad.lock.yml'));
+    expect(mutantLock).toMatch(
+      /\$\{\{[^}\n]*\\\\u0026\\\\u0026[^}\n]*\}\}/,
+    );
+  }, 20000);
+
+  it('compiles the lifecycle upsert as a post-safe-output job (#1916)', () => {
+    const compiled = lockText();
+    expect(compiled).toContain('  upsert_lifecycle_state:');
+    expect(compiled).toMatch(
+      /upsert_lifecycle_state:[\s\S]*?needs:[\s\S]*?- safe_outputs/,
+    );
+    expect(compiled).toContain('name: Upsert Squad lifecycle state');
+    expect(compiled).toContain('comment_id: current.id');
+  }, 20000);
+
+  it('compiles the deterministic terminal lifecycle repair job (#1928)', () => {
+    const compiled = lockText();
+    expect(compiled).toContain('  repair_activated_lifecycle:');
+    expect(compiled).toMatch(
+      /repair_activated_lifecycle:[\s\S]*?needs:[\s\S]*?- safe_outputs/,
+    );
+    expect(compiled).toContain('name: Repair terminal lifecycle after idempotent activation');
+    expect(compiled).toContain(
+      "!contains(needs.agent.outputs.output_types, 'upsert_lifecycle_state')",
+    );
+    expect(compiled).toContain('github.rest.repos.getCollaboratorPermissionLevel');
+    expect(compiled).toContain('["admin", "maintain", "write"].includes(permission)');
+    expect(compiled).toContain("github.event.comment.body == '/squad plan activate'");
+    expect(compiled).toContain(
+      '["/squad activate", "/squad plan accept", "/squad plan activate"].includes(command)',
+    );
+  }, 20000);
+
+  it('compiles Cast failure into a queryable post-agent job that fails the run', () => {
+    const compiled = lockText();
+    const failureJob = compiled.match(
+      /^  cast_failure:\n[\s\S]*?(?=^  conclusion:)/m,
+    )?.[0] ?? '';
+    const conclusionNeeds = parseDocument(compiled).toJS().jobs.conclusion.needs;
+    expect(failureJob).toContain('name: Fail incomplete Cast');
+    expect(failureJob).toContain('runs-on: ubuntu-slim');
+    expect(failureJob).toContain("contains(needs.agent.outputs.output_types, 'cast_failure')");
+    expect(failureJob).toContain("item.type === 'cast_failure'");
+    expect(failureJob).toContain("item.type === 'create_pull_request'");
+    expect(failureJob).toContain('process.env.GH_AW_AGENT_OUTPUT');
+    expect(failureJob).toContain('Cast did not complete.');
+    expect(failureJob).toContain('core.setFailed');
+    expect(conclusionNeeds).toContain('cast_failure');
+  }, 20000);
+
+  it('prepares the materialized Cast validator runner outside the agent prompt', () => {
+    const compiled = lockText();
+    const runnerStep = compiled.match(
+      /      - name: Prepare deterministic Cast validator runner\n[\s\S]*?(?=\n      - (?:continue-on-error:|name:))/,
+    )?.[0] ?? '';
+    const normalizedRunnerStep = runnerStep.replace(/\\"/g, '"');
+    expect(normalizedRunnerStep).toContain('cat > "$validator_runner"');
+    expect(normalizedRunnerStep).toContain(
+      'validator_runner="${GITHUB_WORKSPACE:?}/.github/workflows/run-squad-cast-validator"',
+    );
+    expect(normalizedRunnerStep).toContain(
+      '--payload "${GITHUB_WORKSPACE:?}/.github/workflows/squad-cast-payload.json"',
+    );
+    expect(normalizedRunnerStep).not.toContain('RUNNER_TEMP');
+    const validatorDigest = createHash('sha256')
+      .update(readFileSync(join(SHARED_DIR, 'squad-cast-validator.mjs')))
+      .digest('hex');
+    expect(normalizedRunnerStep).toContain(`validator_expected_sha256="${validatorDigest}"`);
+    expect(normalizedRunnerStep).toContain("outcome: 'cast_failure'");
+    expect(normalizedRunnerStep).toContain('chmod 500 "$validator_runner"');
+    // Prepared as a pre-agent-step (see the built-in fidelity ordering test below):
+    // it must run AFTER the base-branch/ambient restores that can reintroduce a
+    // stale committed .squad snapshot, and still before the agent turn begins.
+    expect(compiled.indexOf('name: Restore inline skills from activation artifact')).toBeLessThan(
+      compiled.indexOf('name: Prepare deterministic Cast validator runner'),
+    );
+    expect(compiled.indexOf('name: Prepare deterministic Cast validator runner')).toBeLessThan(
+      compiled.indexOf('name: Execute GitHub Copilot CLI'),
+    );
+  }, 20000);
+
+  it('materializes built-in charters after init and every late restore, and before the Cast agent turn', () => {
+    const compiled = lockText();
+
+    // Job-level guarantee: the agent job cannot start until the activation
+    // job (which runs `squad init --preset default` when no cast exists yet)
+    // has completed.
+    expect(parseDocument(compiled).toJS().jobs.agent.needs).toBe('activation');
+    const activationJobIndex = compiled.indexOf('\n  activation:\n');
+    const agentJobIndex = compiled.indexOf('\n  agent:\n');
+    expect(activationJobIndex).toBeGreaterThan(-1);
+    expect(agentJobIndex).toBeGreaterThan(activationJobIndex);
+
+    const initIndex = compiled.indexOf('name: Initialize Squad team');
+    const materializeIndex = compiled.indexOf('name: Materialize canonical built-in support agents');
+    expect(initIndex).toBeGreaterThan(-1);
+    expect(materializeIndex).toBeGreaterThan(initIndex);
+
+    // Materialization is a pre-agent-step: it must run strictly after every
+    // restore step that can reintroduce a stale committed `.squad/` snapshot
+    // late in the job (base-branch restore, both ambient-folder restores,
+    // inline sub-agent/skill restores), and strictly before the Cast agent
+    // turn (Copilot CLI execution) starts.
+    for (const priorRestore of [
+      'name: Restore Squad state from activation artifact',
+      'name: Restore agent config folders from base branch',
+      'name: Restore inline sub-agents from activation artifact',
+      'name: Restore inline skills from activation artifact',
+    ]) {
+      const restoreIndex = compiled.indexOf(priorRestore);
+      expect(restoreIndex, `${priorRestore} must be present`).toBeGreaterThan(-1);
+      expect(materializeIndex, `${priorRestore} must precede materialization`).toBeGreaterThan(restoreIndex);
+    }
+    // Both occurrences of the unconditional ambient-folder restore (gh-aw emits
+    // it once after the activation-artifact download and again after PR
+    // checkout) must precede materialization too.
+    const ambientRestoreIndices = [...compiled.matchAll(/name: Restore ambient folders from activation artifact/g)]
+      .map((match) => match.index ?? -1);
+    expect(ambientRestoreIndices.length).toBeGreaterThanOrEqual(2);
+    for (const restoreIndex of ambientRestoreIndices) {
+      expect(materializeIndex).toBeGreaterThan(restoreIndex);
+    }
+
+    const agentExecutionIndex = compiled.indexOf('name: Execute GitHub Copilot CLI');
+    expect(agentExecutionIndex).toBeGreaterThan(-1);
+    expect(agentExecutionIndex).toBeGreaterThan(materializeIndex);
+  }, 20000);
+
+  it('keeps custom safe-output failure visible in the terminal workflow state', () => {
+    const compiled = lockText();
+    const conclusionNeeds = parseDocument(compiled).toJS().jobs.conclusion.needs;
+    expect(conclusionNeeds).toContain('safe_outputs');
+    expect(compiled).toContain(
+      "needs.safe_outputs.result == 'success'",
+    );
+    expect(compiled).toContain(
+      'This completion message does not indicate Cast success. For Cast, only a linked Cast pull request indicates success.',
+    );
+  }, 20000);
+
+  it('preserves the latest-release default in the compiled install step', () => {
+    const compiled = lockText();
+    const install = compiled.match(
+      /- name: Install Squad CLI from standalone release[\s\S]*?(?=\n\s+- name:)/,
+    )?.[0];
+    expect(install, 'compiled squad.lock.yml must retain the standalone installer').toContain(
+      'uses: bradygaster/squad/.github/actions/squad-init@5c662ba015ec4f99befa51b0e8ca4f2148b0497f',
+    );
+    expect(install, 'compiled squad.lock.yml must omit version to use the pinned action latest default')
+      .not.toMatch(/^\s+version:/m);
+    expect(install).toContain('skip-init: "true"');
+    expect(compiled, 'compiled squad.lock.yml must not contain the obsolete release resolver')
+      .not.toContain('squad-release');
+    expect(compiled).not.toContain('vars.SQUAD_CLI_VERSION');
+    expect(compiled).toContain('SQUAD_CLI_VERSION: ${{ steps.squad-cli.outputs.version }}');
+    expect(compiled).toContain('squad health --json');
+    expect(compiled).not.toContain('npm install --global');
+    expect(compiled).not.toContain('npx --yes "@bradygaster/squad-cli@');
+  }, 20000);
+
+  it('emits no attacker-controlled event text in any compiled run: block', () => {
+    const compiled = lockText();
+    const blocks = extractRunBlocks(compiled);
+
+    // Fail closed: a scanner with nothing to scan is a permanently green gate. The
+    // real lock has dozens of run: blocks; zero means compilation changed shape and
+    // the extractor no longer sees them.
+    expect(
+      blocks.length,
+      'No run: blocks found in compiled squad.lock.yml. A scanner that finds nothing ' +
+        'to scan is a permanently green gate (#1834). Re-check extractRunBlocks against ' +
+        'the current `gh aw compile` output shape.'
+    ).toBeGreaterThan(0);
+
+    const violations = scanRunBlocks(blocks, '.github/workflows/squad.lock.yml');
+    expect(
+      violations,
+      `Compiled run: blocks violate the shell input security contract. Actions ` +
+        `expands \${{ … }} before the shell starts, so event text in a run: block is ` +
+        `unsafe even inside quotes. Each entry names the anti-pattern token, file, and ` +
+        `line:\n${formatViolations(violations)}\n\n` +
+        `Reproduce the finding directly against compiled output:\n` +
+        `  gh aw compile .github/workflows/squad.md --strict\n` +
+        `  grep -nE '\\$\\{\\{[^}]*github\\.event\\.[a-z_]+\\.(body|title)' ` +
+        `.github/workflows/squad.lock.yml`
+    ).toEqual([]);
+  }, 20000);
+
+  it('compiles one shared command contract into pre-agent context and safe-output failure', () => {
+    const compiled = lockText().replace(/\\"/g, '"');
+    expect(compiled).toContain('name: Materialize deterministic Squad command context');
+    expect(compiled).toContain('squad-command-contract.mjs"');
+    expect(compiled).toContain('--materialize "$SQUAD_COMMAND_CONTEXT"');
+    expect(compiled).toContain('name: Reject unknown or malformed Squad commands');
+    expect(compiled).toContain('enforceSquadCommandContract');
+    expect(compiled).toContain('github.rest.issues.createComment');
+    expect(compiled).toContain('core.setFailed');
+    expect(compiled.indexOf('name: Materialize deterministic Squad command context')).toBeLessThan(
+      compiled.indexOf('name: Execute GitHub Copilot CLI'),
+    );
+    const commandGuard = compiled.match(
+      /      - name: Reject unknown or malformed Squad commands\n[\s\S]*?(?=\n      - (?:name:|uses:)|\n  [a-z_]+:)/,
+    )?.[0] ?? '';
+    expect(commandGuard).toContain('.squad-command-trusted-base');
+    expect(compiled).toMatch(
+      /name: Checkout executing workflow commit for command enforcement[\s\S]*?ref: \$\{\{ github\.workflow_sha \}\}/,
+    );
+  }, 20000);
+
+  it('positive control: turns red on a known-violating compiled fixture, naming token, file, and line', () => {
+    // RETRO's acceptance bar (#1834): "A gate that cannot turn red on a fixture
+    // containing `run: printf '%s\n' "${{ github.event.issue.body }}"` is not a valid
+    // gate." This proves the gate CAN fail, using the same extractor/scanner the real
+    // lock goes through. It needs no gh aw, so it runs everywhere — the "can it turn
+    // red" proof must never itself be skippable.
+    expect(existsSync(CONTRACT_FIXTURE), `positive-control fixture missing: ${CONTRACT_FIXTURE}`).toBe(true);
+
+    const fixture = readText(CONTRACT_FIXTURE);
+    const violations = scanRunBlocks(extractRunBlocks(fixture), 'violating.lock.yml');
+
+    const tokens = new Set<ContractToken>(violations.map(v => v.token));
+    for (const expected of [
+      'UNTRUSTED_TEMPLATE_IN_RUN',
+      'UNTRUSTED_PRINTF_FORMAT',
+      'UNTRUSTED_COMMAND_STRING',
+      'UNTRUSTED_AWK_PROGRAM_OR_VAR',
+    ] as ContractToken[]) {
+      expect(
+        tokens.has(expected),
+        `Positive-control fixture did not trip ${expected}. The gate cannot observe ` +
+          `that anti-pattern, so it is a status-only gate for it (#1834). Found tokens: ` +
+          `${[...tokens].join(', ') || '(none)'}`
+      ).toBe(true);
+    }
+
+    // The diagnostic must name token AND file AND line — a status-only failure passes
+    // a generic-shaped assertion clean (#1832 mutation-testing finding).
+    const mandated = violations.find(v => v.token === 'UNTRUSTED_TEMPLATE_IN_RUN');
+    expect(mandated, 'the mandated RETRO line must trip UNTRUSTED_TEMPLATE_IN_RUN').toBeDefined();
+    expect(mandated!.file).toBe('violating.lock.yml');
+    expect(mandated!.line, 'the violation must carry a concrete 1-based line number').toBeGreaterThan(0);
+    expect(mandated!.evidence).toContain('github.event.issue.body');
+
+    // And the rendered diagnostic actually contains token, file, and line together.
+    expect(formatViolations(violations)).toMatch(
+      /UNTRUSTED_TEMPLATE_IN_RUN\s+violating\.lock\.yml:\d+/
+    );
+  });
+
+  it('does not flag the sanctioned body-handling forms (guards against a permanent red)', () => {
+    // The contract's own correct forms must stay green, or the gate is a permanent
+    // red — equally worthless per the 2026-08-20 test bar. Runner-owned expansions
+    // ($PATH, ${RUNNER_TEMP}) are not attacker text and must not trip the gate.
+    const safe = [
+      `printf '%s\\n' "$SQUAD_TRIGGER_BODY" | awk '{sub(/\\r$/,"")}' | grep -F -- '/squad'`,
+      `body="\${SQUAD_TRIGGER_BODY-}"`,
+      `printf '%s\\n' "$body" | tr -d '\\r' | grep -n -i -m 3 -F -- '/squad'`,
+      // `--` ends printf's option parsing; the format slot is still the literal that
+      // follows it, so the body remains an argument. The `--` handling added for the
+      // bypass below must not turn this sanctioned form red.
+      `printf -- '%s\\n' "$body"`,
+      `printf -- '%s\\n' "$GITHUB_EVENT_ISSUE_BODY"`,
+      `bash -c 'set +o histexpand; export PATH="$PATH"'`,
+      `source "\${RUNNER_TEMP}/gh-aw/actions/resolve_docker_socket_gid.sh"`,
+      `awk -v n=3 'BEGIN { print n }'`,
+    ].map((text, i) => ({ line: i + 1, text }));
+
+    expect(
+      scanShellLines(safe, 'sanctioned-forms'),
+      'The scanner flagged a contract-COMPLIANT form. A gate that is always red is as ' +
+        'worthless as one that is always green (2026-08-20 test bar). Tighten the ' +
+        'detectors in gh-aw-shell-contract.ts.'
+    ).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: scanner-level regressions in the shell contract gate (#1834)
+// ---------------------------------------------------------------------------
+//
+// The gate above proves the CONTRACT holds against the real workflow. These tests
+// prove the DETECTOR holds — that the scanner actually observes what its own doc
+// comments claim it observes. Three bypasses were found by review after the gate
+// landed; each is a case where the gate reported green because the detector never
+// looked, which is the same "unmeasured is indistinguishable from clean" failure
+// mode the gate itself exists to eliminate.
+//
+// These are pure unit tests over the exported scanner: no `gh aw`, no compile, so
+// the proof that the detector can see each bypass is never skippable.
+
+describe('gh-aw: shell contract detector regressions (#1834)', () => {
+  const scan = (text: string) => scanShellLines([{ line: 1, text }], 'regression');
+  const tokensFor = (text: string) => scan(text).map(v => v.token);
+
+  describe('BODY_VAR matches multi-segment carrier names', () => {
+    // The doc comment promised "any `*_BODY` / `*_TITLE` variable", but the pattern
+    // allowed only ONE `[A-Za-z0-9]+` segment before the suffix. Event-carrier env
+    // vars are conventionally multi-segment SCREAMING_SNAKE, so the *unenforced*
+    // shape was the idiomatic one — every detector went blind on it.
+    const multiSegment = [
+      'SQUAD_EVENT_BODY',
+      'GITHUB_EVENT_ISSUE_BODY',
+      'GITHUB_EVENT_COMMENT_BODY',
+      'SQUAD_EVENT_ISSUE_TITLE',
+      'GITHUB_EVENT_PULL_REQUEST_TITLE',
+    ];
+
+    for (const name of multiSegment) {
+      it(`taints $${name} in printf's format slot`, () => {
+        expect(
+          tokensFor(`printf "$${name}"`),
+          `$${name} is a *_BODY/*_TITLE carrier the scanner claims to taint, but a ` +
+            `single-segment-only pattern let it reach printf's format slot unflagged.`
+        ).toContain('UNTRUSTED_PRINTF_FORMAT');
       });
 
-      const compiled = readFileSync(join(workspace, '.github', 'workflows', 'squad.lock.yml'), 'utf8');
-      expect(compiled).toContain('"auto_close_issue":false');
-      expect(compiled).toContain('"data_enabled":true');
-      expect(compiled).toContain('"required":["origin_issue","phases","schema_version","squad_artifact"]');
-      expect(compiled).toContain('"enum":["research","plan","plan-accepted"');
-      // gh-aw records runtime-import paths relative to the repo root (not the
-      // compiled file's own directory), so with the real `.github/workflows/`
-      // deployment layout these are prefixed accordingly — verified against an
-      // isolated compile outside this repo/worktree entirely.
-      expect(compiled).toContain('{{#runtime-import .github/workflows/shared/planning-ontology.md}}');
-      expect(compiled).toContain('{{#runtime-import .github/workflows/squad.md}}');
-      expect(compiled).not.toMatch(/<!-- squad-[\w-]+(?:-v\d+)? -->/);
-    } finally {
-      rmSync(workspace, { recursive: true, force: true });
+      it(`taints $${name} in a command string`, () => {
+        expect(tokensFor(`eval "\${${name}-}"`)).toContain('UNTRUSTED_COMMAND_STRING');
+      });
+
+      it(`taints $${name} passed through awk -v`, () => {
+        expect(tokensFor(`awk -v v="$${name}" 'BEGIN { print v }'`)).toContain(
+          'UNTRUSTED_AWK_PROGRAM_OR_VAR'
+        );
+      });
     }
-  }, 20000);
+
+    it('still taints the single-segment and sanctioned carrier names', () => {
+      // Widening the prefix must not lose the names that already worked.
+      for (const text of [
+        'printf "$SQUAD_TRIGGER_BODY"',
+        'printf "$ISSUE_BODY"',
+        'printf "$PR_TITLE"',
+        'printf "$body"',
+      ]) {
+        expect(tokensFor(text), `${text} must stay tainted`).toContain(
+          'UNTRUSTED_PRINTF_FORMAT'
+        );
+      }
+    });
+
+    it('does not taint runner-owned variables that merely contain the segments', () => {
+      // A widened prefix must not start flagging runner-owned values, or the gate
+      // goes permanently red — as worthless as permanently green.
+      for (const text of [
+        'printf "$RUNNER_TEMP"',
+        'bash -c "export PATH=$PATH"',
+        'source "${GITHUB_WORKSPACE}/setup.sh"',
+        'printf "$BODYGUARD_HOME"',
+      ]) {
+        expect(tokensFor(text), `${text} carries no attacker text and must stay green`).toEqual(
+          []
+        );
+      }
+    });
+  });
+
+  describe("printf's -- end-of-options separator does not shield the format slot", () => {
+    // `printf -- "$body"` is the idiom used precisely when a body might begin with
+    // `-`. The arg reader treated `--` as the format operand and returned it, so the
+    // body — sitting in the real format slot — was never inspected.
+    for (const name of ['body', 'SQUAD_TRIGGER_BODY', 'GITHUB_EVENT_ISSUE_BODY']) {
+      it(`flags printf -- "$${name}"`, () => {
+        expect(
+          tokensFor(`printf -- "$${name}"`),
+          `\`--\` ends option parsing; the body after it IS the format string. ` +
+            `Reading \`--\` as the first argument bypasses UNTRUSTED_PRINTF_FORMAT.`
+        ).toContain('UNTRUSTED_PRINTF_FORMAT');
+      });
+    }
+
+    it('flags -- combined with other option forms', () => {
+      expect(tokensFor('printf -v out -- "$body"')).toContain('UNTRUSTED_PRINTF_FORMAT');
+    });
+
+    it('leaves the format slot green when -- is followed by a literal format', () => {
+      expect(tokensFor(`printf -- '%s\\n' "$body"`)).toEqual([]);
+      expect(tokensFor(`printf -- "%s\\n" "$SQUAD_TRIGGER_BODY"`)).toEqual([]);
+    });
+
+    it('still flags a body glued to -- as one word', () => {
+      // `--"$body"` is a single word, so it is the format string, not a separator.
+      expect(tokensFor('printf --"$body"')).toContain('UNTRUSTED_PRINTF_FORMAT');
+    });
+  });
+
+  describe('extractRunBlocks does not re-read block scalar content as workflow keys', () => {
+    // A `run:` line inside a heredoc or echoed YAML is shell text, not a key. The
+    // outer cursor never advanced past a consumed scalar, so that line re-entered
+    // the header branch: a phantom block appeared, its lines were already owned by
+    // the real block, and every violation inside it was reported twice.
+    const NESTED = [
+      'jobs:', //                                  1
+      '  a:', //                                   2
+      '    steps:', //                             3
+      '      - name: writes a workflow', //        4
+      '        run: |', //                         5
+      "          cat <<'YAML' > generated.yml", // 6
+      '          run: |', //                       7
+      '            printf "$SQUAD_EVENT_BODY"', // 8
+      '          YAML', //                         9
+      '          echo done', //                   10
+      '      - name: tail', //                    11
+      '        run: echo tail', //                12
+    ].join('\n');
+
+    it('opens no phantom block for a run: line nested in a heredoc', () => {
+      const blocks = extractRunBlocks(NESTED);
+      expect(
+        blocks.map(b => b.headerLine),
+        'Line 7 is heredoc payload owned by the block scalar opened on line 5, not a ' +
+          'workflow key. A header at line 7 means scalar content was misparsed.'
+      ).toEqual([5, 12]);
+    });
+
+    it('keeps the whole heredoc inside the enclosing block', () => {
+      const outer = extractRunBlocks(NESTED).find(b => b.headerLine === 5);
+      expect(outer, 'the real run: block on line 5 must be extracted').toBeDefined();
+      expect(
+        outer!.lines.map(l => l.line),
+        'the enclosing block owns every deeper-indented line, heredoc payload included'
+      ).toEqual([6, 7, 8, 9, 10]);
+    });
+
+    it('reports a violation inside nested YAML exactly once', () => {
+      const violations = scanRunBlocks(extractRunBlocks(NESTED), 'nested.yml');
+      expect(
+        violations.map(v => `${v.token}@${v.line}`),
+        'Duplicate blocks produce duplicate findings, so the same defect is counted ' +
+          'twice in the diagnostic and in any violation total.'
+      ).toEqual(['UNTRUSTED_PRINTF_FORMAT@8']);
+    });
+
+    it('does not skip a sibling run: that terminates the previous block', () => {
+      // Guards the off-by-one in the cursor advance: the line that ENDS a scalar is
+      // not part of it and must still be examined as a header.
+      const siblings = [
+        'steps:', //           1
+        '  run: |', //         2
+        '    printf "$A_BODY"', // 3
+        '  run: |', //         4
+        '    printf "$B_BODY"', // 5
+      ].join('\n');
+
+      const blocks = extractRunBlocks(siblings);
+      expect(
+        blocks.map(b => b.headerLine),
+        'Advancing the cursor past a scalar must not swallow the line that ended it.'
+      ).toEqual([2, 4]);
+      expect(scanRunBlocks(blocks, 'siblings.yml').map(v => v.line)).toEqual([3, 5]);
+    });
+
+    it('still extracts the real compiled lock shape (inline and block runs)', () => {
+      // Non-regression: the shapes the gate depends on are unchanged by the advance.
+      const mixed = [
+        'steps:', //                  1
+        '  - name: inline', //        2
+        '    run: echo hi', //        3
+        '  - name: block', //         4
+        '    run: |', //              5
+        '      echo one', //          6
+        '', //                        7
+        '      echo two', //          8
+        '  - name: after', //         9
+        '    run: echo bye', //      10
+      ].join('\n');
+
+      const blocks = extractRunBlocks(mixed);
+      expect(blocks.map(b => b.headerLine)).toEqual([3, 5, 10]);
+      expect(blocks[1].lines.map(l => l.line)).toEqual([6, 7, 8]);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: Merge continuation dispatch contract (#1751)
+// ---------------------------------------------------------------------------
+
+describe('gh-aw: merge continuation dispatch contract', () => {
+  const squadFrontmatter = extractFrontmatter(SQUAD_WORKFLOW);
+  const squadInputs = extractWorkflowDispatchInputs(squadFrontmatter);
+  const workerContent = readText(SQUAD_IMPLEMENT_WORKER);
+
+  it('does not silently default workflow_dispatch command to a mutating mode', () => {
+    expect(squadInputs.command, 'Squad workflow_dispatch.command should exist').toBeDefined();
+    // gh-aw forbids required workflow_dispatch inputs when the same workflow also
+    // has slash_command triggers, so the safety contract is "no mutating default"
+    // plus explicit missing-input handling in the prompt.
+    expect(squadInputs.command.required).toBe('false');
+    expect(squadInputs.command.default).toBeUndefined();
+  });
+
+  it('documents missing workflow_dispatch issue_number as a guarded halt, not a junk issue', () => {
+    const squadText = readText(SQUAD_WORKFLOW);
+    expect(squadText).toMatch(/missing issue_number/i);
+    // The activation guard halts the run with a visible log annotation instead of
+    // minting a junk issue for an empty/malformed dispatch probe (see PR #1777).
+    expect(squadText).toMatch(/::warning::/);
+    expect(squadText).toMatch(/halting with no side effects/i);
+    expect(squadText).not.toMatch(/Squad workflow dispatch missing issue_number/);
+  });
+
+  it('worker continuation dispatch payload nests keys that Squad declares', () => {
+    const continuation = workerContent.match(
+      /## Continue Parent Epic After Merge([\s\S]*?)The remaining instructions apply only to `workflow_dispatch`/
+    )?.[1] ?? '';
+    const payloadBlock = continuation.match(/```json\n([\s\S]*?)\n```/)?.[1];
+    expect(payloadBlock, 'continuation dispatch JSON payload should be present').toBeDefined();
+
+    const payload = JSON.parse(payloadBlock!) as {
+      workflow_name?: string;
+      inputs?: Record<string, string>;
+      command?: string;
+      issue_number?: string;
+    };
+    expect(payload.workflow_name).toBe('squad');
+    expect(payload.command, 'command must not be a top-level dispatch_workflow argument').toBeUndefined();
+    expect(payload.issue_number, 'issue_number must not be a top-level dispatch_workflow argument').toBeUndefined();
+    expect(payload.inputs).toEqual({
+      command: 'implement',
+      issue_number: '{root-issue-number}',
+    });
+
+    for (const key of Object.keys(payload.inputs ?? {})) {
+      expect(squadInputs, `Squad workflow_dispatch input "${key}" should exist`).toHaveProperty(key);
+    }
+  });
+
+  it('worker continuation warns dispatch_workflow is write-once and not schema-probed', () => {
+    const continuation = workerContent.match(
+      /## Continue Parent Epic After Merge([\s\S]*?)The remaining instructions apply only to `workflow_dispatch`/
+    )?.[1] ?? '';
+
+    expect(continuation, 'continuation should name the dispatch_workflow tool').toMatch(/dispatch_workflow/);
+    expect(continuation, 'empty or placeholder schema probes should be forbidden').toMatch(
+      /NEVER[\s\S]*empty[\s\S]*(?:placeholder|partial)[\s\S]*(?:probe|discover)[\s\S]*schema/i
+    );
+    expect(continuation, 'noop should be named as the alternative when there is nothing to dispatch').toMatch(
+      /(?:nothing|no next wave)[\s\S]{0,200}dispatch[\s\S]{0,200}`?noop`?|`?noop`?[\s\S]{0,200}(?:nothing|no next wave)[\s\S]{0,200}dispatch/i
+    );
+  });
+
+  it('worker continuation comments on the parent epic instead of auto-targeting the merged PR', () => {
+    const continuation = workerContent.match(
+      /## Continue Parent Epic After Merge([\s\S]*?)The remaining instructions apply only to `workflow_dispatch`/
+    )?.[1] ?? '';
+    expect(continuation).toMatch(/comment on the parent epic/i);
+    expect(continuation).toMatch(/item_number[\s\S]*parent epic number/i);
+  });
+
+  // -------------------------------------------------------------------------
+  // Structural gate: max >= 2 (#1772)
+  // -------------------------------------------------------------------------
+  // The `dispatch-workflow: max: 1` constraint means the FIRST safe-output entry
+  // wins and all later entries are silently discarded.  When the LLM emits an empty
+  // probe first, `max: 1` causes it to consume the only slot and the real dispatch
+  // never fires -- confirmed across three aspiregregator-squad-e2e runs
+  // (32324473906, 32394811753, 32316227601).
+  //
+  // Raising max to 2 gives the real dispatch a second slot even when the LLM
+  // probes first, breaking the silent-discard failure mode without requiring any
+  // change to gh-aw itself.
+  //
+  // This test FAILS against the pre-fix state (max: 1) and PASSES after the fix
+  // (max: 2).  It is the structural test that the wording-only approach (#1766)
+  // lacked: prompt text can be present and the live run still broken; this test
+  // directly asserts the frontmatter value that governs runtime behavior.
+  it('worker dispatch-workflow max is at least 2 to survive a probe + real dispatch', () => {
+    const safeOutputs = extractSafeOutputs(extractFrontmatter(SQUAD_IMPLEMENT_WORKER));
+    const dispatchWorkflow = safeOutputs['dispatch-workflow'];
+    expect(dispatchWorkflow, 'squad-implement-worker.md must declare dispatch-workflow safe-output').toBeDefined();
+    const max = dispatchWorkflow?.max as number | undefined;
+    expect(max, 'dispatch-workflow max must be >= 2 so a probe does not silently discard the real dispatch').toBeGreaterThanOrEqual(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: Dispatch workflow schema static gate (#1772)
+// ---------------------------------------------------------------------------
+// The static gate (scripts/check-workflow-input-interpolation.mjs) now validates
+// dispatch_workflow JSON examples in workflow prompts.  A malformed example --
+// missing `workflow_name`, missing `inputs`, or top-level `command`/`issue_number` --
+// causes gh-aw to run the wrong workflow or dispatch with no inputs.
+//
+// This suite:
+//   (a) verifies the gate passes against current workflow files
+//   (b) verifies the gate FAILS against a fixture with a malformed dispatch schema
+//       (the broken state that caused aspiregregator-squad-e2e failures)
+
+describe('gh-aw: dispatch_workflow schema static gate (#1772)', () => {
+  const scriptPath = join(process.cwd(), 'scripts', 'check-workflow-input-interpolation.mjs');
+  const fixturesDir = join(TEST_WORKSPACES_DIR, 'dispatch-schema-gate');
+
+  function writeFixture(name: string, content: string): string {
+    mkdirSync(fixturesDir, { recursive: true });
+    const path = join(fixturesDir, name);
+    writeFileSync(path, content, 'utf8');
+    return path;
+  }
+
+  it('passes against current workflow files (regression guard)', () => {
+    const result = spawnSync(process.execPath, [scriptPath], {
+      encoding: 'utf8',
+      cwd: process.cwd(),
+    });
+    expect(result.status, `Gate should exit 0; stderr: ${result.stderr}`).toBe(0);
+  });
+
+  it('fails when dispatch_workflow example is missing workflow_name', () => {
+    // This is failure shape (3) confirmed in run 32316227601: dispatch schema
+    // without workflow_name caused the squad workflow to run the wrong skill.
+    const fixture = writeFixture('missing-workflow-name.md', `---
+safe-outputs:
+  dispatch-workflow:
+    workflows: [squad]
+    max: 2
+---
+
+# Test Worker
+
+Dispatch workflow using the dispatch_workflow safe-output tool:
+
+\`\`\`json
+{
+  "inputs": {
+    "command": "implement",
+    "issue_number": "42"
+  }
+}
+\`\`\`
+`);
+
+    const result = spawnSync(process.execPath, [scriptPath], {
+      env: { ...process.env, SQUAD_GATE_SCAN_OVERRIDE: fixturesDir },
+      encoding: 'utf8',
+      cwd: process.cwd(),
+    });
+    expect(result.status, 'Gate must exit 1 when dispatch_workflow JSON lacks workflow_name').toBe(1);
+    expect(result.stderr).toMatch(/dispatch-schema|workflow_name/i);
+    // Cleanup
+    rmSync(fixture);
+  });
+
+  it('fails when dispatch_workflow example has top-level command instead of inputs object', () => {
+    // This is failure shape (1) confirmed in runs 32324473906, 32394811753:
+    // top-level command/issue_number are silently dropped by gh-aw; the receiving
+    // workflow runs with no inputs and creates junk issues.
+    const fixture = writeFixture('top-level-inputs.md', `---
+safe-outputs:
+  dispatch-workflow:
+    workflows: [squad]
+    max: 2
+---
+
+# Test Worker
+
+Call dispatch_workflow to continue the relay:
+
+\`\`\`json
+{
+  "workflow_name": "squad",
+  "command": "implement",
+  "issue_number": "42"
+}
+\`\`\`
+`);
+
+    const result = spawnSync(process.execPath, [scriptPath], {
+      env: { ...process.env, SQUAD_GATE_SCAN_OVERRIDE: fixturesDir },
+      encoding: 'utf8',
+      cwd: process.cwd(),
+    });
+    expect(result.status, 'Gate must exit 1 when dispatch_workflow JSON has top-level command').toBe(1);
+    expect(result.stderr).toMatch(/dispatch-schema|top-level/i);
+    rmSync(fixture);
+  });
+
+  it('fails when dispatch_workflow example is missing inputs.issue_number', () => {
+    const fixture = writeFixture('missing-issue-number.md', `---
+safe-outputs:
+  dispatch-workflow:
+    workflows: [squad]
+    max: 2
+---
+
+# Test Worker
+
+Use dispatch_workflow to queue the next wave:
+
+\`\`\`json
+{
+  "workflow_name": "squad",
+  "inputs": {
+    "command": "implement"
+  }
+}
+\`\`\`
+`);
+
+    const result = spawnSync(process.execPath, [scriptPath], {
+      env: { ...process.env, SQUAD_GATE_SCAN_OVERRIDE: fixturesDir },
+      encoding: 'utf8',
+      cwd: process.cwd(),
+    });
+    expect(result.status, 'Gate must exit 1 when dispatch_workflow JSON inputs lacks issue_number').toBe(1);
+    expect(result.stderr).toMatch(/dispatch-schema|issue_number/i);
+    rmSync(fixture);
+  });
+
+  it('passes for a well-formed dispatch_workflow example', () => {
+    const fixture = writeFixture('valid-dispatch.md', `---
+safe-outputs:
+  dispatch-workflow:
+    workflows: [squad]
+    max: 2
+---
+
+# Test Worker
+
+Use dispatch_workflow to continue the relay:
+
+\`\`\`json
+{
+  "workflow_name": "squad",
+  "inputs": {
+    "command": "implement",
+    "issue_number": "{parent-epic-number}"
+  }
+}
+\`\`\`
+`);
+
+    const result = spawnSync(process.execPath, [scriptPath], {
+      env: { ...process.env, SQUAD_GATE_SCAN_OVERRIDE: fixturesDir },
+      encoding: 'utf8',
+      cwd: process.cwd(),
+    });
+    expect(result.status, `Gate should exit 0 for valid schema; stderr: ${result.stderr}`).toBe(0);
+    rmSync(fixture);
+  });
+
+  it('passes for the retrospective receiver without a synthetic issue number', () => {
+    const fixture = writeFixture('valid-retro-dispatch.md', `---
+safe-outputs:
+  dispatch-workflow:
+    workflows: [squad-retro]
+    max: 1
+---
+
+# Test Worker
+
+Use dispatch_workflow to request a retrospective:
+
+\`\`\`json
+{
+  "workflow_name": "squad-retro",
+  "inputs": {
+    "retro_reason": "early-evidence",
+    "request_origin": "squad-review"
+  }
+}
+\`\`\`
+`);
+
+    const result = spawnSync(process.execPath, [scriptPath], {
+      env: { ...process.env, SQUAD_GATE_SCAN_OVERRIDE: fixturesDir },
+      encoding: 'utf8',
+      cwd: process.cwd(),
+    });
+    expect(result.status, `Gate should accept the retro receiver contract; stderr: ${result.stderr}`).toBe(0);
+    rmSync(fixture);
+  });
+
+  it('rejects a misspelled required input in the shipped retrospective relay', () => {
+    const router = readText(SQUAD_WORKFLOW);
+    expect(router).toContain('"request_origin":"manual"');
+    const fixture = writeFixture(
+      'invalid-shipped-retro-relay.md',
+      router.replace('"request_origin":"manual"', '"request_orign":"manual"'),
+    );
+
+    const result = spawnSync(process.execPath, [scriptPath], {
+      env: { ...process.env, SQUAD_GATE_SCAN_OVERRIDE: fixturesDir },
+      encoding: 'utf8',
+      cwd: process.cwd(),
+    });
+    expect(result.status, 'Gate must validate the shipped retro relay payload').toBe(1);
+    expect(result.stderr).toMatch(/request_origin/);
+    rmSync(fixture);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -663,43 +2587,87 @@ describe('gh-aw: compiled workflow contract', () => {
 // ---------------------------------------------------------------------------
 
 describe('gh-aw: Plan Activate hardening behaviors', () => {
-  const content = readFileSync(SQUAD_WORKFLOW, 'utf8');
+  const content = readText(SQUAD_WORKFLOW);
 
-  it('includes output budget awareness guidance', () => {
-    expect(content).toContain('Output Budget Awareness');
-    expect(content).toMatch(/total.*>\s*50.*phased activation|phased.*activation.*>\s*50/i);
+  it('enforces the frozen planning policy with a hard ceiling of 50 issues', () => {
+    expect(activationIssueLimit('')).toBe(20);
+    expect(activationIssueLimit('Squad-Policy: lean')).toBe(10);
+    expect(activationIssueLimit('Squad-Policy: enterprise')).toBe(50);
+    expect(activationIssueLimit('Squad-Setting: max_issues=75')).toBe(50);
+    expect(activationIssueLimit('', '---\nprofile: custom\nmax_issues: 7\n---\n')).toBe(7);
+    expect(() => activationIssueLimit('Squad-Setting: max_issues=0')).toThrow();
+    const fixture = activationFixture();
+    const oversized = Array.from({ length: 51 }, (_, i) => `| t${i} | Task | Builder | builder | None |`);
+    expect(() => parseActivationPlan(
+      ['| # | Title | Owner | Agent ID | Depends On |', '|---|---|---|---|---|', ...oversized].join('\n'),
+      'plan', fixture.capture.registry, fixture.capture.team,
+    )).toThrow(/exceeds 50 issues/);
   });
 
-  it('includes label pre-flight step before issue creation', () => {
-    expect(content).toContain('Label Pre-flight');
-    expect(content).toMatch(/squad.*label.*exist|label.*squad.*exist/i);
+  it('provisions every required label before the first actual issue create', async () => {
+    const fixture = activationFixture();
+    await fixture.create();
+    const labels = fixture.github.rest.issues.createLabel;
+    expect(labels.mock.calls.map(([params]: any) => params.name)).toEqual(['squad', 'squad:builder']);
+    expect(Math.max(...labels.mock.invocationCallOrder)).toBeLessThan(fixture.createIssue.mock.invocationCallOrder[0]);
   });
 
-  it('label pre-flight does not claim impossible label creation', () => {
-    // Workflow has issues: read and no create-label safe-output; must not claim it can create labels
-    const preflight = content.match(/##### Label Pre-flight\n([\s\S]*?)(?=\n#####|\n####)/)?.[1] ?? '';
-    expect(preflight).not.toMatch(/create them|safe-output permissions handle the write|no additional token scope/i);
+  it('does not claim successful label provisioning after permission or server failures', async () => {
+    for (const status of [403, 500]) {
+      const fixture = activationFixture();
+      fixture.github.rest.issues.getLabel.mockRejectedValueOnce(Object.assign(new Error('Label lookup failed'), { status }));
+      await expect(fixture.create()).rejects.toThrow('Label lookup failed');
+      expect(fixture.github.rest.issues.createLabel).not.toHaveBeenCalled();
+      expect(fixture.createIssue).not.toHaveBeenCalled();
+    }
   });
 
-  it('label pre-flight reports missing labels as prerequisite gap', () => {
-    expect(content).toMatch(/prerequisite gap|prerequisite/i);
-    expect(content).toMatch(/issues: write/i);
-    expect(content).toMatch(/create-label.*safe-output|safe-output.*create-label/i);
+  it('label pre-flight declares add-labels/create-if-missing instead of an unconfigured gap (#1955)', () => {
+    // Forward-port note (#1955): this used to assert the OPPOSITE — that missing labels
+    // were reported as an unconfigured "prerequisite gap" requiring a nonexistent
+    // `create-label` safe-output. That was the defect #1955 fixes: gh-aw's real
+    // mechanism is `add-labels` with `create-if-missing: true`, declared in frontmatter.
+    expect(content).toContain('add-labels:');
+    expect(content).toContain('create-if-missing: true');
+    expect(content).not.toContain('create-label:');
+    expect(content).not.toMatch(/create-label.*safe-output|safe-output.*create-label/i);
   });
 
-  it('label pre-flight continues activation and omits unavailable labels with report', () => {
-    expect(content).toMatch(/unavailable labels are omitted and reported|omitted and reported/i);
+  it('sends per-operation labels to actual creates and stops if provisioning fails (#1955)', async () => {
+    const fixture = activationFixture();
+    await fixture.create();
+    expect(fixture.createIssue.mock.calls.map(([params]) => params.labels))
+      .toEqual(fixture.capture.operations.map((operation: any) => operation.labels));
+    const failed = activationFixture();
+    failed.github.rest.issues.createLabel.mockRejectedValueOnce(new Error('Provisioning failed'));
+    await expect(failed.create()).rejects.toThrow('Provisioning failed');
+    expect(failed.createIssue).not.toHaveBeenCalled();
   });
 
-  it('includes transient failure handling with single retry', () => {
-    expect(content).toContain('Transient Failure Handling');
-    expect(content).toMatch(/5xx.*retry|retry.*5xx/i);
+  it('never retries an ambiguous create failure and retains the durable no-create reservation', async () => {
+    const fixture = activationFixture();
+    fixture.createIssue.mockRejectedValueOnce(Object.assign(new Error('Ambiguous create'), { status: 503 }));
+    await expect(fixture.create()).rejects.toThrow('Ambiguous create');
+    expect(fixture.savedJournal()).toMatchObject({ started: ['task:first'], receipts: [] });
+    await expect(fixture.create()).rejects.toThrow(/reserved or accepted/);
+    expect(fixture.createIssue).toHaveBeenCalledTimes(1);
   });
 
-  it('includes graceful sub-issue fallback for 404/422', () => {
-    expect(content).toContain('Sub-issue Fallback');
-    expect(content).toMatch(/404.*422|422.*404/);
-    expect(content).toMatch(/degrade gracefully|graceful/i);
+  it('falls back only for sub-issue 404/422 while retaining actual textual parent references', async () => {
+    for (const status of [404, 422, 500]) {
+      const fixture = activationFixture();
+      fixture.github.rest.issues.addSubIssue.mockRejectedValueOnce(Object.assign(new Error('Parent link failed'), { status }));
+      if (status === 500) {
+        await expect(fixture.create()).rejects.toThrow('Parent link failed');
+        expect(fixture.createIssue).toHaveBeenCalledTimes(1);
+      } else {
+        const journal = await fixture.create();
+        expect(journal.parent_fallbacks).toEqual(['task:first']);
+        expect(fixture.createIssue.mock.calls[0][0].body).toContain('**Parent:** #42');
+        expect(fixture.github.rest.issues.addSubIssue.mock.calls[0][0])
+          .toMatchObject({ issue_number: 42, sub_issue_id: 1101 });
+      }
+    }
   });
 });
 
@@ -708,36 +2676,77 @@ describe('gh-aw: Plan Activate hardening behaviors', () => {
 // ---------------------------------------------------------------------------
 
 describe('gh-aw: Plan Activate atomic task-call contract', () => {
-  const content = readFileSync(SQUAD_WORKFLOW, 'utf8');
+  const content = readText(SQUAD_WORKFLOW);
 
-  it('2c contains explicit ATOMIC CONTRACT heading', () => {
-    expect(content).toMatch(/ATOMIC CONTRACT/i);
+  it('accepts only one activate_plan request with the exact numeric plan comment ID', () => {
+    expect(activationRequest([{ type: 'activate_plan', plan_comment_id: '10' }])).toBe(10);
+    for (const items of [
+      [], [{ type: 'create_issue', title: 'Task' }],
+      [{ type: 'activate_plan', plan_comment_id: 'aw_wi1' }],
+      [{ type: 'activate_plan', plan_comment_id: '10', bindings: [] }],
+      [{ type: 'activate_plan', plan_comment_id: '10' }, { type: 'upsert_lifecycle_state', body: 'Activated' }],
+    ]) expect(() => activationRequest(items)).toThrow();
   });
 
-  it('2c requires immediate call after each task body (one compose → one call)', () => {
-    // Must encode the sequential compose/call/verify pattern
-    expect(content).toMatch(/compose.*call.*verify|compose only that task.*call.*immediately/i);
+  it('records an actual receipt before composing a dependent task body', async () => {
+    const fixture = activationFixture();
+    const journal = await fixture.create();
+    expect(journal.receipts.map((receipt: any) => [receipt.operation_id, receipt.number]))
+      .toEqual([['task:first', 101], ['task:second', 102]]);
+    expect(fixture.createIssue.mock.calls[1][0].body).toContain('**Depends On:** #101');
   });
 
-  it('2c explicitly forbids batching task bodies before calls', () => {
-    expect(content).toMatch(/DO NOT.*compose.*batch|DO NOT.*buffer|not.*compose.*multiple.*before/i);
+  it('stops before the next operation when a synchronous create returns a staged placeholder', async () => {
+    const fixture = activationFixture();
+    fixture.createIssue.mockResolvedValueOnce({ staged: true, issue: { number: 'aw_wi1' } } as any);
+    await expect(fixture.create()).rejects.toThrow(/did not return an actual issue/);
+    expect(fixture.createIssue).toHaveBeenCalledTimes(1);
+    expect(fixture.savedJournal()).toMatchObject({ started: ['task:first'], receipts: [] });
   });
 
-  it('2c task body is compact: one sentence scope, 1-2 acceptance criteria', () => {
-    expect(content).toMatch(/one sentence.*scope|1-2 acceptance criteria/i);
+  it('binds each generated body to only its stable work ID and the frozen plan revision', async () => {
+    const fixture = activationFixture();
+    await fixture.create();
+    for (const [index, [params]] of fixture.createIssue.mock.calls.entries()) {
+      expect(params.body).toContain(`**Stable work ID:** ${fixture.capture.operations[index].id}`);
+      expect(params.body).toContain(`Plan SHA-256: ${fixture.capture.plan_comment.sha256}`);
+      expect(params.body).toContain(`Frozen plan: ${fixture.capture.plan_comment.url}`);
+      expect(params.body).toContain('This issue covers only the stable work ID above.');
+    }
   });
 
-  it('2d incomplete fallback calls report_incomplete with created/expected counts', () => {
-    expect(content).toContain('report_incomplete');
-    expect(content).toMatch(/created.*expected|expected.*created/i);
+  it('retains exact completed and started operation identities after partial failure', async () => {
+    const fixture = activationFixture();
+    const actualCreate = fixture.createIssue.getMockImplementation()!;
+    fixture.createIssue.mockImplementationOnce(actualCreate).mockRejectedValueOnce(new Error('Interrupted'));
+    await expect(fixture.create()).rejects.toThrow('Interrupted');
+    expect(fixture.savedJournal()).toMatchObject({
+      started: ['task:first', 'task:second'],
+      receipts: [{ operation_id: 'task:first', number: 101 }],
+    });
+    expect(() => validateReceiptSet(fixture.capture, fixture.savedJournal())).toThrow(/actual create receipts are missing/);
   });
 
-  it('2d incomplete fallback never noops on count mismatch', () => {
-    expect(content).toMatch(/never noop/i);
+  it('withholds acceptance and lifecycle publication when any actual receipt is missing', async () => {
+    const fixture = activationFixture();
+    await fixture.create();
+    const journal = fixture.savedJournal();
+    journal.receipts.pop();
+    const writes = fixture.github.rest.issues.createComment.mock.calls.length;
+    await expect(finalizeActivation({ ...fixture, journal, receiptArtifactId: 801 }))
+      .rejects.toThrow(/actual create receipts are missing/);
+    expect(fixture.github.rest.issues.createComment).toHaveBeenCalledTimes(writes);
+    expect(fixture.comments).toHaveLength(1);
+    expect(fixture.comments[0].body).toContain('Activation pending - not accepted');
   });
 
-  it('2d states re-run is idempotent via title match', () => {
-    expect(content).toMatch(/idempotent via title match/i);
+  it('never uses duplicate titles as identity or retries a reserved activation', async () => {
+    const fixture = activationFixture();
+    await fixture.create();
+    expect(fixture.createIssue.mock.calls.map(([params]) => params.title)).toEqual(['Same title', 'Same title']);
+    await expect(fixture.create()).rejects.toThrow(/reserved or accepted/);
+    expect(fixture.createIssue).toHaveBeenCalledTimes(2);
+    expect(content).toContain('Never deduplicate by title');
   });
 });
 
@@ -746,7 +2755,7 @@ describe('gh-aw: Plan Activate atomic task-call contract', () => {
 // ---------------------------------------------------------------------------
 
 describe('gh-aw: auto-cast pivot and resumable work (#1689)', () => {
-  const content = readFileSync(SQUAD_WORKFLOW, 'utf8');
+  const content = readText(SQUAD_WORKFLOW);
 
   it('Team Guard section exists and lists covered modes', () => {
     expect(content).toMatch(/## Team Guard/);
@@ -792,7 +2801,7 @@ describe('gh-aw: auto-cast pivot and resumable work (#1689)', () => {
 
   it('does not require unsupported Auto-Cast HTML markers', () => {
     expect(content).not.toMatch(/squad-(pending-intent|cast-opened|cast-pr)-v1/);
-    expect(readFileSync(join(SHARED_DIR, 'planning-ontology.md'), 'utf8'))
+    expect(readText(join(SHARED_DIR, 'squad-planning-ontology.md')))
       .not.toMatch(/squad-(pending-intent|cast-opened|cast-pr)-v1/);
   });
 
@@ -808,12 +2817,14 @@ describe('gh-aw: auto-cast pivot and resumable work (#1689)', () => {
     // Must use headRefName field and startsWith to match squad/cast-{repo} patterns
     expect(content).toMatch(/gh pr list/i);
     expect(content).toMatch(/headRefName/);
+    expect(content).toContain('.headRefName == "squad/bootstrap-cast"');
     expect(content).toMatch(/startswith\("squad\/cast-"\)/);
     expect(content).toMatch(/open Cast PR.*found|cast PR.*found|Cast PR is found/i);
     // Exact --head matching truncates the branch name and never finds squad/cast-{repo}; must be forbidden
     expect(content).not.toMatch(/--head "squad\/cast-"/);
     // squad/cast-member-* must be excluded so Cast Member PRs cannot satisfy Cast dedup
     expect(content).toMatch(/startswith\("squad\/cast-member-"\).*\| not|\| not.*startswith\("squad\/cast-member-"\)/);
+    expect(content).toMatch(/More than one candidate is ambiguous: fail closed/i);
   });
 
   it('Cast PR dedup stops without opening a duplicate PR', () => {
@@ -835,16 +2846,42 @@ describe('gh-aw: auto-cast pivot and resumable work (#1689)', () => {
     expect(content).toMatch(/Never instruct.*\/squad cast|never.*\/squad cast separately/i);
   });
 
-  it('partial activation N/M copy uses plan total not safe-output cap', () => {
-    expect(content).toMatch(/plan.*declared total|use the plan.*total.*not the safe-output cap/i);
+  it('partial activation completeness uses the frozen operations rather than the native create cap', async () => {
+    const fixture = activationFixture();
+    const journal = await fixture.create();
+    expect(journal.schema).toBe(ACTIVATION_RECEIPT_SCHEMA);
+    expect(journal.capture_sha256).toBe(digest(fixture.capture));
+    expect(validateReceiptSet(fixture.capture, journal).size).toBe(fixture.capture.operations.length);
+    const extra = structuredClone(journal);
+    extra.receipts.push({ ...extra.receipts[0], operation_id: 'task:extra' });
+    expect(() => validateReceiptSet(fixture.capture, extra)).toThrow();
   });
 
-  it('partial activation post message includes rerun instruction', () => {
-    expect(content).toMatch(/N of M issues created.*rerun the identical|rerun the identical.*command to continue/i);
+  it('partial activation recovery instructs no-create reconciliation instead of blind reruns', () => {
+    const acceptance = content.slice(
+      content.indexOf('## skill: `squad-plan-accept`'),
+      content.indexOf('## skill: `squad-plan-revise`'),
+    );
+    expect(acceptance).toContain('every rerun is no-create');
+    expect(acceptance).toContain('reconcile_activation');
+    expect(acceptance).toContain('current-state-authorized');
+    expect(acceptance).not.toMatch(/N of M issues created.*rerun the identical|idempotent via title match/i);
   });
 
-  it('partial activation never surfaces safe-output cap as reason', () => {
-    expect(content).toMatch(/Never surface.*safe-output cap|never surface.*create-issue.*cap/i);
+  it('actual receipt validation distinguishes identity failure from planning capacity', async () => {
+    const fixture = activationFixture();
+    const journal = await fixture.create();
+    const operation = fixture.capture.operations[0];
+    const issue = { number: 101, id: 1101, node_id: 'I_101',
+      html_url: 'https://github.com/owner/repo/issues/101',
+      url: 'https://api.github.com/repos/owner/repo/issues/101' };
+    expect(validateCreateReceipt({ staged: false, issue }, operation, fixture.capture)).toEqual(journal.receipts[0]);
+    for (const mutation of [
+      { number: 'aw_wi1' }, { id: null }, { node_id: '' },
+      { html_url: 'https://github.com/other/repo/issues/101' }, { pull_request: {} },
+    ]) expect(() => validateCreateReceipt(
+      { staged: false, issue: { ...issue, ...mutation } }, operation, fixture.capture,
+    )).toThrow(/actual issue|identities|repository or URL/);
   });
 
   it('safe-output caps (75 create-issue / 20 add-comment) are not conflated with plan limits', () => {
@@ -867,6 +2904,13 @@ describe('gh-aw: auto-cast pivot and resumable work (#1689)', () => {
 // ---------------------------------------------------------------------------
 
 describe('gh-aw: Team Guard roster-row detection — committed-HEAD git repo coverage (#1689 revision 3)', () => {
+  // A skipped behavioral suite is a permanently-green gate (#1833). Fail loudly
+  // instead of quietly reporting a pass for assertions that never executed.
+  it('resolves a POSIX shell, so the behavioral cases below actually run', () => {
+    expect(POSIX_SHELL, NO_POSIX_SHELL_MESSAGE).not.toBeNull();
+  });
+
+
   // Content shared across test cases
   const SCAFFOLD_CONTENT = `# Squad Team\n\n## Members\n| Name | Role | Charter path | Status |\n|------|------|--------------|--------|\n`;
   const ONE_MEMBER_CONTENT = `# Squad Team\n\n## Members\n| Name | Role | Charter path | Status |\n|------|------|--------------|--------|\n| Eecom | Core Dev | .squad/agents/eecom/charter.md | active |\n`;
@@ -878,7 +2922,7 @@ describe('gh-aw: Team Guard roster-row detection — committed-HEAD git repo cov
   function runCommittedRosterCheck(cwd: string): string {
     return execSync(
       `git show HEAD:.squad/team.md 2>/dev/null | awk '{sub(/\\r$/,"")} /^## Members/{f=1;next} f&&/^#/{f=0} f&&/^\\|/&&!/^\\|[-: |]*\\|$/&&!/\\| *Name *\\|/' | grep -q . && echo TEAM_PRESENT || echo TEAM_ABSENT`,
-      { cwd, shell: '/bin/sh', encoding: 'utf8' }
+      { cwd, shell: requirePosixShell(), encoding: 'utf8' }
     ).trim();
   }
 
@@ -1023,7 +3067,7 @@ describe('gh-aw: Team Guard roster-row detection — committed-HEAD git repo cov
 // ---------------------------------------------------------------------------
 
 describe('gh-aw: Auto-Cast prompt hygiene (#1689 revision)', () => {
-  const content = readFileSync(SQUAD_WORKFLOW, 'utf8');
+  const content = readText(SQUAD_WORKFLOW);
 
   it('{original_command} does not appear anywhere in workflow — only canonical command variables are used', () => {
     expect(content).not.toMatch(/\{original_command\}/);
@@ -1039,7 +3083,13 @@ describe('gh-aw: Auto-Cast prompt hygiene (#1689 revision)', () => {
 // ---------------------------------------------------------------------------
 
 describe('gh-aw: Cast PR dedup jq filter behavioral coverage (#1689 revision)', () => {
-  const squadContent = readFileSync(SQUAD_WORKFLOW, 'utf8');
+  // See #1833 — this suite skipped silently on Windows and still reported green.
+  it('resolves a POSIX shell, so the behavioral cases below actually run', () => {
+    expect(POSIX_SHELL, NO_POSIX_SHELL_MESSAGE).not.toBeNull();
+  });
+
+
+  const squadContent = readText(SQUAD_WORKFLOW);
 
   // Extract the exact --jq expression from squad.md so this test stays in sync.
   function extractJqFilter(): string {
@@ -1051,7 +3101,7 @@ describe('gh-aw: Cast PR dedup jq filter behavioral coverage (#1689 revision)', 
   function runJqFilter(jsonInput: string, filter: string): string {
     return execSync(
       `echo '${jsonInput.replace(/'/g, "'\\''")}' | jq -r '${filter}'`,
-      { shell: '/bin/sh', encoding: 'utf8' }
+      { shell: requirePosixShell(), encoding: 'utf8' }
     ).trim();
   }
 
@@ -1072,13 +3122,23 @@ describe('gh-aw: Cast PR dedup jq filter behavioral coverage (#1689 revision)', 
     expect(result).toContain('"number": 42');
   });
 
-  it('Cast Member branch (squad/cast-member-*) is excluded and returns null', () => {
+  it('deterministic bootstrap Cast branch satisfies the filter', () => {
+    const filter = extractJqFilter();
+    const prs = JSON.stringify([
+      { headRefName: 'squad/bootstrap-cast', number: 2, url: 'https://github.com/org/repo/pull/2' },
+    ]);
+    const result = runJqFilter(prs, filter);
+    expect(result).toContain('"headRefName": "squad/bootstrap-cast"');
+    expect(result).toContain('"number": 2');
+  });
+
+  it('Cast Member branch (squad/cast-member-*) is excluded and returns an empty array', () => {
     const filter = extractJqFilter();
     const prs = JSON.stringify([
       { headRefName: 'squad/cast-member-dev', number: 43, url: 'https://github.com/org/repo/pull/43' },
     ]);
     const result = runJqFilter(prs, filter);
-    expect(result).toBe('null');
+    expect(result).toBe('[]');
   });
 
   it('a closed Cast PR is absent from the open-PR scan, allowing additive retry', () => {
@@ -1092,7 +3152,7 @@ describe('gh-aw: Cast PR dedup jq filter behavioral coverage (#1689 revision)', 
       },
     ];
     const openPrs = allPrs.filter(pr => pr.state === 'OPEN');
-    expect(runJqFilter(JSON.stringify(openPrs), filter)).toBe('null');
+    expect(runJqFilter(JSON.stringify(openPrs), filter)).toBe('[]');
     expect(squadContent).toMatch(/If no open Cast PR found.*Execute Cast Mode/s);
   });
 
@@ -1106,6 +3166,18 @@ describe('gh-aw: Cast PR dedup jq filter behavioral coverage (#1689 revision)', 
     expect(result).toContain('"headRefName": "squad/cast-myrepo"');
     expect(result).not.toContain('squad/cast-member-dev');
   });
+
+  it('returns every exact Cast candidate so ambiguity cannot be hidden by first', () => {
+    const filter = extractJqFilter();
+    const prs = JSON.stringify([
+      { headRefName: 'squad/bootstrap-cast', number: 2, url: 'https://github.com/org/repo/pull/2' },
+      { headRefName: 'squad/cast-myrepo', number: 42, url: 'https://github.com/org/repo/pull/42' },
+      { headRefName: 'squad/cast-member-dev', number: 43, url: 'https://github.com/org/repo/pull/43' },
+    ]);
+    const result = JSON.parse(runJqFilter(prs, filter));
+    expect(result.map((pullRequest: { number: number }) => pullRequest.number)).toEqual([2, 42]);
+    expect(squadContent).toContain('Never choose the first result heuristically.');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1116,7 +3188,7 @@ describe('gh-aw: Cast PR dedup jq filter behavioral coverage (#1689 revision)', 
 // Complements the broader auto-Cast coverage in the '#1689' describe blocks above.
 // ---------------------------------------------------------------------------
 describe('gh-aw: Auto-Cast UX guidance — canonical fallback and Cast PR body return instruction (#1700)', () => {
-  const squadContent = readFileSync(SQUAD_WORKFLOW, 'utf8');
+  const squadContent = readText(SQUAD_WORKFLOW);
 
   it('canonical_mode definition includes safe fallback for unresolvable mode', () => {
     expect(squadContent).toMatch(/if.*canonical_mode.*cannot be determined.*safe fallback|safe fallback.*\/squad/i);
@@ -1128,5 +3200,1501 @@ describe('gh-aw: Auto-Cast UX guidance — canonical fallback and Cast PR body r
 
   it('Cast PR body instructs user to return to originating issue and rerun canonical command', () => {
     expect(squadContent).toMatch(/return to the originating issue and rerun.*\{canonical_command\}/s);
+  });
+
+  it('Cast emits routing state that standalone health can parse', () => {
+    expect(squadContent).toContain('section heading `## Routing Table`');
+    expect(squadContent).toContain('headers `Work Type | Route To | Examples`');
+    expect(squadContent).toContain('exact active casting-registry `persistent_name`');
+    expect(squadContent).toContain('multiple names comma-separated and no prose or annotations');
+    expect(squadContent).toContain('Do not route to the four built-ins or any other inactive/support role');
+  });
+});
+
+describe('gh-aw: Cast naming-mode contract (#1907)', () => {
+  const squadContent = readText(SQUAD_WORKFLOW);
+  const cast = squadContent.match(
+    /## skill: `squad-cast`\n[\s\S]*?(?=\n## skill:|$)/,
+  )?.[0] ?? '';
+
+  it('defaults an unqualified Cast request to descriptive role-based names', () => {
+    expect(cast).toMatch(/No themed naming request.*descriptive mode/s);
+    expect(cast).toContain('short, unique functional names derived from roles');
+    expect(cast).toMatch(/every registry entry.*`universe`.*`"descriptive"`/s);
+    expect(cast).toMatch(/descriptive naming.*never invent.*fictional universe/s);
+    expect(cast).not.toContain('assign character names from a fictional universe');
+  });
+
+  it('uses an explicitly requested built-in or custom universe', () => {
+    expect(cast).toMatch(/Explicit built-in or custom universe request.*requested universe/s);
+    expect(cast).toMatch(/custom universe.*spoiler-safety rules/s);
+  });
+
+  it('auto-selects a built-in universe only for themed names with no universe', () => {
+    expect(cast).toMatch(
+      /Themed names requested without a universe.*auto-select.*built-in universe/s,
+    );
+    expect(cast).toMatch(/capacity.*shape.*fit table/s);
+  });
+});
+
+describe('gh-aw: Cast replaces disposable bootstrap state (#1909)', () => {
+  const squadContent = readText(SQUAD_WORKFLOW);
+  const cast = squadContent.match(
+    /## skill: `squad-cast`\n[\s\S]*?(?=\n## skill:|$)/,
+  )?.[0] ?? '';
+  const frontmatter = extractFrontmatter(SQUAD_WORKFLOW);
+
+  function assertTruthfulCastTerminalContract(workflow: string): void {
+    const candidateCast = workflow.match(
+      /## skill: `squad-cast`\n[\s\S]*?(?=\n## skill:|$)/,
+    )?.[0] ?? '';
+    const failureBranch = candidateCast.match(
+      /For outcomes 2 or 3[\s\S]*?(?=\n##### Step 8:)/,
+    )?.[0] ?? '';
+
+    expect(candidateCast).toMatch(
+      /only exit status zero with stdout exactly\s+`Cast validation passed\.` authorizes exactly one `create-pull-request`/s,
+    );
+    expect(candidateCast).toContain(
+      '"${GITHUB_WORKSPACE:?}/.github/workflows/run-squad-cast-validator"',
+    );
+    expect(candidateCast).toMatch(/Do not transcribe validator bytes, and do not invoke or\s+load/);
+    expect(candidateCast).toContain('emits one JSON\nrecord on stdout');
+    expect(candidateCast.match(
+      /<!-- SQUAD:CAST-VALIDATOR-COMMAND:BEGIN -->[\s\S]*?<!-- SQUAD:CAST-VALIDATOR-COMMAND:END -->/,
+    )?.[0]).not.toMatch(/base64|gzip|awk|validator_expected_sha256/);
+    expect(failureBranch).toContain('## ❌ Cast did not complete');
+    expect(failureBranch).toContain('No team or Cast pull request was delivered.');
+    expect(failureBranch).toContain('complete stderr exactly as observed');
+    expect(failureBranch).toContain('One `add-comment`');
+    expect(failureBranch).toContain('One `cast_failure`');
+    expect(failureBranch).toContain('identical `stage`, `command_category`,');
+    expect(failureBranch).toContain('Never call `noop` or `report_incomplete`');
+    expect(failureBranch).toContain('never\ncall `create-pull-request`');
+    expect(failureBranch).toContain('rerun `/squad cast`');
+    expect(failureBranch).toContain('Do not suggest re-materializing, reinstalling, or');
+    expect(failureBranch).toContain('runs only when this output is emitted');
+    expect(failureBranch).toContain('cannot detect that omission');
+    expect(failureBranch).toContain('or independently\ngate `create-pull-request`');
+    expect(failureBranch).toContain('cannot prevent a pull\nrequest that is materialized concurrently');
+    expect(failureBranch).not.toMatch(/failure signal is independently enforced/i);
+    expect(failureBranch).not.toMatch(/(?:fail-closed|independent(?:ly)? fail-closed) gate/i);
+    expect(failureBranch).not.toMatch(/call `noop` and stop/i);
+    expect(failureBranch).not.toMatch(/re-?materialize the (?:committed )?(?:validator )?payload/i);
+
+    for (const [stage, category] of [
+      ['discovery', 'validator resource discovery'],
+      ['integrity', 'SHA-256 authentication'],
+      ['syntax', 'node --check'],
+      ['validation', 'validator execution'],
+    ]) {
+      expect(candidateCast).toContain(`\`${stage}\``);
+      expect(candidateCast).toContain(`\`${category}\``);
+    }
+  }
+
+  it('uses an explicit fresh-artifact payload allowlist instead of staging .squad wholesale', () => {
+    expect(cast).toContain('Never stage `.squad/` wholesale');
+    for (const artifact of [
+      '`.squad/team.md`',
+      '`.squad/routing.md`',
+      '`.squad/casting/registry.json`',
+      '`.squad/casting/history.json`',
+      '`.squad/casting/policy.json`',
+      '`.github/agents/squad.agent.md`',
+      '`meet-the-squad.md`',
+    ]) {
+      expect(cast).toContain(artifact);
+    }
+    expect(cast).toContain('only the concrete `.squad/agents/{selected-id}/charter.md`');
+  });
+
+  it('explicitly excludes activation-bootstrap templates, automation, and default agents', () => {
+    for (const excluded of [
+      '`.squad/templates/**`',
+      '`.squad/skills/**`',
+      '`.squad/scripts/**`',
+      '`.squad/workflows/**`',
+      '`lead`',
+      '`reviewer`',
+      '`security`',
+      '`docs`',
+      '`devrel`',
+    ]) {
+      expect(cast).toContain(excluded);
+    }
+  });
+
+  it('validates the complete routing file as one exact registry-backed section', () => {
+    expect(cast).toMatch(/validator deterministically parses.*routing/s);
+    expect(cast).toContain('exactly one `## Routing Table` section');
+    expect(cast).toContain('exact headers `Work Type | Route To | Examples`');
+    expect(cast).toContain('No `## Work Type → Agent` section');
+    expect(cast).toMatch(/every `Route To` value.*active casting-registry `persistent_name`/s);
+  });
+
+  it('synchronizes the generated agent capabilities from final Cast state', () => {
+    expect(cast).toContain('Completely replace the disposable bootstrap coordinator');
+    expect(cast).toContain('Do not reuse, patch, summarize, or retain any bootstrap body text');
+    expect(cast).toContain('<!-- SQUAD:TEAM-CAPABILITIES:BEGIN -->');
+    expect(cast).toContain('<!-- SQUAD:TEAM-CAPABILITIES:END -->');
+    expect(cast).toMatch(/specialists.*active registry count/s);
+    expect(cast).toMatch(/taskTypes.*hints.*routing-row count/s);
+    expect(cast).toContain('must be self-contained for the final Cast tree');
+  });
+
+  it('enforces mutually exclusive factual Cast terminal outcomes', () => {
+    expect(cast).toContain('Deterministic final-tree validation');
+    expect(cast).toContain('$GITHUB_WORKSPACE/.github/workflows/squad-cast-payload.json');
+    expect(cast).toContain('squad-cast-validator');
+    assertTruthfulCastTerminalContract(squadContent);
+  });
+
+  it('configures one bounded durable Cast failure output that calls core.setFailed', () => {
+    const castFailureJob = frontmatter.match(
+      /^    cast-failure:\n[\s\S]*?(?=^    [\w-]+:|^  data:)/m,
+    )?.[0] ?? '';
+    expect(castFailureJob).not.toBe('');
+    expect(castFailureJob).toContain('max: 1');
+    expect(castFailureJob).toContain('runs-on: ubuntu-slim');
+    expect(castFailureJob).toContain("item.type === 'cast_failure'");
+    expect(castFailureJob).toContain("item.type === 'create_pull_request'");
+    expect(castFailureJob).toContain('cannot prevent a concurrently materialized pull request');
+    expect(castFailureJob).toContain('process.env.GH_AW_AGENT_OUTPUT');
+    expect(castFailureJob).toContain('core.setFailed');
+    expect(castFailureJob).toContain('Cast did not complete.');
+    expect(castFailureJob).toContain('failure.stderr');
+    expect(castFailureJob).toContain("['validation', 'validator execution']");
+    expect(castFailureJob).toContain("['syntax', 'node --check']");
+  });
+
+  it('does not treat gh-aw run conclusion or report_incomplete as proof of Cast success', () => {
+    expect(frontmatter).toContain(
+      'run-success: "🤖 [{workflow_name}]({run_url}) finished processing. This completion message does not indicate Cast success. For Cast, only a linked Cast pull request indicates success."',
+    );
+    expect(frontmatter).toContain('activation-comments: false');
+    expect(cast).toContain('makes `report_incomplete` fail the conclusion step');
+    expect(cast).toContain('Diagnostics remain in Actions\nlogs and summaries');
+    expect(cast).toContain('Only a linked Cast PR is the success signal');
+  });
+
+  it('kills claims that the post-agent job independently enforces failure or PR authorization', () => {
+    const overclaimMutation = squadContent
+      .replace(
+        /When the agent emits `cast_failure`, the typed job[\s\S]*?gate `create-pull-request`\./,
+        'The failure signal is independently enforced after the agent and fail-closed for create-pull-request.',
+      );
+    expect(() => assertTruthfulCastTerminalContract(overclaimMutation)).toThrow();
+  });
+
+  it('kills restoration of the old add-comment plus noop success-shaped path', () => {
+    const oldPathMutation = squadContent
+      .replace(
+        /- One `cast_failure` with the identical[\s\S]*?complete `stderr`\./,
+        '- Call `noop` and stop.',
+      )
+      .replace('Never call `noop` or `report_incomplete`', 'Call `noop`');
+    expect(() => assertTruthfulCastTerminalContract(oldPathMutation)).toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// gh-aw: Cast PR closes its originating issue on merge (#1974)
+//
+// A direct `/squad cast` command opens a PR that scaffolds the team. Prior to
+// this change, that PR never referenced the invoking issue with a closing
+// keyword, so merging it left the issue open. The Auto-Cast Pivot (TG-3) is a
+// different code path that opens a Cast PR as a *side effect* of another
+// command (e.g. `/squad plan`) finding no team yet -- that PR must NOT close
+// the underlying work issue, since only the team was cast, not the requested
+// work. Step 8 must therefore add the closing keyword only for the direct
+// invocation, while TG-3's existing prohibition (tested above) stays intact.
+// ---------------------------------------------------------------------------
+describe('gh-aw: Cast PR closes its originating issue on merge (#1974)', () => {
+  const squadContent = readText(SQUAD_WORKFLOW);
+  const cast = squadContent.match(
+    /## skill: `squad-cast`\n[\s\S]*?(?=\n## skill:|$)/,
+  )?.[0] ?? '';
+  const step8 = cast.match(/##### Step 8: Open PR\n[\s\S]*?(?=\n##### Step 9)/)?.[0] ?? '';
+
+  it('Step 8 exists and configures the branch/title used by direct Cast', () => {
+    expect(step8.length, 'Step 8: Open PR section should be found in the cast skill').toBeGreaterThan(0);
+    expect(step8).toContain('`create-pull-request`');
+    expect(step8).toContain('branch `squad/cast-{repo}`');
+    expect(step8).toContain('title `[squad] Cast your Squad — {description}`');
+  });
+
+  it('Step 8 templates a closing line with the resolved issue number for a direct Cast invocation', () => {
+    expect(step8).toMatch(/append a standalone final body line in the form `Closes #\{issue_number\}`/);
+    expect(step8).toMatch(/merging this PR automatically closes the issue that invoked `\/squad cast`/);
+    expect(step8).toMatch(/Replace `\{issue_number\}` with the resolved numeric target issue number/);
+  });
+
+  it('the closing keyword is scoped to the resolved target issue, never a different issue', () => {
+    expect(step8).toMatch(/resolved numeric target issue number from Trigger Context/i);
+    expect(step8).toMatch(/never .*reference a different issue/i);
+  });
+
+  it('explicitly excludes the Auto-Cast Pivot (TG-3), which forbids closing keywords', () => {
+    expect(step8).toMatch(/not the Auto-Cast Pivot in TG-3, which forbids closing keywords/i);
+    // TG-3's own prohibition (asserted elsewhere) must still be present and unweakened.
+    expect(squadContent).toMatch(
+      /MUST NOT contain.*Fixes.*Closes.*Resolves/i,
+    );
+  });
+
+  it('instructs omitting placeholder braces and documentation backticks from the real PR body', () => {
+    expect(step8).toMatch(/never emit the braces/i);
+    expect(step8).toMatch(/omit the documentation backticks from the actual PR body/i);
+  });
+
+  it('preserves existing Step 8 PR content: team summary and the post-merge rerun instruction', () => {
+    expect(step8).toContain('body with team summary');
+    expect(step8).toMatch(
+      /return to the originating issue and rerun `\{canonical_command\}` to resume your work/,
+    );
+  });
+
+  it('preserves the Step 6 payload allowlist enumeration instruction', () => {
+    expect(step8).toMatch(
+      /Enumerate every concrete path from the validated Step 6 payload allowlist as the file request/,
+    );
+    expect(step8).toMatch(/do not add any other path/);
+  });
+
+  it('does not weaken auto-close-issue: false, which still guards Connect/Adopt/Cast-Member/Auto-Pivot', () => {
+    // The literal Closes # line (not gh-aw's built-in auto-close-issue) is what closes the
+    // issue for direct Cast, so the shared safe-output config can stay false for every other
+    // create-pull-request call in this workflow (Connect, Adopt, Cast-Member, Auto-Cast Pivot).
+    const frontmatter = extractFrontmatter(SQUAD_WORKFLOW);
+    const safeOutputs = extractSafeOutputs(frontmatter);
+    const pr = safeOutputs['create-pull-request'] as Record<string, unknown>;
+    expect(pr['auto-close-issue']).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// gh-aw: Threat detection taxonomy regression (#1701)
+//
+// Verifies that Squad's label registry correctly distinguishes detection
+// infrastructure failures (`agentic-detection-failed`) from confirmed content
+// threats (`agentic-threat-detected`).  The former is Squad-owned; the latter
+// is applied by the upstream gh-aw framework and MUST NOT be defined here.
+// ---------------------------------------------------------------------------
+describe('gh-aw: threat detection taxonomy — parse_error must not map to agentic-threat-detected (#1701)', () => {
+  const LABEL_SYNC = join(process.cwd(), '.github/workflows/sync-squad-labels.yml');
+  const labelSyncContent = readText(LABEL_SYNC);
+
+  it('sync-squad-labels.yml defines agentic-detection-failed for infrastructure failures', () => {
+    expect(labelSyncContent).toContain('agentic-detection-failed');
+  });
+
+  it('agentic-detection-failed label has a non-empty description that mentions infrastructure failure', () => {
+    expect(labelSyncContent).toMatch(/agentic-detection-failed.*infrastructure failure|infrastructure failure.*agentic-detection-failed/s);
+  });
+
+  it('agentic-detection-failed is distinct from agentic-threat-detected (Squad must not define the threat label)', () => {
+    // agentic-threat-detected is applied by the upstream process_safe_outputs.cjs on genuine threats.
+    // Squad must not redefine it here to avoid ambiguity in the taxonomy.
+    expect(labelSyncContent).not.toContain('agentic-threat-detected');
+  });
+
+  it('agentic-detection-failed is present in SIGNAL_LABELS array (high-visibility, not buried)', () => {
+    // Verify the label appears after the SIGNAL_LABELS declaration, confirming it is
+    // placed in the high-signal group rather than a lower-priority type:* group.
+    const signalStart = labelSyncContent.indexOf('SIGNAL_LABELS');
+    expect(signalStart).toBeGreaterThan(-1);
+    const signalEnd = labelSyncContent.indexOf('];', signalStart);
+    const signalBlock = labelSyncContent.slice(signalStart, signalEnd);
+    expect(signalBlock).toContain('agentic-detection-failed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: Shared bootstrap health-before-dispatch contract (#1605)
+//
+// The shared squad.md bootstrap must invoke `squad health --json` after init
+// and before any artifact upload or dispatch. Health failure must stop the
+// dispatch path visibly — no continue-on-error on the health step.
+// ---------------------------------------------------------------------------
+
+describe('gh-aw: shared bootstrap health-before-dispatch contract (#1605)', () => {
+  const sharedContent = readText(join(SHARED_DIR, 'squad.md'));
+
+  it('squad health --json appears in the shared bootstrap', () => {
+    expect(sharedContent).toMatch(/\bsquad\s+health\s+--json/);
+  });
+
+  it('health uses --json flag for structured CI output', () => {
+    expect(sharedContent).toMatch(/health --json/);
+  });
+
+  it('gates health on installed CLI capability and reports missing support (#1884)', () => {
+    expect(sharedContent).toContain(
+      "squad help | grep -Fq 'Validate team state for CI'",
+    );
+    expect(sharedContent).toMatch(
+      /if squad help \| grep -Fq 'Validate team state for CI'; then\s+squad health --json\s+else/,
+    );
+    expect(sharedContent).toContain(
+      '::warning::Squad CLI ${SQUAD_CLI_VERSION} predates the health command; the readiness gate will activate after the next published CLI release.',
+    );
+  });
+
+  it('squad health --json appears after squad init (command ordering)', () => {
+    const initIdx = sharedContent.indexOf('init --preset default');
+    const healthIdx = sharedContent.indexOf('health --json');
+    expect(initIdx, 'squad init must appear in the shared bootstrap').toBeGreaterThan(-1);
+    expect(healthIdx, 'squad health --json must appear in the shared bootstrap').toBeGreaterThan(-1);
+    expect(healthIdx, 'health must come after init').toBeGreaterThan(initIdx);
+  });
+
+  it('squad health --json appears before upload-artifact (before dispatch)', () => {
+    const healthIdx = sharedContent.indexOf('health --json');
+    const uploadIdx = sharedContent.indexOf('upload-artifact');
+    expect(healthIdx, 'squad health --json must appear in the shared bootstrap').toBeGreaterThan(-1);
+    expect(uploadIdx, 'upload-artifact must appear in the shared bootstrap').toBeGreaterThan(-1);
+    expect(healthIdx, 'health must come before artifact upload').toBeLessThan(uploadIdx);
+  });
+
+  it('health step has no continue-on-error (fail-fast contract)', () => {
+    const lines = sharedContent.split('\n');
+    const healthLineIdx = lines.findIndex(l => l.includes('health --json'));
+    expect(healthLineIdx, 'health command must appear in the shared bootstrap').toBeGreaterThan(-1);
+
+    // Walk back to the "- name:" that opens this step.
+    let stepStart = healthLineIdx;
+    while (stepStart > 0 && !lines[stepStart].match(/^\s+-\s+name:/)) {
+      stepStart--;
+    }
+    // Walk forward to the next "- name:" or end of the activation steps block.
+    let stepEnd = healthLineIdx + 1;
+    while (stepEnd < lines.length && !lines[stepEnd].match(/^\s+-\s+name:/) && !lines[stepEnd].match(/^steps:/)) {
+      stepEnd++;
+    }
+    const stepBlock = lines.slice(stepStart, stepEnd).join('\n');
+
+    expect(stepBlock, 'health step must contain the health command').toContain('health --json');
+    expect(
+      stepBlock,
+      'health step must NOT have continue-on-error: true — health failure must stop dispatch',
+    ).not.toMatch(/continue-on-error:\s*true/);
+  });
+
+  it('step ordering after activation checkout: init → health → upload', () => {
+    const activationStepsStart = sharedContent.search(/^  activation:\s*\n\s+steps:/m);
+    expect(
+      activationStepsStart,
+      'jobs.activation.steps must exist in the shared bootstrap',
+    ).toBeGreaterThan(-1);
+    const activationStepsSection = sharedContent.slice(activationStepsStart);
+
+    const initStepIdx = activationStepsSection.indexOf('Initialize Squad team');
+    const healthStepIdx = activationStepsSection.indexOf('Run Squad health check');
+    const uploadStepIdx = activationStepsSection.indexOf('Upload Squad state artifact');
+
+    expect(initStepIdx, '"Initialize Squad team" step must exist').toBeGreaterThan(-1);
+    expect(healthStepIdx, '"Run Squad health check" step must exist').toBeGreaterThan(-1);
+    expect(uploadStepIdx, '"Upload Squad state artifact" step must exist').toBeGreaterThan(-1);
+
+    expect(healthStepIdx, 'health check must follow init').toBeGreaterThan(initStepIdx);
+    expect(healthStepIdx, 'health check must precede upload').toBeLessThan(uploadStepIdx);
+  });
+
+  it('health and init use the standalone CLI selected before both steps', () => {
+    const lines = sharedContent.split('\n');
+    const healthLineIdx = lines.findIndex(l => l.includes('health --json'));
+    expect(healthLineIdx).toBeGreaterThan(-1);
+
+    const healthLine = lines[healthLineIdx];
+    expect(healthLine, 'health must invoke the installed squad binary').toMatch(/\bsquad health --json/);
+    expect(sharedContent).toContain(
+      'uses: bradygaster/squad/.github/actions/squad-init@5c662ba015ec4f99befa51b0e8ca4f2148b0497f',
+    );
+    expect(sharedContent).not.toContain('squad-release');
+    expect(sharedContent).toContain('SQUAD_CLI_VERSION: ${{ steps.squad-cli.outputs.version }}');
+    expect(sharedContent).not.toContain('npm install --global');
+    expect(sharedContent).not.toContain('npx --yes "@bradygaster/squad-cli@');
+  });
+
+  it('continue-on-error on the restore step does not shield health failure from stopping dispatch', () => {
+    // The agent-job restore step may carry continue-on-error: true — that is deliberate
+    // (it lets the agent-job body explain a missing artifact). The HEALTH step in the
+    // activation job must NOT carry it: activation-job failure blocks the agent job.
+    const lines = sharedContent.split('\n');
+    const restoreLineIdx = lines.findIndex(l => l.includes('Restore Squad state from activation artifact'));
+    expect(restoreLineIdx, 'restore step must exist').toBeGreaterThan(-1);
+
+    // Examine only the activation-job section (before the restore step).
+    const activationSection = lines.slice(0, restoreLineIdx).join('\n');
+    const healthStepStart = activationSection.lastIndexOf('Run Squad health check');
+    expect(healthStepStart, '"Run Squad health check" step must appear before the restore step').toBeGreaterThan(-1);
+
+    const healthStepBlock = activationSection.slice(healthStepStart);
+    expect(
+      healthStepBlock,
+      'health step in the activation job must not carry continue-on-error: true',
+    ).not.toMatch(/continue-on-error:\s*true/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: Uncast scaffolds must still initialize before the health gate (#1605)
+//
+// The activation job skips `squad init` when `.squad/team.md` already lists
+// roster entries. A scaffolded team.md carries only the table header and the
+// separator row, and counting those as a roster skips init — which, now that
+// readiness runs before dispatch, fails the activation job and blocks every
+// agent instead of casting the team.
+// ---------------------------------------------------------------------------
+
+describe('gh-aw: activation roster guard counts only data rows (#1605)', () => {
+  const sharedContent = readText(join(SHARED_DIR, 'squad.md'));
+
+  it('runs initialization after gh-aw checks out the activation context', () => {
+    expect(
+      sharedContent,
+      'the generated activation checkout must include committed Squad state',
+    ).toMatch(/ambient-folders:\s*\n\s+- \.squad/);
+    expect(
+      sharedContent,
+      'jobs.activation.steps runs after the generated activation checkout',
+    ).toMatch(/^  activation:\s*\n\s+steps:/m);
+    expect(
+      sharedContent,
+      'pre-steps run before the generated activation checkout and cannot inspect committed state',
+    ).not.toMatch(/^  activation:\s*\n\s+pre-steps:/m);
+  });
+
+  function initStepScript(): string {
+    const lines = sharedContent.split('\n');
+    const start = lines.findIndex((l) => l.includes('Initialize Squad team'));
+    expect(start, '"Initialize Squad team" step must exist').toBeGreaterThan(-1);
+    let end = start + 1;
+    while (end < lines.length && !/^\s+-\s+name:/.test(lines[end])) end++;
+    return lines.slice(start, end).join('\n');
+  }
+
+  /** Runs the step's roster guard against a team.md fixture. */
+  function skipsInit(teamContent: string): boolean {
+    const dir = mkdtempSync(join(tmpdir(), 'squad-roster-guard-'));
+    try {
+      const teamPath = join(dir, 'team.md');
+      writeFileSync(teamPath, teamContent);
+      const script = initStepScript();
+      const guard = script.match(/if \[ -f "\.squad\/team\.md" \] && ([\s\S]*?); then/)?.[1];
+      expect(
+        guard,
+        'roster guard must remain extractable from the "Initialize Squad team" step',
+      ).toBeDefined();
+
+      const result = spawnSync(
+        requirePosixShell(),
+        ['-c', (guard as string).replace(/\.squad\/team\.md/g, 'team.md')],
+        { cwd: dir, encoding: 'utf8' },
+      );
+      return result.status === 0;
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  const HEADER = '## Members\n\n| Name | Role | Charter | Status |\n|------|------|---------|--------|\n';
+
+  it('keeps the roster guard runnable in a plain POSIX shell', () => {
+    // The fixtures below execute the guard through `requirePosixShell()`, which is
+    // `/bin/sh` on Linux. Process substitution is a bash extension, so a guard that
+    // used it would fail there for the wrong reason and make the fixtures below
+    // report on shell support instead of roster semantics.
+    expect(
+      initStepScript(),
+      'roster guard must not use bash-only process substitution',
+    ).not.toContain('<(');
+  });
+
+  it('runs init for a scaffolded team.md that has no cast members', () => {
+    expect(
+      skipsInit(`${HEADER}\n## Project Context\n`),
+      'header and separator rows are not roster entries — skipping init here leaves ' +
+        'an uncast team that fails readiness and blocks every dispatch',
+    ).toBe(false);
+  });
+
+  it('preserves a committed cast rather than re-running init', () => {
+    expect(
+      skipsInit(`${HEADER}| Flight | Lead | \`.squad/agents/flight/charter.md\` | ✅ Active |\n\n## Project Context\n`),
+      'a team.md with real roster rows must still skip init (#1657)',
+    ).toBe(true);
+  });
+
+  it('ignores roster-shaped rows outside the Members section', () => {
+    expect(
+      skipsInit(`## Coordinator\n\n| Name | Role | Notes |\n|------|------|-------|\n| Squad | Coordinator | Routes work. |\n\n${HEADER}\n`),
+      'only the Members table describes the cast; the Coordinator table is always present',
+    ).toBe(false);
+  });
+});
+
+describe('gh-aw: CI verifier registry contract', () => {
+  it('installs verifier dependencies from the public registry without lifecycle scripts', () => {
+    const workflowPath = '.github/workflows/squad-ci.yml';
+    const workflow = parseDocument(readText(join(process.cwd(), workflowPath))).toJS();
+    const job = workflow.jobs['gh-aw-compile'];
+    const step = job.steps.find(
+      (candidate: { name?: string }) => candidate.name === 'Install verifier dependencies',
+    );
+    expect(step, `${workflowPath}: gh-aw-compile must install verifier dependencies`).toBeDefined();
+    expect(
+      step.run.trim(),
+      `${workflowPath}: Install verifier dependencies must use the public registry, not the local-development proxy`,
+    ).toBe('npm ci --ignore-scripts --registry=https://registry.npmjs.org/');
+    expect(
+      JSON.stringify(job),
+      `${workflowPath}: gh-aw-compile must not depend on the local-development npm proxy`,
+    ).not.toContain('packagefeedproxy.microsoft.io');
+  });
+});
+
+describe('gh-aw: CI compiler pin contract', () => {
+  const ci = readText(join(process.cwd(), '.github/workflows/squad-ci.yml'));
+  const installs = [
+    {
+      job: 'test',
+      name: 'Install gh-aw extension',
+      commands: [`gh extension install --pin ${MIN_GH_AW_VERSION} github/gh-aw`],
+    },
+    {
+      job: 'gh-aw-compile',
+      name: `Install gh-aw ${MIN_GH_AW_VERSION} (pinned)`,
+      commands: [
+        `gh extension install --force --pin ${MIN_GH_AW_VERSION} github/gh-aw`,
+        `test "$(gh aw --version 2>&1 | awk '{print $NF}')" = ${MIN_GH_AW_VERSION}`,
+      ],
+    },
+  ] as const;
+
+  // This is a deliberately bounded recognizer, not a general shell parser.
+  // Unsupported here-documents fail closed; only literal cat-to-stdout is inert.
+  function shellCommands(run: string): string[] {
+    const commands: string[] = [];
+    let command = '';
+    let quote = '';
+    let wordStart = true;
+    for (let i = 0; i < run.length; i++) {
+      const char = run[i];
+      if (char === '\\' && quote !== "'") {
+        const next = run[++i];
+        if (next === undefined) throw new Error('Dangling shell escape');
+        if (next !== '\n' || quote) {
+          command += char + next;
+          wordStart = false;
+        }
+      } else if (char === quote) {
+        quote = '';
+        command += char;
+      } else if (!quote && (char === "'" || char === '"')) {
+        quote = char;
+        command += char;
+        wordStart = false;
+      } else if (!quote && char === '#' && wordStart) {
+        while (i + 1 < run.length && run[i + 1] !== '\n') i++;
+      } else if (!quote && char === '\n') {
+        const heredoc = command.match(/^cat <<(['"])([A-Za-z_][A-Za-z0-9_]*)\1$/);
+        if (heredoc) {
+          const end = run.indexOf(`\n${heredoc[2]}\n`, i);
+          if (end === -1) throw new Error('Unterminated literal heredoc');
+          command += run.slice(i, end + heredoc[2].length + 1);
+          i = end + heredoc[2].length + 1;
+        }
+        if (command.trim()) commands.push(command.trim());
+        command = '';
+        wordStart = true;
+      } else {
+        command += char;
+        if (!quote) wordStart = /[\s;|&()<>]/.test(char);
+      }
+    }
+    if (quote) throw new Error('Unterminated shell quote');
+    if (command.trim()) commands.push(command.trim());
+    return commands;
+  }
+
+  function isInstallerOrAmbiguous(command: string): boolean {
+    if (/^cat <<(['"])([A-Za-z_][A-Za-z0-9_]*)\1\n[\s\S]*\n\2$/.test(command)) return false;
+    if (/^(?:echo|printf)(?:\s+(?:'[^']*'|"(?:\\[\s\S]|[^"\\$`])*"))+$/.test(command)) return false;
+    // Remove word-splicing quotes/escapes for detection only, never for approval.
+    // A repository operand alone is enough: dynamic command/argument construction
+    // must not evade detection merely by hiding "gh extension install".
+    const visible = command.replace(/['"\\]/g, '');
+    const syntax = command.replace(/'[^']*'|"(?:\\[\s\S]|[^"\\])*"|\\[\s\S]/g,
+      token => token.startsWith('"') && /[$`]/.test(token) ? '$' : 'literal');
+    const dynamicCommand = '(?![A-Za-z_]\\w*=)[^\\s;&|()]*[$`]';
+    return /github\/gh-aw|\bgh\s+(?:extension|ext)\b/.test(visible) ||
+      /\bgh\s+[^\s]*[$`]/.test(visible) ||
+      new RegExp(`(?:^|[;&|(){}\\n])\\s*(?:(?:if|then|else|do|!|command|exec|env|sudo|--?[\\w-]+|[A-Za-z_]\\w*=[^()\\s]+)\\s+)*${dynamicCommand}`).test(syntax) ||
+      new RegExp(`(?:\\$\\(|\`)\\s*${dynamicCommand}`).test(visible) ||
+      /\b(?:command|exec|env|sudo)\s[^;\n]*[$`]/.test(syntax) ||
+      /(?:^|[;&|()\n])\s*(?:eval|source|\.)\s/.test(syntax) ||
+      /\b(?:bash|sh|zsh|ksh)\s+.*(?:-[a-z]*c\b|[$`])/.test(visible) ||
+      /<</.test(syntax) || /\\\n/.test(command);
+  }
+
+  function assertCompilerPins(source: string): void {
+    const workflow = parseDocument(source);
+    expect(workflow.errors).toEqual([]);
+    const jobs = workflow.get('jobs');
+    if (!isMap(jobs)) throw new Error('CI must define jobs');
+    const installSteps: Array<{ job: unknown; name: unknown; commands: string[] }> = [];
+    for (const { key, value } of jobs.items) {
+      if (!isMap(value)) throw new Error('CI job must be a mapping');
+      const steps = value.get('steps');
+      if (steps === undefined) continue; // Reusable workflow jobs have no steps.
+      if (!isSeq(steps)) throw new Error('CI steps must be a sequence');
+      for (const step of steps.items) {
+        if (!isMap(step)) throw new Error('CI step must be a mapping');
+        const run = step.get('run');
+        if (run === undefined) continue;
+        if (typeof run !== 'string') throw new Error('CI run must be a string');
+        const commands = shellCommands(`${run}\n`);
+        const name = step.get('name');
+        // Include named slots even if their install was removed or replaced by output.
+        // Unexpected install-like scripts fail closed; never accept a shell wrapper
+        // merely because it contains the pinned command as a substring.
+        if (installs.some(install => install.name === name) || commands.some(isInstallerOrAmbiguous)) {
+          installSteps.push({ job: String(key), name, commands });
+        }
+      }
+    }
+    expect(installSteps).toEqual(installs);
+  }
+
+  function mutateInstall(job: string, change: (step: YAMLMap) => void): string {
+    const workflow = parseDocument(ci);
+    const steps = workflow.getIn(['jobs', job, 'steps']);
+    if (!isSeq(steps)) throw new Error(`Missing steps for ${job}`);
+    const name = installs.find(install => install.job === job)?.name;
+    const step = steps.items.find(step => isMap(step) && step.get('name') === name);
+    if (!isMap(step)) throw new Error(`Missing install step for ${job}`);
+    change(step);
+    return workflow.toString();
+  }
+
+  it('pins every CI compiler install to the package minimum gh-aw version', () => {
+    assertCompilerPins(ci);
+  });
+
+  it('ignores YAML comments, shell comment lines, and non-run strings', () => {
+    const workflow = parseDocument(ci);
+    workflow.setIn(['env', 'INSTALL_EXAMPLE'], 'gh extension install github/gh-aw');
+    workflow.addIn(['jobs', 'changes', 'steps'], {
+      name: installs[0].commands[0],
+      run: `echo '${installs[0].commands[0]}'\nprintf "%s" "gh extension install github/gh-aw"`,
+    });
+    const source = mutateInstall('test', step => {
+      step.set('run', `# gh extension install github/gh-aw\n\n${installs[0].commands[0]} # pinned\n`);
+      step.setIn(['env', 'PIN_EXAMPLE'], installs[1].commands[0]);
+    });
+    assertCompilerPins(`# gh extension install github/gh-aw\n${source}`);
+    assertCompilerPins(workflow.toString());
+  });
+
+  it.each([
+    ['continued comment', '# gh extension \\\necho "install github/gh-aw"'],
+    ['single-quoted backslash', "printf '%s' 'gh extension \\\ninstall github/gh-aw'"],
+    ['double-quoted backslash', 'echo "gh extension \\\ninstall github/gh-aw"'],
+    ['escaped backslash', String.raw`echo "gh extension \\"`],
+    ['literal heredoc', "cat <<'INSTALL'\ngh extension \\\ninstall github/gh-aw\nINSTALL"],
+    ['heredoc quote and comment text', "cat <<'INSTALL'\n' \" # \\\n$(gh extension install github/gh-aw)\nINSTALL"],
+  ])('ignores inert %s without folding literal text', (_label, run) => {
+    const workflow = parseDocument(ci);
+    workflow.addIn(['jobs', 'changes', 'steps'], { name: 'Literal example', run });
+    assertCompilerPins(workflow.toString());
+    if (!run.startsWith('#')) expect(shellCommands(`${run}\n`)).toEqual([run]);
+  });
+
+  it('accepts an unquoted continuation of the standalone approved command', () => {
+    assertCompilerPins(mutateInstall('test', step => {
+      step.set('run', installs[0].commands[0].replace('extension ', 'extension \\\n'));
+    }));
+  });
+
+  describe.each(installs)('$job install step', ({ job, commands }) => {
+    it.each([
+      ['unpinned', 'gh extension install github/gh-aw'],
+      ['wrong version', commands[0].replace(MIN_GH_AW_VERSION, 'v0.0.0')],
+      ['duplicate command', `${commands[0]}\n${commands[0]}`],
+      ['comment-only pin', `# ${commands[0]}\ngh extension install github/gh-aw`],
+      ['inline comment pin', `gh extension install github/gh-aw # ${commands[0]}`],
+      ['echoed pin', `echo "${commands[0]}"`],
+      ['shell wrapper', `bash -c '${commands[0]}'`],
+      ['conditional command', `false && ${commands[0]}`],
+      ['preceding command', `echo preparing\n${commands[0]}`],
+      ['appended command', `${commands[0]}; gh extension install github/gh-aw`],
+      ['heredoc text', `cat <<'INSTALL'\n${commands[0]}\nINSTALL`],
+      ['quoted continuation', `'${commands[0].replace('extension ', 'extension \\\n')}'`],
+      ['escaped backslash is not continuation', commands[0].replace('extension ', 'extension \\\\\n')],
+      ['comment backslash is not continuation', commands[0].replace('extension ', 'extension # comment \\\n')],
+      ['space after backslash is not continuation', commands[0].replace('extension ', 'extension \\ \n')],
+    ])('rejects %s', (_label, command) => {
+      const source = mutateInstall(job, step => {
+        step.set('run', [command, ...commands.slice(1)].join('\n'));
+      });
+      expect(() => assertCompilerPins(source)).toThrow();
+    });
+
+    it('rejects an install moved to an unexpected step', () => {
+      const source = mutateInstall(job, step => step.set('name', 'Unexpected install'));
+      expect(() => assertCompilerPins(source)).toThrow();
+    });
+
+    it('rejects an install moved to an unexpected job', () => {
+      const workflow = parseDocument(ci);
+      const original = workflow.getIn(['jobs', job]);
+      workflow.deleteIn(['jobs', job]);
+      workflow.setIn(['jobs', 'unexpected-job'], original);
+      expect(() => assertCompilerPins(workflow.toString())).toThrow();
+    });
+
+    it('rejects a missing install step', () => {
+      const source = mutateInstall(job, step => step.delete('run'));
+      expect(() => assertCompilerPins(source)).toThrow();
+    });
+
+    it.each([
+      ['duplicate step', job, commands[0]],
+      ['extra pinned install', 'changes', commands[0]],
+      ['extra unpinned install', 'changes', 'gh extension install github/gh-aw'],
+      ['extra wrapped install', 'changes', `bash -c '${commands[0]}'`],
+      ['extra install after quoted hash', 'changes', `echo "#"; ${commands[0]}`],
+      ['extra install in output substitution', 'changes', `echo "$(${commands[0]})"`],
+      ['continued installer', 'changes', 'gh extension \\\ninstall github/gh-aw'],
+      ['continued command word', 'changes', 'g\\\nh ext\\\nension install github/gh-aw'],
+      ['continued repository', 'changes', 'gh extension install github/gh-\\\naw'],
+      ['continued wrapper', 'changes', 'command gh extension \\\ninstall github/gh-aw'],
+      ['continued conditional', 'changes', 'if true; then gh extension \\\ninstall github/gh-aw; fi'],
+      ['continued substitution', 'changes', 'echo "$(gh extension \\\ninstall github/gh-aw)"'],
+      ['backtick substitution', 'changes', 'echo "`gh extension install github/gh-aw`"'],
+      ['quoted word splicing', 'changes', `g'h' exten"sion" install github/gh-"aw"`],
+      ['dynamic command', 'changes', 'cli=gh\n"$cli" extension install github/gh-aw'],
+      ['dynamic arguments', 'changes', 'gh "$verb" "$action" "$repository"'],
+      ['partly dynamic subcommand', 'changes', 'gh exten"$suffix" "$action" "$repository"'],
+      ['partly dynamic executable', 'changes', 'g"$suffix" "$verb" "$action" "$repository"'],
+      ['fully dynamic command', 'changes', '"$INSTALLER"'],
+      ['dynamic command in group', 'changes', '{ "$INSTALLER"; }'],
+      ['dynamic command in substitution', 'changes', 'echo "$("$INSTALLER")"'],
+      ['dynamic command in backticks', 'changes', 'echo "`$INSTALLER`"'],
+      ['dynamic command after assignment', 'changes', 'ENV=value "$INSTALLER"'],
+      ['dynamic env wrapper', 'changes', 'env -i "$INSTALLER"'],
+      ['dynamic wrapper with option operand', 'changes', 'env -u PATH "$INSTALLER"'],
+      ['dynamic shell wrapper', 'changes', 'bash -c "$INSTALLER"'],
+      ['eval wrapper', 'changes', 'eval "$INSTALLER"'],
+      ['unquoted heredoc substitution', 'changes', 'cat <<INSTALL\n$(gh extension \\\ninstall github/gh-aw)\nINSTALL'],
+      ['executable heredoc', 'changes', "bash <<'INSTALL'\ngh extension \\\ninstall github/gh-aw\nINSTALL"],
+      ['literal piped to shell', 'changes', `printf '%s' '${commands[0]}' | bash`],
+      ['literal heredoc piped to shell', 'changes', "cat <<'INSTALL' | bash\ngh extension \\\ninstall github/gh-aw\nINSTALL"],
+      ['installer after literal heredoc', 'changes', "cat <<'INSTALL'\nliteral \\\nINSTALL\ngh extension \\\ninstall github/gh-aw"],
+      ['installer after comment backslash', 'changes', '# example \\\ngh extension install github/gh-aw'],
+      ['installer after quoted backslash', 'changes', "echo '\\'\ngh extension install github/gh-aw"],
+      ['installer after escaped backslash', 'changes', 'echo \\\\\ngh extension install github/gh-aw'],
+      ['installer after escaped space hash', 'changes', 'echo \\ #; gh extension install github/gh-aw'],
+      ['double-quoted continuations', 'changes', '"g\\\nh" "exten\\\nsion" install "github/gh-\\\naw"'],
+    ])('rejects %s', (_label, targetJob, command) => {
+      const workflow = parseDocument(ci);
+      workflow.addIn(['jobs', targetJob, 'steps'], {
+        name: 'Extra install',
+        run: command,
+      });
+      expect(() => assertCompilerPins(workflow.toString())).toThrow();
+    });
+  });
+});
+
+describe('gh-aw: canonical package integrity contract', () => {
+  const revisionA = 'a'.repeat(40);
+  const revisionB = 'b'.repeat(40);
+
+  function copyInto(root: string, source: string, destination: string): void {
+    const target = join(root, destination);
+    mkdirSync(dirname(target), { recursive: true });
+    cpSync(join(process.cwd(), source), target);
+  }
+
+  function makeConsumer(
+    revision = revisionA,
+    materialize = true,
+    sourceBinding: 'workflow' | 'package' | 'mixed' = 'workflow',
+  ): string {
+    const root = createTestWorkspace('gh-aw-package-contract-');
+    const install = createFirstInstallFixture(revision, sourceBinding);
+    copyInto(root, CONTRACT_SOURCE, CONTRACT_DESTINATION);
+    const contract = JSON.parse(readFileSync(join(process.cwd(), CONTRACT_SOURCE), 'utf8'));
+    for (const workflow of contract.workflows) {
+      const destination = join(root, workflow.destination);
+      mkdirSync(dirname(destination), { recursive: true });
+      writeFileSync(destination, install.consumerFiles.get(workflow.destination)!);
+      const lock = join(root, workflow.lock);
+      mkdirSync(dirname(lock), { recursive: true });
+      writeFileSync(lock, install.consumerFiles.get(workflow.lock)!);
+    }
+    for (const resource of contract.shared_runtime) {
+      copyInto(root, resource.source, resource.package_destination);
+      if (materialize && resource.package_destination !== resource.destination) {
+        copyInto(root, resource.source, resource.destination);
+      }
+    }
+    for (const skill of contract.skills) {
+      copyInto(root, skill.source, skill.destination);
+    }
+    const owned = [
+      ...contract.workflows,
+      ...contract.shared_runtime.map((entry: { source: string; package_destination: string }) => ({
+        source: entry.source,
+        destination: entry.package_destination,
+      })),
+      { source: CONTRACT_SOURCE, destination: CONTRACT_DESTINATION },
+    ].map((entry: { source: string; destination: string }) => ({
+      source: entry.source,
+      destination: entry.destination,
+      sha256: createHash('sha256').update(readFileSync(join(root, entry.destination))).digest('hex'),
+    })).sort((left, right) => left.destination.localeCompare(right.destination));
+    const ownership = join(root, '.github/aw/packages/bradygaster-squad-workflows-test.json');
+    mkdirSync(dirname(ownership), { recursive: true });
+    writeFileSync(ownership, `${JSON.stringify({
+      schemaVersion: 1,
+      package: PACKAGE_NAME,
+      source: `${PACKAGE_NAME}@${revision}`,
+      resolvedCommit: revision,
+      installer: 'gh-aw v0.91.5 test',
+      files: owned,
+    }, null, 2)}\n`);
+    return root;
+  }
+
+  function mutateContract(root: string, mutate: (contract: any) => void): string[] {
+    const path = join(root, CONTRACT_DESTINATION);
+    const contract = JSON.parse(readFileSync(path, 'utf8'));
+    mutate(contract);
+    writeFileSync(path, `${JSON.stringify(contract, null, 2)}\n`);
+    return verifyInstall(root).failures;
+  }
+
+  it('registers the exact nested 8/20/1 topology and safe trigger probe', () => {
+    expect(checkSource(process.cwd())).toEqual([]);
+    const contract = JSON.parse(readFileSync(join(process.cwd(), CONTRACT_SOURCE), 'utf8'));
+    const ciRuntimeCount = readText(join(process.cwd(), '.github/workflows/squad-ci.yml')).match(
+      /find \.github\/workflows\/shared -type f ! -name 'squad-bootstrap-trigger-probe\.json' \| wc -l \| tr -d ' '\)" = (\d+)/,
+    );
+    const ci = readText(join(process.cwd(), '.github/workflows/squad-ci.yml'));
+    expect(contract.workflows.map((entry: { name: string }) => entry.name)).toEqual(WORKFLOW_NAMES);
+    expect(contract.workflows).toHaveLength(8);
+    expect(contract.shared_runtime).toHaveLength(RUNTIME_TUPLES.length);
+    expect(contract.shared_runtime).toHaveLength(21);
+    const sharedResources = contract.shared_runtime.filter((entry: { destination: string }) =>
+      entry.destination.startsWith('.github/workflows/shared/'));
+    expect(ciRuntimeCount?.[1], 'strict compile CI shared-directory count must match materialized destinations')
+      .toBe(String(sharedResources.length));
+    expect(sharedResources).toHaveLength(20);
+    expect(ci).toContain('test -f .github/workflows/squad-agent-binding-check.yml');
+    const seedStart = ci.indexOf('mkdir -p .github/workflows');
+    const addStart = ci.indexOf('gh aw add --force "$GITHUB_WORKSPACE/workflows"');
+    expect(seedStart, 'clean-consumer CI must seed all dispatched peers before gh aw add compiles')
+      .toBeGreaterThan(-1);
+    expect(addStart).toBeGreaterThan(seedStart);
+    expect(ci.slice(seedStart, addStart)).toContain(
+      `for workflow in ${WORKFLOW_NAMES.join(' ')}; do`,
+    );
+    expect(ci.slice(seedStart, addStart)).toContain(
+      '"$GITHUB_WORKSPACE/workflows/package/${workflow}.md"',
+    );
+    expect(ci.slice(addStart)).toContain('rm -f .github/skills/agentic-workflows/SKILL.md');
+    expect(contract.shared_runtime).toContainEqual(expect.objectContaining({
+      path: 'shared/squad-review-guard.mjs',
+      destination: '.github/workflows/shared/squad-review-guard.mjs',
+    }));
+    for (const resource of ['squad-activation.mjs', 'check-agent-binding.mjs']) {
+      expect(contract.shared_runtime).toContainEqual(expect.objectContaining({
+        path: `shared/${resource}`, destination: `.github/workflows/shared/${resource}`,
+      }));
+    }
+    expect(contract.shared_runtime).toContainEqual(expect.objectContaining({
+      path: 'shared/squad-agent-binding-check.yml',
+      package_destination: '.github/aw/squad/runtime/shared/squad-agent-binding-check.yml',
+      destination: '.github/workflows/squad-agent-binding-check.yml',
+    }));
+    expect(contract.skills).toHaveLength(SKILL_TUPLES.length);
+    expect(contract.skills).toHaveLength(1);
+    expect(contract.package).toBe('bradygaster/squad/workflows');
+    expect(contract.manifest).toBe('workflows/aw.yml');
+    expect(contract.bootstrap.trigger_probe).toBe(TRIGGER_PROBE);
+    expect(contract.shared_runtime.some((entry: { path: string }) => entry.path === TRIGGER_PROBE)).toBe(false);
+    expect(readText(join(process.cwd(), 'workflows/aw.yml'))).toContain('  - skills/gh-aw-enlistment');
+    expect(existsSync(join(
+      process.cwd(),
+      '.github/skills/agentic-workflows/SKILL.md',
+    ))).toBe(false);
+    const liveRoutingPath = join(process.cwd(), '.squad/routing.md');
+    if (existsSync(liveRoutingPath)) {
+      expect(readText(liveRoutingPath)).toContain(
+        '| Agentic workflows | agentic-workflows-dev |',
+      );
+    } else {
+      expect(existsSync(liveRoutingPath)).toBe(false);
+    }
+    expect(existsSync(join(
+      process.cwd(),
+      '.github/skills/agentic-workflow-designer/SKILL.md',
+    ))).toBe(true);
+    expect(existsSync(join(
+      process.cwd(),
+      '.github/skills/gh-aw-reliability/SKILL.md',
+    ))).toBe(true);
+    expect(existsSync(join(
+      process.cwd(),
+      '.github/workflows/agentics-maintenance.yml',
+    ))).toBe(true);
+    for (const workflow of contract.workflows) {
+      expect(workflow.source).toBe(`workflows/package/${workflow.name}.md`);
+      expect(readText(join(process.cwd(), workflow.source))).not.toMatch(/^resources:/m);
+    }
+    expect(existsSync(join(process.cwd(), 'aw.yml'))).toBe(false);
+  }, 120_000);
+
+  it('installs through the actual pinned native manifest boundary and verifies the materialized checker', () => {
+    const root = createTestWorkspace('gh-aw-native-package-');
+    execFileSync('git', ['init', '--quiet'], { cwd: root });
+    execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/example/squad-consumer.git'], { cwd: root });
+    for (const name of WORKFLOW_NAMES) {
+      copyInto(root, `workflows/package/${name}.md`, `.github/workflows/${name}.md`);
+    }
+    execFileSync('gh', ['aw', 'add', '--force', WORKFLOWS_DIR], {
+      cwd: root, stdio: 'pipe', timeout: 90_000,
+    });
+    unlinkSync(join(root, '.github/skills/agentic-workflows/SKILL.md'));
+    const destination = '.github/workflows/squad-agent-binding-check.yml';
+    expect(existsSync(join(root, destination))).toBe(false);
+    writeLocalTestOwnership(root, revisionA);
+    materializeRuntime(root);
+    expect(readText(join(root, destination))).toBe(readText(join(WORKFLOWS_DIR, 'shared/squad-agent-binding-check.yml')));
+    compileWithPinnedActions(root);
+    expect(verifyInstall(root, { expectedRevision: revisionA }).failures).toEqual([]);
+    writeFileSync(join(root, destination), 'tampered native checker\n');
+    expect(verifyInstall(root, { expectedRevision: revisionA }).failures.join('\n'))
+      .toContain(destination);
+    expect(() => materializeRuntime(root)).toThrow(/refusing to overwrite/);
+    expect(readText(join(root, destination))).toBe('tampered native checker\n');
+  }, 120_000);
+
+  it('refuses to overwrite an unrelated pre-existing native checker during materialization', () => {
+    const root = makeConsumer(revisionA, false);
+    const destination = join(root, '.github/workflows/squad-agent-binding-check.yml');
+    writeFileSync(destination, 'name: Existing unrelated workflow\n');
+    expect(() => materializeRuntime(root)).toThrow(/refusing to overwrite/);
+    expect(readText(destination)).toBe('name: Existing unrelated workflow\n');
+  });
+
+  it('accepts a coherent consumer with the exact ownership cardinality', () => {
+    const root = makeConsumer();
+    expect(verifyInstall(root, { expectedRevision: revisionA }).failures).toEqual([]);
+    const record = JSON.parse(readFileSync(
+      join(root, '.github/aw/packages/bradygaster-squad-workflows-test.json'),
+      'utf8',
+    ));
+    expect(record.files).toHaveLength(OWNERSHIP_ENTRY_COUNT);
+  });
+
+  it('preserves compiler-owned relay inputs, pinned SDK research, and activation scope', () => {
+    const fixture = createFirstInstallFixture(revisionA, 'package');
+    for (const name of WORKFLOW_NAMES) {
+      const source = readText(join(WORKFLOWS_DIR, `${name}.md`));
+      const frontmatter = parseDocument(extractFrontmatter(join(WORKFLOWS_DIR, `${name}.md`))).toJS();
+      expect(frontmatter.on.workflow_dispatch?.inputs ?? {}).not.toHaveProperty('aw_context');
+      const lockText = fixture.consumerFiles.get(`.github/workflows/${name}.lock.yml`)!.toString();
+      const lock = parseDocument(lockText).toJS();
+      if (lock.on.workflow_dispatch) {
+        expect(lock.on.workflow_dispatch.inputs.aw_context)
+          .toEqual({ default: '', description: 'Agent caller context (Reserved for Agentic Workflows).', required: false, type: 'string' });
+      }
+      if (name === 'squad-bootstrap') {
+        expect(lock.jobs.conclusion.permissions).toEqual({
+          actions: 'read',
+          issues: 'write',
+          'pull-requests': 'read',
+        });
+      }
+      if (source.includes('  - shared/squad.md')) {
+        const token = lock.jobs.activation.steps.find((step: { id?: string }) => step.id === 'squad-app-token');
+        expect(token.with.repositories).toBe('${{ github.repository }}');
+        expect(token.with.owner).toBe('${{ vars.SQUAD_GITHUB_APP_OWNER }}');
+        expect(token.with['permission-contents']).toBe('read');
+        expect(Object.keys(token.with).filter(key => key.startsWith('permission-')))
+          .toEqual(['permission-contents']);
+      }
+      if (name === 'squad') {
+        expect(lockText).toContain('install_copilot_cli.sh" 1.0.78');
+        const agent = lock.jobs.agent.steps.find((step: { env?: Record<string, unknown> }) =>
+          step.env?.GH_AW_COPILOT_SDK_DRIVER);
+        const args = JSON.parse(agent.env.GH_AW_COPILOT_SDK_SERVER_ARGS);
+        expect(args).toEqual(expect.arrayContaining(['--agent', 'squad', '--disable-builtin-mcps']));
+        const config = JSON.parse(agent.env.GH_AW_COPILOT_SDK_TOOL_CONFIG);
+        expect(config.capabilities.webFetch).toBe(true);
+        expect(config.capabilities.webSearch).toBe(false);
+        expect(config.permissions.allowedTools).toContain('web_fetch');
+      } else {
+        expect(lockText).not.toContain('GH_AW_COPILOT_SDK_DRIVER:');
+      }
+    }
+  });
+
+  it('strict-verifies an explicit schedule seed without relaxing lock comparison', () => {
+    const root = makeConsumer(revisionA, true, 'package');
+    execFileSync('git', ['init', '--quiet'], { cwd: root });
+    execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/example/squad-consumer.git'], { cwd: root });
+    compileWithPinnedActions(root);
+    execFileSync('gh', ['aw', 'compile', '--strict', '--no-check-update',
+      '--schedule-seed', 'example/shared-schedules'], { cwd: root, stdio: 'pipe' });
+    expect(verifyInstall(root, { strictCompile: true }).failures.join('\n')).toContain('Generated lock is stale');
+    vi.stubEnv('SQUAD_GH_AW_SCHEDULE_SEED', 'example/shared-schedules');
+    try {
+      expect(verifyInstall(root, { strictCompile: true }).failures).toEqual([]);
+      const path = join(root, '.github/workflows/squad-retro.lock.yml');
+      writeFileSync(path, readText(path).replace('contents: read', 'contents: write'));
+      expect(verifyInstall(root, { strictCompile: true }).failures.join('\n')).toContain('Installed digest mismatch');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 120_000);
+
+  it.each(['workflow', 'package', 'mixed'] as const)(
+    'binds the complete %s lock digest to the declared 24-hour failure expiry', sourceBinding => {
+      const root = makeConsumer(revisionA, true, sourceBinding);
+      execFileSync('git', ['init', '--quiet'], { cwd: root });
+      execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/example/squad-consumer.git'], { cwd: root });
+      const configPath = join(root, '.github/workflows/aw.json');
+      const config = JSON.stringify({ maintenance: { action_failure_issue_expires: 24 } });
+      const workerPath = join(root, '.github/workflows/squad-implement-worker.lock.yml');
+      expect(readText(workerPath)).toContain('GH_AW_ACTION_FAILURE_ISSUE_EXPIRES_HOURS: "168"');
+      writeFileSync(configPath, config);
+      expect(verifyInstall(root).failures.join('\n')).toContain('Installed digest mismatch');
+      compileWithPinnedActions(root);
+      expect(readText(workerPath)).toContain('GH_AW_ACTION_FAILURE_ISSUE_EXPIRES_HOURS: "24"');
+      expect(readText(configPath)).toBe(config);
+      expect(verifyInstall(root, { strictCompile: true }).failures).toEqual([]);
+
+      writeFileSync(configPath, JSON.stringify({ maintenance: { action_failure_issue_expires: 168 } }));
+      expect(verifyInstall(root).failures.join('\n')).toContain('Installed digest mismatch');
+      unlinkSync(configPath);
+      expect(verifyInstall(root).failures.join('\n')).toContain('Installed digest mismatch');
+      writeFileSync(configPath, config);
+      const original = readText(workerPath);
+      for (const modified of [
+        original.replace('GH_AW_ACTION_FAILURE_ISSUE_EXPIRES_HOURS: "24"', 'GH_AW_ACTION_FAILURE_ISSUE_EXPIRES_HOURS: "48"'),
+        original.replace('contents: read', 'contents: write'),
+        original.replace('uses: actions/github-script@', 'uses: attacker/github-script@'),
+      ]) {
+        expect(modified).not.toBe(original);
+        writeFileSync(workerPath, modified);
+        expect(verifyInstall(root).failures.join('\n')).toContain('Installed digest mismatch');
+      }
+    }, 120_000,
+  );
+
+  it.each([0, -1, 48, '24', null, {}, []])(
+    'rejects unsupported failure expiry %j without compiler fallback', expiry => {
+      const root = makeConsumer();
+      writeFileSync(join(root, '.github/workflows/aw.json'),
+        JSON.stringify({ maintenance: { action_failure_issue_expires: expiry } }));
+      expect(verifyInstall(root).failures.join('\n')).toContain('Unsupported');
+    },
+  );
+
+  it('rejects invalid consumer configuration instead of selecting baseline digests', () => {
+    const root = makeConsumer();
+    const path = join(root, '.github/workflows/aw.json');
+    for (const config of ['{', 'null', '[]', '{"maintenance":[]}', '{"maintenance":null}']) {
+      writeFileSync(path, config);
+      expect(verifyInstall(root).failures.length, config).toBeGreaterThan(0);
+    }
+  });
+
+  it.each(['v0.89.22', 'v0.91.4', 'v0.91.50', 'v0.91.5-preview'])(
+    'rejects ownership from unsupported installer %s', version => {
+      const root = makeConsumer();
+      const path = join(root, '.github/aw/packages/bradygaster-squad-workflows-test.json');
+      const record = JSON.parse(readText(path));
+      record.installer = `gh-aw ${version}`;
+      writeFileSync(path, JSON.stringify(record));
+      expect(verifyInstall(root).failures.join('\n')).toContain('Package ownership installer must be gh-aw v0.91.5');
+    },
+  );
+
+  it.each(['workflow', 'package', 'mixed'] as const)(
+    'verifies %s source bindings at the immutable squash-merged revision',
+    sourceBinding => {
+      const revision = '6ec06cc79230cf71d55b484457e8f11190e20a49';
+      const root = makeConsumer(revision, true, sourceBinding);
+      execFileSync('git', ['init', '--quiet'], { cwd: root });
+      execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/example/squad-consumer.git'], { cwd: root });
+      compileWithPinnedActions(root);
+      expect(verifyInstall(root, { expectedRevision: revision, strictCompile: true }).failures).toEqual([]);
+      const contract = JSON.parse(readFileSync(join(root, CONTRACT_DESTINATION), 'utf8'));
+      const review = contract.workflows.find((entry: { name: string }) => entry.name === 'squad-review');
+      expect(review.package_lock_sha256).not.toBe(review.lock_sha256);
+      expect(contract.schema_version).toBe(2);
+    },
+    120_000,
+  );
+
+  it('keeps both compiled digest variants stable across equivalent trees with different commit identities', () => {
+    const trees: string[] = [];
+    const commits: string[] = [];
+    for (const message of ['PR head', 'Squash merge']) {
+      const root = createTestWorkspace('gh-aw-commit-identity-');
+      cpSync(WORKFLOWS_DIR, join(root, 'workflows'), { recursive: true });
+      const git = (args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
+      git(['init', '--quiet']);
+      git(['add', 'workflows']);
+      git(['-c', 'user.name=Contract Test', '-c', 'user.email=test@example.invalid', 'commit', '--quiet', '-m', message]);
+      trees.push(git(['rev-parse', 'HEAD^{tree}']));
+      const revision = git(['rev-parse', 'HEAD']);
+      commits.push(revision);
+      expect(buildContract(root)).toEqual(JSON.parse(readFileSync(join(root, CONTRACT_SOURCE), 'utf8')));
+      for (const sourceBinding of ['workflow', 'package'] as const) {
+        expect(verifyInstall(makeConsumer(revision, true, sourceBinding), {
+          expectedRevision: revision,
+        }).failures).toEqual([]);
+      }
+    }
+    expect(trees[0]).toBe(trees[1]);
+    expect(commits[0]).not.toBe(commits[1]);
+  }, 120_000);
+
+  it.each(['workflow', 'package'] as const)(
+    'strict-compiles %s digests with immutable action pins and rejects altered pins',
+    sourceBinding => {
+      const root = makeConsumer(revisionA, true, sourceBinding);
+      execFileSync('git', ['init', '--quiet'], { cwd: root });
+      compileWithPinnedActions(root);
+      expect(verifyInstall(root).failures).toEqual([]);
+      expect(() => compileWithPinnedActions(root, { ...process.env, SQUAD_GH_AW_BIN: process.execPath }))
+        .toThrow(/requires gh-aw/);
+
+      const pinPath = join(root, '.github/aw/actions-lock.json');
+      const pins = JSON.parse(readFileSync(pinPath, 'utf8'));
+      const setup = pins.entries[`github/gh-aw-actions/setup@${MIN_GH_AW_VERSION}`];
+      const lockPath = join(root, '.github/workflows/squad.lock.yml');
+      const original = readFileSync(lockPath, 'utf8');
+      const actionReference = `github/gh-aw-actions/setup@${setup.sha} # ${MIN_GH_AW_VERSION}`;
+      const mutableReference = `github/gh-aw-actions/setup@${MIN_GH_AW_VERSION}`;
+      const mutable = original
+        .replaceAll(actionReference, mutableReference)
+        .replace(
+          `"repo":"github/gh-aw-actions/setup","sha":"${setup.sha}","version":"${MIN_GH_AW_VERSION}"`,
+          `"repo":"github/gh-aw-actions/setup","sha":"${MIN_GH_AW_VERSION}","version":"${MIN_GH_AW_VERSION}"`,
+        );
+      expect(mutable).not.toBe(original);
+      expect(mutable).not.toContain(actionReference);
+      expect(createHash('sha256').update(normalizeCompiledLock(mutable, revisionA)).digest('hex'))
+        .not.toBe(createHash('sha256').update(normalizeCompiledLock(original, revisionA)).digest('hex'));
+      expect(() => validateCompilerActionPins(mutable)).toThrow(/invalid immutable action pin/);
+      writeFileSync(lockPath, mutable);
+      expect(verifyInstall(root).failures.join('\n'))
+        .toContain('Installed digest mismatch for .github/workflows/squad.lock.yml');
+      writeFileSync(lockPath, original);
+
+      for (const key of Object.keys(pins.entries)) {
+        for (const value of [undefined, MIN_GH_AW_VERSION, '0'.repeat(40)]) {
+          const altered = structuredClone(pins);
+          if (value === undefined) delete altered.entries[key];
+          else altered.entries[key].sha = value;
+          writeFileSync(pinPath, JSON.stringify(altered));
+          expect(() => compileWithPinnedActions(root)).toThrow(/missing or noncanonical pin/);
+        }
+      }
+
+      for (const value of [MIN_GH_AW_VERSION, '0'.repeat(40)]) {
+        const altered = original.replaceAll(setup.sha, value);
+        expect(() => validateCompilerActionPins(altered)).toThrow(/invalid immutable action pin/);
+        writeFileSync(lockPath, altered);
+        expect(verifyInstall(root).failures.join('\n'))
+          .toContain('Installed digest mismatch for .github/workflows/squad.lock.yml');
+      }
+      expect(() => validateCompilerActionPins(original.replace(/^# gh-aw-manifest: .+\n/m, '')))
+        .toThrow(/missing the gh-aw setup action pin/);
+    },
+    120_000,
+  );
+
+  it('seeds native-consumer CI pins without usable authentication and rejects tampering', () => {
+    const workflow = parseDocument(readText(join(process.cwd(), '.github/workflows/squad-ci.yml'))).toJS();
+    const step = workflow.jobs['gh-aw-compile'].steps.find(
+      (candidate: { name?: string }) => candidate.name === 'Verify a clean native package consumer',
+    );
+    const seed = step.run.match(/node --input-type=module -e '([\s\S]*?)'/)?.[1];
+    expect(seed, 'native consumer must execute the version-bound pin helper').toBeDefined();
+    expect(step.run.indexOf('compileWithPinnedActions(process.cwd())'))
+      .toBeLessThan(step.run.indexOf('gh aw compile --strict --approve'));
+    expect(step.run).toContain('--verify-install');
+    expect(step.run).toContain('--strict-compile');
+
+    const root = makeConsumer(revisionA, true, 'package');
+    execFileSync('git', ['init', '--quiet'], { cwd: root });
+    execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/example/squad-consumer.git'], { cwd: root });
+    // A deliberately invalid test credential prevents fallback to local keychain authentication.
+    const env = { ...process.env, GH_TOKEN: 'invalid-test-token', GITHUB_TOKEN: '' };
+    const compile = () => execFileSync('gh', ['aw', 'compile', '--strict', '--no-check-update'], {
+      cwd: root, env, stdio: 'pipe', timeout: 120_000,
+    });
+    const lockPath = join(root, '.github/workflows/squad.lock.yml');
+    compile();
+    const unpinned = readText(lockPath);
+    expect(createHash('sha256').update(normalizeCompiledLock(unpinned, revisionA)).digest('hex'))
+      .not.toBe(JSON.parse(readText(join(root, CONTRACT_DESTINATION))).workflows
+        .find((entry: { name: string }) => entry.name === 'squad').package_lock_sha256);
+    expect(verifyInstall(root).failures.join('\n')).toContain('Installed digest mismatch');
+
+    const seedPins = () => spawnSync(process.execPath, ['--input-type=module', '-e', seed!], {
+      cwd: root, env, encoding: 'utf8', timeout: 120_000,
+    });
+    const seeded = seedPins();
+    expect(seeded.status, seeded.stderr).toBe(0);
+    compile();
+    expect(verifyInstall(root, { expectedRevision: revisionA, strictCompile: true }).failures).toEqual([]);
+    const contract = JSON.parse(readText(join(root, CONTRACT_DESTINATION)));
+    for (const entry of contract.workflows) {
+      const lock = readText(join(root, entry.lock));
+      expect(() => validateCompilerActionPins(lock)).not.toThrow();
+      expect(createHash('sha256').update(normalizeCompiledLock(lock, revisionA)).digest('hex'))
+        .toBe(entry.package_lock_sha256);
+    }
+
+    const pinPath = join(root, '.github/aw/actions-lock.json');
+    const pins = JSON.parse(readText(pinPath));
+    pins.entries[`github/gh-aw-actions/setup@${MIN_GH_AW_VERSION}`].sha = '0'.repeat(40);
+    writeFileSync(pinPath, JSON.stringify(pins));
+    const tampered = seedPins();
+    expect(tampered.status).not.toBe(0);
+    expect(tampered.stderr).toContain('missing or noncanonical pin');
+  }, 120_000);
+
+  function updateOwnedDigest(root: string, destination: string): void {
+    const path = join(root, '.github/aw/packages/bradygaster-squad-workflows-test.json');
+    const record = JSON.parse(readFileSync(path, 'utf8'));
+    const entry = record.files.find((file: { destination: string }) => file.destination === destination);
+    entry.sha256 = createHash('sha256').update(readFileSync(join(root, destination))).digest('hex');
+    writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`);
+  }
+
+  it.each(['workflow', 'package'] as const)('rejects %s source and compiled provenance mutations', sourceBinding => {
+    const source = `${PACKAGE_NAME}${sourceBinding === 'workflow' ? '/package/squad-review.md' : ''}@${revisionA}`;
+    const sourcePath = '.github/workflows/squad-review.md';
+    const lockPath = '.github/workflows/squad-review.lock.yml';
+    const mutations: Array<[string, (text: string) => string]> = [
+      ['wrong owner', text => text.replaceAll('bradygaster/squad', 'attacker/squad')],
+      ['wrong repo', text => text.replaceAll('bradygaster/squad', 'bradygaster/other')],
+      ['wrong package', text => text.replaceAll('/workflows', '/other')],
+      ['wrong workflow', text => text.replaceAll(source, `${PACKAGE_NAME}/package/squad.md@${revisionA}`)],
+      ['wrong revision', text => text.replaceAll(revisionA, revisionB)],
+      ['unexpected suffix', text => text.replaceAll(source, `${source}/extra`)],
+      ['missing annotation', text => text.replace(`source: ${source}\n`, '')],
+      ['duplicate annotation', text => text.replace(`source: ${source}\n`, `source: ${source}\nsource: ${source}\n`)],
+    ];
+    for (const [label, mutate] of mutations) {
+      const root = makeConsumer(revisionA, true, sourceBinding);
+      const original = readFileSync(join(root, sourcePath), 'utf8');
+      const modified = mutate(original);
+      expect(modified, label).not.toBe(original);
+      writeFileSync(join(root, sourcePath), modified);
+      updateOwnedDigest(root, sourcePath);
+      expect(verifyInstall(root).failures.join('\n'), label).toMatch(/source binding|digest mismatch/);
+    }
+
+    const lockMutations: Array<[string, (text: string) => string]> = [
+      ...mutations.slice(0, 6),
+      ['wrong URL', text => text.replace('/bradygaster/squad/blob/', '/attacker/squad/blob/')],
+      ['mixed annotation', text => text.replace(`GH_AW_WORKFLOW_SOURCE: "${source}"`, 'GH_AW_WORKFLOW_SOURCE: "unknown"')],
+      ['missing annotation', text => text.replace(`          GH_AW_INFO_FRONTMATTER_SOURCE: "${source}"\n`, '')],
+      ['duplicate annotation', text => text.replace(`GH_AW_WORKFLOW_SOURCE: "${source}"`, `GH_AW_WORKFLOW_SOURCE: "${source}"\n          GH_AW_WORKFLOW_SOURCE: "${source}"`)],
+      ['action tamper', text => text.replace('uses: actions/github-script@', 'uses: attacker/github-script@')],
+      ['permission tamper', text => text.replace('contents: read', 'contents: write')],
+      ['payload tamper', text => text.replace('await guard.assertClearingReview', 'await guard.skipClearingReview')],
+    ];
+    for (const [label, mutate] of lockMutations) {
+      const root = makeConsumer(revisionA, true, sourceBinding);
+      const original = readFileSync(join(root, lockPath), 'utf8');
+      const modified = mutate(original);
+      expect(modified, label).not.toBe(original);
+      writeFileSync(join(root, lockPath), modified);
+      expect(verifyInstall(root).failures.length, label).toBeGreaterThan(0);
+    }
+
+    const root = makeConsumer(revisionA, true, sourceBinding);
+    const other = createFirstInstallFixture(revisionA, sourceBinding === 'workflow' ? 'package' : 'workflow');
+    writeFileSync(join(root, lockPath), other.consumerFiles.get(lockPath)!);
+    expect(verifyInstall(root).failures.join('\n')).toContain(`Installed digest mismatch for ${lockPath}`);
+  }, 120_000);
+
+  it('rejects old schemas, absent variants, runtime tampering and canonical manifest drift', () => {
+    const mutations: Array<(contract: any) => void> = [
+      contract => { contract.schema_version = 1; },
+      contract => { delete contract.workflows[0].package_lock_sha256; },
+      contract => { contract.workflows[0].package_lock_sha256 = 'invalid'; },
+      contract => { delete contract.lock_variants; },
+      contract => { contract.lock_variants[0].action_failure_issue_expires = 48; },
+      contract => { contract.lock_variants[0].workflows[0].lock_sha256 = 'invalid'; },
+      contract => { contract.lock_variants[0].workflows.reverse(); },
+    ];
+    for (const mutate of mutations) {
+      expect(mutateContract(makeConsumer(), mutate).length).toBeGreaterThan(0);
+    }
+    const root = makeConsumer();
+    const runtime = '.github/workflows/shared/squad-review-guard.mjs';
+    writeFileSync(join(root, runtime), '// tampered\n');
+    updateOwnedDigest(root, runtime);
+    expect(verifyInstall(root).failures.join('\n')).toContain(`Installed digest mismatch for ${runtime}`);
+
+    const drift = makeConsumer();
+    const manifestPath = join(drift, CONTRACT_DESTINATION);
+    writeFileSync(manifestPath, `${readFileSync(manifestPath, 'utf8')}\n`);
+    expect(() => verifyCanonicalManifest(process.cwd(), drift)).toThrow(/not byte-identical/);
+  });
+
+  it('normalizes only compiler-declared repository-scattered schedules', () => {
+    const metadata = `# gh-aw-metadata: {"frontmatter_hash":"${'a'.repeat(64)}"}`;
+    const lock = [
+      metadata,
+      `source_revision: ${revisionA}`,
+      '      - cron: "17 4 * * 2" # Friendly format: weekly on Tuesday at 04:00 (scattered)',
+      '      - cron: "0 4 * * 2" # Fixed schedule',
+    ].join('\n');
+    const normalized = normalizeCompiledLock(lock, revisionA);
+
+    expect(normalized).toContain(
+      '      - cron: "<repository-scattered>" # Friendly format: weekly on Tuesday at 04:00 (scattered)',
+    );
+    expect(normalized).toContain('      - cron: "0 4 * * 2" # Fixed schedule');
+    expect(normalized).not.toContain(revisionA);
+  });
+
+  it('accepts only the deterministic retained bootstrap trigger sentinel', () => {
+    const root = makeConsumer();
+    const probePath = join(root, TRIGGER_PROBE_DESTINATION);
+    mkdirSync(dirname(probePath), { recursive: true });
+    writeFileSync(probePath, `${JSON.stringify({
+      schema_version: 1,
+      kind: 'squad-bootstrap-trigger-probe',
+      trusted_source_sha: revisionA,
+      hosted_run_id: '12345',
+      install_merge_sha: revisionB,
+      default_branch_sha: revisionB,
+    }, null, 2)}\n`);
+    expect(verifyInstall(root, { expectedRevision: revisionA }).failures).toEqual([]);
+    const probe = JSON.parse(readFileSync(probePath, 'utf8'));
+    probe.default_branch_sha = revisionA;
+    writeFileSync(probePath, `${JSON.stringify(probe, null, 2)}\n`);
+    expect(verifyInstall(root).failures.join('\n')).toContain(
+      'default_branch_sha must equal install_merge_sha',
+    );
+  });
+
+  it('rejects missing workflow, runtime, lock, skill, manifest, and stale bytes', () => {
+    const root = makeConsumer();
+    unlinkSync(join(root, '.github/workflows/squad-bootstrap.md'));
+    writeFileSync(join(root, '.github/workflows/shared/squad-cast-validator.mjs'), 'stale\n');
+    unlinkSync(join(root, '.github/workflows/squad-review.lock.yml'));
+    unlinkSync(join(root, '.github/aw/squad/runtime/shared/builtins/scribe-charter.md'));
+    unlinkSync(join(root, '.github/skills/gh-aw-enlistment/SKILL.md'));
+    const failures = verifyInstall(root).failures.join('\n');
+    expect(failures).toMatch(/missing|digest mismatch/i);
+
+    const missingManifest = makeConsumer();
+    unlinkSync(join(missingManifest, CONTRACT_DESTINATION));
+    expect(verifyInstall(missingManifest).failures.join('\n')).toContain('Required file is missing');
+  });
+
+  it('rejects missing, extra, reordered, duplicated, narrowed, redirected, and unknown fields', () => {
+    const mutations: Array<(contract: any) => void> = [
+      contract => { contract.workflows.pop(); },
+      contract => { contract.shared_runtime.push(contract.shared_runtime[0]); },
+      contract => { contract.workflows.reverse(); },
+      contract => { contract.workflows[1] = contract.workflows[0]; },
+      contract => { contract.shared_runtime = []; },
+      contract => { contract.workflows[0].destination = '.github/workflows/redirected.md'; },
+      contract => { contract.workflows[0].unknown = true; },
+      contract => { contract.extra = true; },
+    ];
+    for (const mutation of mutations) {
+      expect(mutateContract(makeConsumer(), mutation).length).toBeGreaterThan(0);
+    }
+  });
+
+  it('rejects unsafe path forms before reading redirected targets', () => {
+    for (const unsafe of ['../escape', '/absolute/path']) {
+      const root = makeConsumer();
+      const failures = mutateContract(root, contract => {
+        contract.shared_runtime[0].source = unsafe;
+      });
+      expect(failures.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('rejects symlinked manifest leaves and runtime parents', () => {
+    const manifestRoot = makeConsumer();
+    const manifestPath = join(manifestRoot, CONTRACT_DESTINATION);
+    const manifestTarget = join(manifestRoot, 'redirected-manifest.json');
+    writeFileSync(manifestTarget, readFileSync(manifestPath));
+    unlinkSync(manifestPath);
+    symlinkSync(manifestTarget, manifestPath);
+    expect(verifyInstall(manifestRoot).failures.join('\n')).toContain('symbolic link');
+
+    const runtimeRoot = makeConsumer(revisionA, false);
+    const shared = join(runtimeRoot, '.github/workflows/shared');
+    const redirected = join(runtimeRoot, '.github/workflows/shared-redirected');
+    cpSync(shared, redirected, { recursive: true });
+    rmSync(shared, { recursive: true });
+    symlinkSync(redirected, shared, 'dir');
+    expect(() => materializeRuntime(runtimeRoot)).toThrow(/symbolic link/);
+  });
+
+  it('materializes package-only runtime bytes and rejects stale sources', () => {
+    const root = makeConsumer(revisionA, false);
+    const contract = JSON.parse(readFileSync(join(root, CONTRACT_DESTINATION), 'utf8'));
+    const materialized = contract.shared_runtime.filter(
+      (entry: { package_destination: string; destination: string }) =>
+        entry.package_destination !== entry.destination,
+    );
+    for (const entry of materialized) expect(existsSync(join(root, entry.destination))).toBe(false);
+    materializeRuntime(root);
+    for (const entry of materialized) {
+      expect(readFileSync(join(root, entry.destination)).equals(
+        readFileSync(join(root, entry.package_destination)),
+      )).toBe(true);
+    }
+    writeFileSync(join(root, materialized[0].package_destination), 'stale\n');
+    expect(() => materializeRuntime(root)).toThrow(/digest mismatch/);
+  });
+
+  it('rejects ownership mismatches and mixed revisions', () => {
+    const root = makeConsumer();
+    const ownershipPath = join(root, '.github/aw/packages/bradygaster-squad-workflows-test.json');
+    const ownership = JSON.parse(readFileSync(ownershipPath, 'utf8'));
+    ownership.source = `${PACKAGE_NAME}@${revisionB}`;
+    writeFileSync(ownershipPath, `${JSON.stringify(ownership, null, 2)}\n`);
+    expect(verifyInstall(root).failures.join('\n')).toContain('Package ownership source');
+
+    const extra = makeConsumer();
+    const extraPath = join(extra, '.github/aw/packages/bradygaster-squad-workflows-test.json');
+    const extraOwnership = JSON.parse(readFileSync(extraPath, 'utf8'));
+    extraOwnership.files.push(extraOwnership.files[0]);
+    writeFileSync(extraPath, `${JSON.stringify(extraOwnership, null, 2)}\n`);
+    expect(verifyInstall(extra).failures.join('\n')).toContain(
+      `Package ownership files must contain exactly ${OWNERSHIP_ENTRY_COUNT} entries.`,
+    );
+  });
+
+  it('rejects unsafe standalone contract shapes without filesystem access', () => {
+    const contract = JSON.parse(readFileSync(join(process.cwd(), CONTRACT_SOURCE), 'utf8'));
+    contract.skills[0].destination = '../outside';
+    expect(() => validateContract(contract)).toThrow(/unsafe path segment/);
   });
 });

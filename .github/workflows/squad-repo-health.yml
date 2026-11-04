@@ -32,7 +32,7 @@ jobs:
           sparse-checkout-cone-mode: false
       - name: Fetch PR head (data only — not executed)
         run: git fetch origin ${{ github.event.pull_request.head.sha }}
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 #v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 #v6
         with:
           node-version: '22'
       - name: Check bootstrap dependencies
@@ -87,28 +87,33 @@ jobs:
           fetch-depth: 0
       - name: Fetch PR head (data only — not executed)
         run: git fetch origin ${{ github.event.pull_request.head.sha }}
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 #v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 #v6
         with:
           node-version: '22'
       - name: Detect .squad/ leakage
         id: leakage
         run: |
           git fetch origin dev --quiet
-          OUTPUT=$(node scripts/check-squad-leakage.mjs origin/dev ${{ github.event.pull_request.head.sha }} 2>&1)
+          OUTPUT=$(node scripts/check-squad-leakage.mjs origin/dev ${{ github.event.pull_request.head.sha }})
           echo "$OUTPUT"
           echo "result<<EOF" >> "$GITHUB_OUTPUT"
           echo "$OUTPUT" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
+      # Report content is passed through the environment, never interpolated into
+      # the script body — findings legitimately contain backticks and `${`, which
+      # would terminate a template literal and corrupt the parsed script (#1770).
       - name: Comment on leakage
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 #v9
+        env:
+          REPO_HEALTH_OUTPUT: ${{ steps.leakage.outputs.result }}
         with:
           script: |
             const { run } = await import(`${process.env.GITHUB_WORKSPACE}/scripts/repo-health-comment.mjs`);
             await run({
               github,
               context,
-              output: `${{ steps.leakage.outputs.result }}`,
+              output: process.env.REPO_HEALTH_OUTPUT || '',
               job: 'leakage',
             });
 
@@ -124,7 +129,7 @@ jobs:
           fetch-depth: 0
       - name: Fetch PR head (data only — not executed)
         run: git fetch origin ${{ github.event.pull_request.head.sha }}
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 #v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 #v6
         with:
           node-version: '22'
       - name: Run architectural review
@@ -136,16 +141,19 @@ jobs:
           echo "result<<EOF" >> "$GITHUB_OUTPUT"
           echo "$OUTPUT" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
+      # See #1770 — report content must never be spliced into the script source.
       - name: Comment on findings
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 #v9
+        env:
+          REPO_HEALTH_OUTPUT: ${{ steps.arch.outputs.result }}
         with:
           script: |
             const { run } = await import(`${process.env.GITHUB_WORKSPACE}/scripts/repo-health-comment.mjs`);
             await run({
               github,
               context,
-              output: `${{ steps.arch.outputs.result }}`,
+              output: process.env.REPO_HEALTH_OUTPUT || '',
               job: 'architectural',
             });
 
@@ -161,7 +169,7 @@ jobs:
           fetch-depth: 0
       - name: Fetch PR head (data only — not executed)
         run: git fetch origin ${{ github.event.pull_request.head.sha }}
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 #v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 #v6
         with:
           node-version: '22'
       - name: Run security review
@@ -173,15 +181,18 @@ jobs:
           echo "result<<EOF" >> "$GITHUB_OUTPUT"
           echo "$OUTPUT" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
+      # See #1770 — report content must never be spliced into the script source.
       - name: Comment on findings
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 #v9
+        env:
+          REPO_HEALTH_OUTPUT: ${{ steps.security.outputs.result }}
         with:
           script: |
             const { run } = await import(`${process.env.GITHUB_WORKSPACE}/scripts/repo-health-comment.mjs`);
             await run({
               github,
               context,
-              output: `${{ steps.security.outputs.result }}`,
+              output: process.env.REPO_HEALTH_OUTPUT || '',
               job: 'security',
             });

@@ -10,7 +10,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { ToolRegistry, defineTool, sanitizeArgs, type RouteRequest, type DecisionRecord, type MemoryEntry } from '@bradygaster/squad-sdk/tools';
+import { ToolRegistry, defineTool, sanitizeArgs, isMutableStateKey, type RouteRequest, type DecisionRecord, type MemoryEntry } from '@bradygaster/squad-sdk/tools';
 import { SessionPool, EventBus } from '@bradygaster/squad-sdk/client';
 import type { FanOutDependencies } from '@bradygaster/squad-sdk/coordinator';
 import type { AgentCharter } from '@bradygaster/squad-sdk/agents';
@@ -124,6 +124,7 @@ describe('ToolRegistry', () => {
     'squad_state_read',
     'squad_state_write',
     'squad_state_append',
+    'squad_state_create_if_absent',
     'squad_state_delete',
     'squad_state_list',
     'squad_state_health',
@@ -240,6 +241,102 @@ describe('ToolRegistry', () => {
       );
 
       expect(result.resultType).toBe('success');
+    });
+  });
+
+  describe('built-in append-only audit trails (#2084)', () => {
+    const auditKeys = ['rai/audit-trail.md', 'fact-checker/audit-trail.md'];
+
+    async function mutate(toolName: string, key: string, content = 'replacement\n') {
+      return registry.getTool(toolName)!.handler(
+        { key, content },
+        { sessionId: 'test-session', toolCallId: 'test-call', toolName, arguments: {} },
+      );
+    }
+
+    it.each(auditKeys)('creates and appends evidence without replacing earlier entries: %s', async (key) => {
+      expect(isMutableStateKey(key)).toBe(false);
+      expect((await mutate('squad_state_append', key, 'first\n')).resultType).toBe('success');
+      expect((await mutate('squad_state_append', key, 'second\n')).resultType).toBe('success');
+      expect(fs.readFileSync(path.join(testRoot, key), 'utf-8')).toBe('first\nsecond\n');
+    });
+
+    it.each(auditKeys)('normalizes the standard .squad prefix and Windows separators: %s', async (key) => {
+      const prefixedKey = `.squad\\${key.replace(/\//g, '\\')}`;
+      expect((await mutate('squad_state_append', prefixedKey, 'evidence\n')).resultType).toBe('success');
+      expect(fs.readFileSync(path.join(testRoot, key), 'utf-8')).toBe('evidence\n');
+      expect((await mutate('squad_state_write', prefixedKey)).resultType).toBe('failure');
+      expect((await mutate('squad_state_create_if_absent', prefixedKey)).resultType).toBe('failure');
+      expect((await mutate('squad_state_delete', prefixedKey)).resultType).toBe('failure');
+      expect(fs.readFileSync(path.join(testRoot, key), 'utf-8')).toBe('evidence\n');
+    });
+
+    it.each(auditKeys)('rejects writes, creates, and deletes before creation and after append: %s', async (key) => {
+      const filename = path.join(testRoot, key);
+      for (const toolName of ['squad_state_write', 'squad_state_create_if_absent', 'squad_state_delete']) {
+        const result = await mutate(toolName, key);
+        expect(result.resultType).toBe('failure');
+        expect(result.textResultForLlm).toContain('append-only');
+        expect(fs.existsSync(filename)).toBe(false);
+      }
+      await mutate('squad_state_append', key, 'original\n');
+      for (const toolName of ['squad_state_write', 'squad_state_create_if_absent', 'squad_state_delete']) {
+        const result = await mutate(toolName, key, '');
+        expect(result.resultType).toBe('failure');
+        expect(result.textResultForLlm).toContain('append-only');
+        expect(fs.readFileSync(filename, 'utf-8')).toBe('original\n');
+      }
+    });
+
+    it.each([
+      'rai/policy.md', 'fact-checker/policy.md', 'rai/other.md', 'fact-checker/other.md',
+      'rai/audit-trail.md.bak', 'fact-checker/audit-trail.md.bak',
+      'rai/audit-trail.md/entry', 'fact-checker/audit-trail.md/entry',
+      'Rai/audit-trail.md', 'Fact-Checker/audit-trail.md', 'other/audit-trail.md',
+      'rai', 'fact-checker', 'team.md', 'agents/rai/charter.md', 'casting/registry.json',
+      'rai/../rai/audit-trail.md', 'fact-checker/../fact-checker/audit-trail.md',
+    ])('rejects every mutation outside the allowlist: %s', async (key) => {
+      for (const toolName of ['squad_state_append', 'squad_state_write', 'squad_state_delete']) {
+        expect((await mutate(toolName, key)).resultType, toolName).toBe('failure');
+        expect(fs.existsSync(testRoot)).toBe(false);
+      }
+    });
+
+    it('preserves write, append, and delete for ordinary mutable state', async () => {
+      const key = 'log/review.md';
+      expect((await mutate('squad_state_write', key, 'first\n')).resultType).toBe('success');
+      expect((await mutate('squad_state_append', key, 'second\n')).resultType).toBe('success');
+      expect(fs.readFileSync(path.join(testRoot, key), 'utf-8')).toBe('first\nsecond\n');
+      expect((await mutate('squad_state_write', key, 'replacement\n')).resultType).toBe('success');
+      expect(fs.readFileSync(path.join(testRoot, key), 'utf-8')).toBe('replacement\n');
+      expect((await mutate('squad_state_delete', key)).resultType).toBe('success');
+      expect(fs.existsSync(path.join(testRoot, key))).toBe(false);
+    });
+  });
+
+  // #2107: doctor reads this allowlist to find state stranded in a linked team repo.
+  describe('isMutableStateKey (#2107)', () => {
+    it.each([
+      'decisions.md', 'decisions/inbox/a.md', 'casting/policy.json', 'agents/edie/history.md',
+      'log/a.md', 'orchestration-log/a.md', 'sessions/s.json', '.scratch/n.md', 'identity/now.md',
+    ])('accepts %s', (key) => {
+      expect(isMutableStateKey(key), `${key} must be writable by the state tools`).toBe(true);
+    });
+
+    it.each([
+      'team.md', 'routing.md', 'config.json', 'decisions', 'decisions/a.md', 'decisions.md/x',
+      'casting/registry.json', 'casting/history.json', 'agents/edie/charter.md', 'agents/edie/history.md/x',
+      'agents/a/b/history.md', 'log', 'logs/a.md', 'identity', 'skills/x/SKILL.md',
+    ])('rejects %s', (key) => {
+      expect(isMutableStateKey(key), `${key} must not be writable by the state tools`).toBe(false);
+    });
+
+    it('squad_state_write rejects a key outside the allowlist', async () => {
+      const result = await registry.getTool('squad_state_write')!.handler(
+        { key: 'casting/registry.json', content: '{}' },
+        { sessionId: 'test-session', toolCallId: 'test-call', toolName: 'squad_state_write', arguments: {} },
+      );
+      expect(result.resultType, 'casting/registry.json write').toBe('failure');
     });
   });
 });

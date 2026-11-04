@@ -1,8 +1,5 @@
 # Squad in VS Code
 
-> ⚠️ **Experimental** — Squad is alpha software. APIs, commands, and behavior may change between releases.
-
-
 Squad is fully supported in VS Code (v0.4.0+). Your team runs identically to the CLI, with the same `.squad/` state, same agents, same decisions — but with VS Code-specific tooling and constraints.
 
 This guide covers what's different, what's the same, and when to use CLI vs VS Code.
@@ -16,12 +13,15 @@ This guide covers what's different, what's the same, and when to use CLI vs VS C
 - **VS Code** — Latest version
 - **GitHub Copilot extension** — `GitHub.copilot` (installed, authenticated)
 - **Workspace trust** — Your workspace must be trusted (VS Code security)
-- **Node.js 20+ (LTS)** — If running CLI to initialize Squad
+- **Node.js 22.5+** — Only if installing the CLI with npm
 - **Squad installed** — Either in the repo already (from CLI), or initialized fresh via agent selection
 
 ### Initial Setup
 
 **Option A: Initialize with CLI (recommended)**
+
+Install the CLI with any method in the
+[Installation guide](../get-started/installation.md). For example, with npm:
 
 ```bash
 npm install -g @bradygaster/squad-cli
@@ -50,7 +50,7 @@ When you assign work to an agent, the coordinator spawns that agent as a sub-age
 
 ### No Per-Spawn Model Selection
 
-VS Code accepts the session model (your Copilot model picker). No per-spawn dynamic selection. Cost optimization deferred — use Haiku via model picker for cheaper runs.
+VS Code uses the session model selected in the Copilot model picker. Per-spawn model selection isn't available; choose a different session model in the picker when needed.
 
 ### Sub-Agents Run Sync (But Parallel)
 
@@ -96,7 +96,7 @@ Use single-root workspaces (multi-root has path resolution bugs).
 
 Accept file modification approval once — subsequent writes are automatic.
 
-For initial setup, heavy parallel work (5+ agents), SQL workflows, or cost optimization (per-spawn model selection) → use CLI.
+For initial setup, heavy parallel work (5+ agents), SQL workflows, or per-spawn model selection → use CLI.
 
 Check the model picker at top of chat if agents seem slow or expensive — switch to Haiku for cost savings.
 
@@ -240,6 +240,6 @@ const decision = await coordinator.route(userTask, {
 
 - [Getting Started](../get-started/installation.md) — Installation and setup guide
 - [Parallel Execution](parallel-execution.md) — How Squadron fan-outs agents
-- [Model Selection](model-selection.md) — Cost-first routing strategy
+- [Model Selection](model-selection.md) — Per-agent selection and the session model picker
 - [CLI Reference](../reference/cli.md) — Shell commands and features
 - [SDK API Reference](../reference/api-reference.md) — Full SDK type and function reference

@@ -25,6 +25,8 @@ export type { ConfigLoadResult, ConfigValidationError } from './runtime/config.j
 export { MODELS, TIMEOUTS, AGENT_ROLES } from './runtime/constants.js';
 export type { AgentRole } from './runtime/constants.js';
 export * from './runtime/streaming.js';
+export * from './runtime/usage-ledger.js';
+export * from './runtime/context-utilization.js';
 export * from './runtime/cost-tracker.js';
 export * from './runtime/telemetry.js';
 export * from './runtime/offline.js';
@@ -156,3 +158,26 @@ export type {
   AgentHandle,
   CollectionPathResolver,
 } from './state/index.js';
+
+// Archival integrity — see state/io/archival.ts
+export {
+  archiveEntries,
+  countEntries,
+  demoteHeadings,
+  extractHeadings,
+  findHeadingLineIndices,
+  formatArchivalReport,
+  isCommittableDestination,
+  isTrackedInGit,
+  prepareInboxBodyForMerge,
+  resolveTrackedDestination,
+  splitEntries,
+  ArchiveVerificationError,
+  UntrackedArchiveDestinationError,
+} from './state/io/index.js';
+export type {
+  ArchivalResult,
+  ArchiveEntriesOptions,
+  DecisionEntry,
+  GitRunner,
+} from './state/io/index.js';

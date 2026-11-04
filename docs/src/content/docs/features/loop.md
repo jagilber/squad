@@ -1,7 +1,5 @@
 # Loop — Prompt-driven work loop
 
-> ⚠️ **Experimental** — Squad is alpha software. APIs, commands, and behavior may change between releases.
-
 **Try this to initialize a loop:**
 ```
 squad loop --init
@@ -264,7 +262,7 @@ All `squad loop` flags:
 | `--file <path>` | string | Path to loop file (default: `loop.md`) | `squad loop --file scripts/monitor.md` |
 | `--interval <N>` | number | Override loop interval in minutes | `squad loop --interval 3` |
 | `--timeout <N>` | number | Override cycle timeout in minutes | `squad loop --timeout 60` |
-| `--copilot-flags "..."` | string | Pass extra flags to Copilot CLI | `squad loop --copilot-flags "--model gpt-4"` |
+| `--copilot-flags "..."` | string | Pass extra flags to Copilot CLI | `squad loop --copilot-flags "--model gpt-5.6-luna"` |
 | `--agent-cmd <cmd>` | string | Custom agent command (advanced) | `squad loop --agent-cmd my-agent-wrapper` |
 | `--monitor-email` | boolean | Scan email for alerts each cycle | `squad loop --monitor-email` |
 | `--monitor-teams` | boolean | Scan Teams for action items each cycle | `squad loop --monitor-teams` |

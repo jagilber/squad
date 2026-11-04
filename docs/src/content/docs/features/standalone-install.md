@@ -1,7 +1,5 @@
 # Standalone Install (no npm)
 
-> ⚠️ **Experimental** — Squad is alpha software. APIs, commands, and behavior may change between releases.
-
 Squad publishes self-contained bundles that vendor their own Node.js runtime.
 Installing from these touches `github.com` only — nothing is fetched from
 `registry.npmjs.org`, and neither Node.js nor npm needs to be installed first.
@@ -11,15 +9,16 @@ CI runners behind a corporate firewall, locked-down build agents, and air-gapped
 mirrors. It is also simply a faster install for anyone who does not otherwise
 have a Node toolchain.
 
-`npm install -g @bradygaster/squad-cli` remains fully supported and is still the
-recommended path for day-to-day development.
+`npm install -g @bradygaster/squad-cli` remains fully supported. All install
+methods provide the same Squad CLI; choose based on your platform and whether
+your environment can reach the npm registry.
 
 ## Install
 
 ### macOS and Linux
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/bradygaster/squad/dev/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/bradygaster/squad/main/scripts/install.sh | sh
 ```
 
 The installer picks the right bundle for your platform, verifies it against the
@@ -34,8 +33,8 @@ release `SHA256SUMS.txt`, unpacks it into `$PREFIX/lib/squad`, and symlinks
 
 ```sh
 # pin a version and install somewhere specific
-curl -fsSL https://raw.githubusercontent.com/bradygaster/squad/dev/scripts/install.sh \
-  | VERSION="v0.11.0" PREFIX="$HOME/tools" sh
+curl -fsSL https://raw.githubusercontent.com/bradygaster/squad/main/scripts/install.sh \
+  | VERSION="v0.13.1" PREFIX="$HOME/tools" sh
 ```
 
 ### Windows
@@ -55,7 +54,8 @@ add the folder to your `PATH`.
 Install with Homebrew:
 
 ```sh
-brew install --cask bradygaster/squad/squad
+brew tap bradygaster/squad
+brew install --cask squad
 ```
 
 Or use the install script above, which works on macOS too.
@@ -120,15 +120,20 @@ brew install --cask copilot-cli                   # Homebrew
 ## Using it in CI
 
 The bundles are what make an npm-free CI job possible — including the
-[gh-aw](/features/gh-aw/) activation job, which previously required `npx` and so
-could not run on a runner without npm registry access.
+[gh-aw](/features/gh-aw/) activation job, which previously required registry
+access and could not run on an isolated runner.
+
+The release workflow still uses npm at bundle-build time because there is no
+practical npm-free way to assemble the dependency tree. That workflow uses the
+GitHub-hosted runner's normal registry configuration. The Microsoft npm proxy is
+for local development only and must not be configured in GitHub Actions.
 
 The `squad-init` action wraps the install and init steps:
 
 ```yaml
 - uses: bradygaster/squad/.github/actions/squad-init@<sha>
   with:
-    version: v0.11.0        # default: latest release
+    version: v0.13.1        # default: latest release
     preset: default
     state-backend: local
 ```
@@ -139,9 +144,9 @@ Point `repository:` at an internal mirror if your runners cannot reach
 ```yaml
 - name: Install Squad
   env:
-    SQUAD_VERSION: v0.11.0
+    SQUAD_VERSION: v0.13.1
   run: |
-    curl -fsSL https://raw.githubusercontent.com/bradygaster/squad/dev/scripts/install.sh \
+    curl -fsSL https://raw.githubusercontent.com/bradygaster/squad/main/scripts/install.sh \
       | VERSION="${SQUAD_VERSION}" PREFIX="${HOME}/.local" sh
     echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
 
@@ -162,30 +167,34 @@ docker build -t squad:local .
 docker run --rm -e GITHUB_TOKEN=... -v "$PWD/.squad:/app/.squad" squad:local
 ```
 
-The image sets `SQUAD_STANDALONE_HOME=/opt/squad`, which is what makes
-`squad init` inside the container write an npx-free MCP spec (below).
+The image sets `SQUAD_STANDALONE_HOME=/opt/squad`, which makes `squad init`
+inside the container write a registry-independent MCP spec.
 
 ## The squad_state MCP server
 
 `squad init` writes a `squad_state` MCP entry into `.mcp.json` so Copilot can
-reach Squad's state tools. Normally that entry launches through `npx`:
+reach Squad's state tools. Shared project configuration uses the installed
+executable on each host's `PATH`, not the initiating user's installation path.
+On macOS and Linux:
 
 ```json
-{ "command": "npx", "args": ["-y", "@bradygaster/squad-cli@0.11.0", "state-mcp"] }
-```
-
-That would defeat the purpose here — the CLI would install fine from a bundle,
-then the MCP server would fail to start on the first run because npm is
-unreachable. When Squad is running from a bundle it instead writes:
-
-```json
-{ "command": "/opt/squad/squad", "args": ["state-mcp"] }
+{ "command": "squad", "args": ["state-mcp"] }
 ```
 
 The launcher exports `SQUAD_STANDALONE_HOME`, and the resolver checks it
 *before* probing the npm registry, so a firewalled machine makes no registry
-call at all. The path is absolute because Copilot spawns the MCP server in its
-own environment, where neither `PATH` nor that variable is guaranteed.
+call at all. On Windows, the shared entry uses `"command": "squad.exe"` so MCP
+subprocess spawning selects the real executable rather than a PowerShell or CMD
+shim. Each teammate must install Squad and expose that executable in the
+**MCP host's PATH**; restart the host after changing PATH. Moving a project
+between Windows and Unix requires rerunning `squad upgrade` to select the host's
+portable executable name. Missing PATH setup fails visibly when the host starts
+the server; no teammate's absolute installation path is written into the repo.
+
+Machine-local launch resolution still uses the detected absolute bundle path.
+Npm installations keep their portable, version-pinned `npx` specification.
+Upgrade preserves other MCP servers, user environment settings, tool
+restrictions, and custom fields on the managed entry.
 
 ## Building a bundle yourself
 
@@ -216,10 +225,15 @@ They are generated from the release's own `SHA256SUMS.txt`:
 node scripts/generate-packaging.mjs --version v0.11.0
 ```
 
-That writes `dist-packaging/homebrew/squad.rb` and the three winget manifests
-(version, installer, locale). The release workflow runs this automatically and
-attaches the result as a `packaging-manifests` artifact; a maintainer submits
-them to the tap and to `winget-pkgs`.
+That writes a channel-specific Homebrew cask (`squad.rb`, `squad-preview.rb`,
+or `squad-insider.rb`) and three channel-specific winget manifests (version,
+installer, locale). The release workflow runs this automatically, updates the
+Homebrew tap, and opens a pull request against `winget-pkgs`.
+The `packaging-manifests` artifact is retained for audit and manual recovery.
+Homebrew updates are available as soon as the release workflow finishes;
+WinGet updates become available after the community repository accepts the
+generated pull request. Stable, preview, and insider releases each publish
+standalone archives and use isolated Homebrew casks and WinGet identifiers.
 
 ## Known limitations
 

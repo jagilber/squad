@@ -12,6 +12,7 @@ import type { StorageProvider } from '../storage/storage-provider.js';
 import type { SquadState } from '../state/squad-state.js';
 import { randomUUID } from 'node:crypto';
 import { parseCharterMarkdown } from './charter-compiler.js';
+import { validateCharterMarkdown } from './charter-validator.js';
 import { EventBus } from '../client/event-bus.js';
 import { trace, SpanStatusCode } from '../runtime/otel-api.js';
 import { recordAgentSpawn, recordAgentDuration, recordAgentError, recordAgentDestroy } from '../runtime/otel-metrics.js';
@@ -38,12 +39,33 @@ export {
   type CharterCompileOptions, 
   type CharterConfigOverrides, 
   type ParsedCharter,
+  type CharterSourceMetadata,
   type CompiledCharter,
 } from './charter-compiler.js';
+
+export {
+  CHARTER_CAPABILITIES,
+  CHARTER_DIAGNOSTIC_CODES,
+  CHARTER_DIAGNOSTIC_SEVERITIES,
+  CHARTER_PROFILE,
+  CHARTER_PROFILE_METADATA,
+  validateCharterConformance,
+  validateCharterMarkdown,
+  type CharterCapability,
+  type CharterConformance,
+  type CharterConformanceOptions,
+  type CharterDiagnostic,
+  type CharterDiagnosticCode,
+  type CharterDiagnosticSeverity,
+  type CharterValidationOptions,
+  type CharterValidationResult,
+} from './charter-validator.js';
 
 // --- M1-9 Model Selection + M3-5 Model Fallback ---
 export { 
   resolveModel,
+  resolveAgentModel,
+  MODEL_RESOLUTION_PRECEDENCE,
   inferTierFromModel,
   isTierFallbackAllowed,
   ModelFallbackExecutor,
@@ -51,13 +73,24 @@ export {
   buildEffectiveCostPolicy,
   buildCatalogCategoryMap,
   pruneChainToCeiling,
+  isModelPreference,
+  persistentConfigModel,
+  resolveModelProfile,
+  PROFILE_TASK_TIERS,
+  DEFAULT_MODEL_SELECTION_PROFILE,
+  MODEL_SELECTION_PROFILES,
+  isModelSelectionProfile,
+  type ModelSelectionProfile,
   type ModelResolutionOptions, 
   type ResolvedModel,
+  type ModelResolution,
+  type PersistentModelConfig,
   type EffectiveCostPolicy,
   type TaskType,
   type ModelTier,
   type ModelResolutionSource,
   type FallbackExecutorConfig,
+  type FallbackExecuteOptions,
   type FallbackAttempt,
   type FallbackResult,
 } from './model-selector.js';
@@ -69,6 +102,7 @@ export {
   type AgentStatus,
   type SpawnAgentOptions,
   type LifecycleManagerConfig,
+  type AgentModelResolution,
 } from './lifecycle.js';
 
 // --- M1-11 History Shadows ---
@@ -167,6 +201,7 @@ export class CharterCompiler {
     if (content === undefined) {
       throw new Error(`Charter file not found: ${charterPath}`);
     }
+    assertValidRuntimeCharter(content, charterPath);
     const parsed = parseCharterMarkdown(content);
 
     const name = parsed.identity.name ?? basename(dirname(charterPath));
@@ -197,6 +232,7 @@ export class CharterCompiler {
       throw new Error('compileByName requires SquadState — pass state to CharterCompiler constructor');
     }
     const content = await this.state.agents.get(agentName).charter();
+    assertValidRuntimeCharter(content, `agents/${agentName}/charter.md`);
     const parsed = parseCharterMarkdown(content);
 
     const name = parsed.identity.name ?? agentName;
@@ -265,6 +301,17 @@ export class CharterCompiler {
       .filter((r): r is PromiseFulfilledResult<AgentCharter> => r.status === 'fulfilled')
       .map((r) => r.value);
   }
+}
+
+function assertValidRuntimeCharter(content: string, charterPath: string): void {
+  const validation = validateCharterMarkdown(content, { path: charterPath });
+  if (validation.accepted) return;
+
+  const summary = validation.diagnostics
+    .filter(diagnostic => diagnostic.severity === 'error')
+    .map(diagnostic => `${diagnostic.code} at ${diagnostic.line}:${diagnostic.column}`)
+    .join(', ');
+  throw new Error(`Invalid charter at ${charterPath}: ${summary}`);
 }
 
 // --- Agent Session Manager ---
